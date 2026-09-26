@@ -57,6 +57,9 @@ pub const SUBSCRIPTION_RETRY_INTERVAL_SECS: u64 = 2 * 24 * 60 * 60;
 pub const MAX_REASON_LEN: usize = 256;
 pub const MAX_EVIDENCE_LEN: usize = 512;
 pub const MAX_NOTES_LEN: usize = 512;
+/// Issue #801: Maximum length of a merchant-supplied payment memo, matching
+/// the Stellar memo text limit (140 bytes).
+pub const MAX_MEMO_LEN: usize = 140;
 pub(crate) const ZERO_CONTRACT_STRKEY: &str =
     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
