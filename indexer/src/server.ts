@@ -7,7 +7,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import * as dotenv from "dotenv";
 import { Database } from "./database";
-import { requireApiKey } from "./auth/api-key";
+import { requireApiKey, requireAdminApiKey } from "./auth/api-key";
 import {
   registerWebhookRoutes,
   startDeliveryLogRetentionJob,
@@ -19,7 +19,26 @@ dotenv.config();
 
 export type ReplayDLQHandler = () => Promise<{ attempted: number; succeeded: number; failed: number }>;
 
-export function createServer(database: Database, replayDlqHandler?: ReplayDLQHandler) {
+export interface ReplayProgressUpdate {
+  processed: number;
+  total: number;
+  stored?: number;
+  currentLedger?: number;
+}
+
+export type EventReplayHandler = (
+  fromLedger: number,
+  toLedger: number,
+  onProgress?: (progress: ReplayProgressUpdate) => void,
+) => Promise<{ processed: number; stored: number; total: number }>;
+
+export const MAX_REPLAY_LEDGER_RANGE = 10000;
+
+export function createServer(
+  database: Database,
+  replayDlqHandler?: ReplayDLQHandler,
+  eventReplayHandler?: EventReplayHandler,
+) {
   const app = express();
   app.use(express.json());
 
@@ -153,6 +172,64 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
     }
   });
 
+  // POST /admin/replay?from_ledger=N&to_ledger=M - Re-process contract events from a ledger range via SSE stream
+  app.post("/admin/replay", requireAdminApiKey, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const fromParam = req.query.from_ledger ?? req.query.from ?? req.body?.from_ledger ?? req.body?.from;
+      const toParam = req.query.to_ledger ?? req.query.to ?? req.body?.to_ledger ?? req.body?.to;
+
+      const fromLedger = parseInt(fromParam as string, 10);
+      const toLedger = parseInt(toParam as string, 10);
+
+      if (isNaN(fromLedger) || isNaN(toLedger) || fromLedger < 1 || toLedger < fromLedger) {
+        res.status(400).json({
+          error: "Invalid ledger parameters: 'from_ledger' and 'to_ledger' must be positive integers with from_ledger <= to_ledger",
+        });
+        return;
+      }
+
+      if (toLedger - fromLedger > MAX_REPLAY_LEDGER_RANGE) {
+        res.status(400).json({
+          error: `Requested ledger range (${toLedger - fromLedger + 1}) exceeds maximum allowed limit of ${MAX_REPLAY_LEDGER_RANGE} ledgers`,
+        });
+        return;
+      }
+
+      if (!eventReplayHandler) {
+        res.status(501).json({ error: "Event replay handler not configured on server" });
+        return;
+      }
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+
+      let isClientConnected = true;
+      req.on("close", () => {
+        isClientConnected = false;
+      });
+
+      const onProgress = (progress: ReplayProgressUpdate) => {
+        if (!isClientConnected) return;
+        res.write(`data: ${JSON.stringify({ processed: progress.processed, total: progress.total, stored: progress.stored })}\n\n`);
+      };
+
+      const result = await eventReplayHandler(fromLedger, toLedger, onProgress);
+      if (isClientConnected) {
+        res.write(`data: ${JSON.stringify({ type: "complete", processed: result.processed, total: result.total, stored: result.stored })}\n\n`);
+        res.end();
+      }
+    } catch (error: any) {
+      if (res.headersSent) {
+        res.write(`data: ${JSON.stringify({ type: "error", error: error.message || String(error) })}\n\n`);
+        res.end();
+      } else {
+        next(error);
+      }
+    }
+  });
+
   // Global Error Handler
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     console.error("API Request Error:", err);
@@ -165,9 +242,10 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
 export async function startServer(
   database: Database,
   port = parseInt(process.env.PORT || process.env.INDEXER_API_PORT || "3001", 10),
-  replayDlqHandler?: ReplayDLQHandler
+  replayDlqHandler?: ReplayDLQHandler,
+  eventReplayHandler?: EventReplayHandler,
 ) {
-  const app = createServer(database, replayDlqHandler);
+  const app = createServer(database, replayDlqHandler, eventReplayHandler);
   const server = app.listen(port, () => {
     console.log(`Indexer REST API listening on port ${port}`);
   });

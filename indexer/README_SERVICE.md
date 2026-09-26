@@ -91,6 +91,32 @@ All protected endpoints require an API key via header `x-api-key: <API_KEY>` or 
 | `GET` | `/refunds/:refundId` | Yes | Get refund record by refund ID. Returns 404 if not found. |
 | `GET` | `/events` | Yes | Query persisted events. Supports query parameters `type` (e.g. `PAYMENT/CONFIRMED`), `from` (ledger sequence), and `to` (ledger sequence). |
 | `POST` | `/admin/replay-dlq` | Yes | Manually trigger replay of failed events in the dead-letter queue. Returns `{ attempted, succeeded, failed }`. |
+| `POST` | `/admin/replay` | Yes (Admin) | Replay and backfill missed contract events from a ledger range (`from_ledger` to `to_ledger`). Progress streamed as SSE. |
+
+---
+
+## Ledger Event Replay & Backfill (#858)
+
+When the indexer experiences downtime (deployments, node restarts, outages), Stellar contract events emitted during that period can be backfilled using the admin replay endpoint:
+
+### Replay Procedure
+
+1. **Authenticate**: Send `x-admin-api-key: <ADMIN_API_KEY>` (or `Authorization: Bearer <ADMIN_API_KEY>`).
+2. **Execute Replay**:
+   ```bash
+   curl -N -X POST "http://localhost:3001/admin/replay?from_ledger=100000&to_ledger=105000" \
+     -H "x-admin-api-key: $ADMIN_API_KEY"
+   ```
+3. **Stream Progress**: The endpoint streams Server-Sent Events (SSE) reporting real-time progress:
+   ```
+   data: {"processed":50,"total":5001,"stored":12}
+   ...
+   data: {"type":"complete","processed":120,"total":5001,"stored":35}
+   ```
+4. **Safety & Invariants**:
+   - **Range Limit**: Capped at a maximum range of 10,000 ledgers (`MAX_REPLAY_LEDGER_RANGE`) per request to prevent runaway queries.
+   - **Idempotency**: Events already present in the database are skipped using `ON CONFLICT (event_id) DO NOTHING`.
+   - **Non-Destructive**: Existing rows and records are never overwritten or altered; only missing entries are inserted.
 
 ---
 

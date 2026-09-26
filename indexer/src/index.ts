@@ -258,6 +258,92 @@ export class EventSubscriber {
     return { attempted, succeeded, failed };
   }
 
+  /**
+   * Issue #858: Replay events from a specified ledger range [fromLedger, toLedger].
+   * Fetches contract events via RPC, runs them through the same pipeline as live events,
+   * skipping already-persisted events via ON CONFLICT DO NOTHING idempotency.
+   */
+  async replayLedgerRange(
+    fromLedger: number,
+    toLedger: number,
+    onProgress?: (progress: { processed: number; total: number; stored: number; currentLedger: number }) => void,
+  ): Promise<{ processed: number; stored: number; total: number }> {
+    const totalLedgers = Math.max(1, toLedger - fromLedger + 1);
+    let processed = 0;
+    let stored = 0;
+    let currentStart = fromLedger;
+
+    while (currentStart <= toLedger) {
+      try {
+        const request: Parameters<rpc.Server["getEvents"]>[0] = {
+          filters: [
+            {
+              type: "contract",
+              contractIds: this.config.contractIds,
+            },
+          ],
+          startLedger: currentStart,
+          limit: 100,
+        };
+
+        const response = await this.server.getEvents(request);
+        if (!response.events || response.events.length === 0) {
+          if (response.latestLedger && response.latestLedger < toLedger) {
+            currentStart = response.latestLedger + 1;
+          } else {
+            break;
+          }
+        } else {
+          for (const event of response.events) {
+            const ledger = typeof event.ledger === "number" ? event.ledger : parseInt(event.ledger, 10);
+            if (ledger > toLedger) break;
+
+            processed++;
+            const eventId = `${event.ledger}-${event.txHash}-${event.id || Date.now()}`;
+            try {
+              const parsedEvent = this.parseEvent(event);
+              if (parsedEvent) {
+                const wasStored = await this.database.storeEvent(parsedEvent);
+                if (wasStored) {
+                  stored++;
+                }
+              }
+            } catch (error: any) {
+              console.error(`Error processing replay event ${eventId}:`, error);
+            }
+          }
+
+          const lastLedger = response.events[response.events.length - 1].ledger;
+          const lastNum = typeof lastLedger === "number" ? lastLedger : parseInt(lastLedger, 10);
+          currentStart = Math.max(currentStart + 1, lastNum + 1);
+        }
+      } catch (err: any) {
+        console.error(`Replay error at ledger ${currentStart}:`, err);
+        currentStart++;
+      }
+
+      if (onProgress) {
+        onProgress({
+          processed,
+          total: totalLedgers,
+          stored,
+          currentLedger: Math.min(toLedger, currentStart),
+        });
+      }
+    }
+
+    if (onProgress) {
+      onProgress({
+        processed,
+        total: totalLedgers,
+        stored,
+        currentLedger: toLedger,
+      });
+    }
+
+    return { processed, stored, total: totalLedgers };
+  }
+
   async shutdown(): Promise<void> {
     console.log("Shutting down event subscriber...");
     if (this.pollTimer) clearInterval(this.pollTimer);
@@ -274,7 +360,12 @@ async function main(): Promise<void> {
 
   // Start REST API Server alongside subscriber
   const database = (subscriber as any).database;
-  await startServer(database, config.apiPort, () => subscriber.retryDLQEvents(true));
+  await startServer(
+    database,
+    config.apiPort,
+    () => subscriber.retryDLQEvents(true),
+    (from, to, onProgress) => subscriber.replayLedgerRange(from, to, onProgress),
+  );
 }
 
 if (require.main === module) {
