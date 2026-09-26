@@ -24,6 +24,17 @@ export class Database {
     this.pool = new Pool({ connectionString });
   }
 
+  /**
+   * The underlying connection pool.
+   *
+   * Exposed so modules that own their own tables — the webhook store
+   * (Issues #808, #810) — can share this pool rather than opening a second
+   * one against the same database.
+   */
+  getPool(): Pool {
+    return this.pool;
+  }
+
   async initialize(): Promise<void> {
     try {
       const client = await this.pool.connect();

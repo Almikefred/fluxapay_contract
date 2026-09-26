@@ -8,6 +8,12 @@ import express, { type Request, type Response, type NextFunction } from "express
 import * as dotenv from "dotenv";
 import { Database } from "./database";
 import { requireApiKey } from "./auth/api-key";
+import {
+  registerWebhookRoutes,
+  startDeliveryLogRetentionJob,
+  WebhookStore,
+  type RetentionJobHandle,
+} from "./webhooks";
 
 dotenv.config();
 
@@ -33,6 +39,18 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
 
   // All subsequent routes require API-key authentication
   app.use(requireApiKey);
+
+  // Webhook test delivery and delivery history (Issues #808, #810).
+  // Registered after the API-key gate, so both are merchant-authenticated.
+  registerWebhookRoutes(app, {
+    store: new WebhookStore(database.getPool()),
+    // The API key identifies the merchant; endpoint ownership is re-checked
+    // per request so one merchant cannot read another's delivery log.
+    merchantIdFromRequest: (req) =>
+      typeof req.header("x-merchant-id") === "string"
+        ? (req.header("x-merchant-id") as string)
+        : null,
+  });
 
   // GET /payments/:paymentId
   app.get("/payments/:paymentId", async (req: Request, res: Response, next: NextFunction) => {

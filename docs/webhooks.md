@@ -355,3 +355,102 @@ curl -X POST http://localhost:3000/webhooks/fluxapay \
 - [Architecture & settlement webhooks](architecture.md)
 - [SEP-6 / SEP-24 anchor callbacks](sep6-sep24-anchor-integration.md)
 - [Local invoke recipes](local-invoke.md)
+
+---
+
+## Verifying your integration: `POST /v1/webhooks/test`
+
+*(Issue #808)*
+
+Before this endpoint existed, the only way to confirm your handler worked was
+to put a real payment through. This sends a synthetic event to your registered
+endpoint with **real HMAC signing**, so you can exercise your signature
+verification without moving money.
+
+```http
+POST /v1/webhooks/test
+Authorization: Bearer <merchant API key>
+Content-Type: application/json
+
+{ "endpoint_id": "wh_abc123", "event_type": "payment.confirmed" }
+```
+
+Response:
+
+```json
+{
+  "delivery_id": "…",
+  "event_type": "payment.confirmed",
+  "livemode": false,
+  "delivered": true,
+  "http_status": 200,
+  "duration_ms": 142,
+  "response_body": "ok"
+}
+```
+
+Things worth knowing:
+
+- **`livemode` is `false`** and the payload uses `test_`-prefixed identifiers
+  (`payment_id: "test_pay_000000000000"`). A handler that ignores the flag
+  still cannot mistake the delivery for a real payment.
+- **The signature is real**, computed with your endpoint's actual signing
+  secret. If your verification passes here it will pass in production.
+- **Unknown event types are rejected** with `400 UnsupportedEventType` rather
+  than signed and sent, so a typo fails loudly instead of leaving you waiting
+  for a delivery that will never match.
+- **Rate limited to 5 test deliveries per endpoint per hour.** Exceeding it
+  returns `429` with `Retry-After`.
+- A `200` means *the test ran*; whether your endpoint accepted it is in
+  `delivered` and `http_status`.
+
+## Delivery history: `GET /v1/webhooks/{endpoint_id}/deliveries`
+
+*(Issue #810)*
+
+Every delivery attempt — live and test, success and failure — is logged.
+
+```http
+GET /v1/webhooks/wh_abc123/deliveries?payment_id=pay_123&limit=20
+Authorization: Bearer <merchant API key>
+```
+
+```json
+{
+  "data": [
+    {
+      "id": "…",
+      "endpoint_id": "wh_abc123",
+      "event_type": "payment.confirmed",
+      "payment_id": "pay_123",
+      "attempt_number": 2,
+      "delivered_at": "2026-09-26T10:31:00.000Z",
+      "http_status": 500,
+      "response_body": "Internal Server Error",
+      "duration_ms": 3011,
+      "success": false,
+      "livemode": true
+    }
+  ],
+  "next_before": "2026-09-26T10:31:00.000Z",
+  "retention_days": 30
+}
+```
+
+- **Paginate with `before`**, passing the previous page's `next_before`. This
+  is keyset pagination rather than an offset, so deliveries arriving while you
+  page cannot push a row you are hunting for past unseen.
+- **`response_body` is truncated to 1 KB.** A failing endpoint often returns a
+  full HTML error page; the first kilobyte carries the status line and any
+  JSON error worth acting on.
+- **Logs are purged after 30 days.** This is a debugging aid, not a ledger.
+- A missing endpoint and an endpoint belonging to another merchant both return
+  `404`, so endpoint ids cannot be enumerated.
+
+### Signature scheme
+
+The `x-fluxapay-signature` header is `t=<unix-seconds>,v1=<hex-hmac>`, and the
+signed material is `<timestamp>.<raw-body>`. The timestamp is inside the
+signature deliberately: signing the body alone would let anyone who captured a
+delivery replay it indefinitely. Reject deliveries whose timestamp is more
+than 5 minutes old, and compare signatures with a constant-time function.
