@@ -409,3 +409,86 @@ fn test_dummy_events() {
     let ev = env.events().all();
     ev.dummy_method();
 }
+
+#[test]
+fn test_execute_swap_success_with_slippage_tolerance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register(crate::dex_router::DexRouter, ());
+    let client = crate::dex_router::DexRouterClient::new(&env, &router_id);
+
+    let caller = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+
+    let amount_in = 1000i128;
+    // With 1 hop, get_amounts_out simulates 1% slippage -> 990 output
+    let min_amount_out = 950i128;
+    let max_slippage_bps = 500u32; // 5%
+
+    let result = client.execute_swap(
+        &caller,
+        &token_in,
+        &token_out,
+        &amount_in,
+        &min_amount_out,
+        &max_slippage_bps,
+    );
+    assert_eq!(result, 990);
+}
+
+#[test]
+fn test_execute_swap_rejects_insufficient_output_slippage() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register(crate::dex_router::DexRouter, ());
+    let client = crate::dex_router::DexRouterClient::new(&env, &router_id);
+
+    let caller = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+
+    let amount_in = 1000i128;
+    // get_amounts_out gives 990, require 995 -> should fail
+    let min_amount_out = 995i128;
+    let max_slippage_bps = 500u32;
+
+    let result = client.try_execute_swap(
+        &caller,
+        &token_in,
+        &token_out,
+        &amount_in,
+        &min_amount_out,
+        &max_slippage_bps,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_swap_rejects_excessive_max_slippage_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register(crate::dex_router::DexRouter, ());
+    let client = crate::dex_router::DexRouterClient::new(&env, &router_id);
+
+    let caller = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+
+    let amount_in = 1000i128;
+    let min_amount_out = 500i128;
+    let max_slippage_bps = 5001u32; // > 5000 bps (50%) must be rejected
+
+    let result = client.try_execute_swap(
+        &caller,
+        &token_in,
+        &token_out,
+        &amount_in,
+        &min_amount_out,
+        &max_slippage_bps,
+    );
+    assert!(result.is_err());
+}
