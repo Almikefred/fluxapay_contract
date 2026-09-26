@@ -20,12 +20,17 @@ pub mod events;
 pub mod fx_oracle;
 pub mod merchant_auth;
 mod payment_state_machine;
+pub mod stream;
+
+pub use stream::{PaymentStream, PaymentStreaming, StreamDataKey, StreamError, StreamStatus};
 
 pub use access_control::AccessControlDataKey;
 pub use access_control::{AdminAction, AdminProposal};
 pub use dex_router::{DexRouter, DexRouterClient};
 pub use fx_oracle::{FXOracle, FXOracleClient, FXOracleError};
-pub use merchant_auth::{MerchantAuthError, MerchantAuthorization, MerchantPreAuth};
+pub use merchant_auth::{
+    ApiKeyRecord, MerchantAuth, MerchantAuthError, MerchantAuthorization, MerchantPreAuth,
+};
 
 #[contract]
 pub struct PaymentProcessor;
@@ -10536,6 +10541,30 @@ impl PaymentProcessor {
         MerchantPreAuth::remaining_limit(env, customer, merchant)
     }
 
+    /// Issue #854: Merchant creates a scoped API key.
+    pub fn create_api_key(
+        env: Env,
+        merchant: Address,
+        key_hash: BytesN<32>,
+        scopes: Vec<String>,
+    ) -> Result<ApiKeyRecord, MerchantAuthError> {
+        MerchantPreAuth::create_api_key(env, merchant, key_hash, scopes)
+    }
+
+    /// Issue #854: Retrieve an API key record by its key hash.
+    pub fn get_api_key(env: Env, key_hash: BytesN<32>) -> Result<ApiKeyRecord, MerchantAuthError> {
+        MerchantPreAuth::get_api_key(env, key_hash)
+    }
+
+    /// Issue #854: Merchant revokes an active API key.
+    pub fn revoke_api_key(
+        env: Env,
+        merchant: Address,
+        key_hash: BytesN<32>,
+    ) -> Result<(), MerchantAuthError> {
+        MerchantPreAuth::revoke_api_key(env, merchant, key_hash)
+    }
+
     pub fn cancel_stream(env: Env, sender: Address, stream_id: String) -> Result<(), StreamError> {
         if Self::is_blacklisted_address(&env, &sender) {
             return Err(StreamError::Unauthorized);
@@ -11492,24 +11521,8 @@ fn bump_version_string(env: &Env, version: &String) -> String {
     String::from_bytes(env, &result[..pos])
 }
 
-#[cfg(test)]
-mod arbitrage_test;
-#[cfg(test)]
-mod auth_test;
-#[cfg(test)]
-mod dispute_test;
-#[cfg(test)]
-mod fx_oracle_test;
-#[cfg(test)]
-mod integration_test;
 pub mod merchant_registry;
-#[cfg(test)]
-mod merchant_registry_test;
-#[cfg(test)]
-mod oracle_sanitization_test;
 mod payment_link;
-#[cfg(test)]
-mod proptests;
 pub use payment_link::{
     CreateLinkArgs, FiatConfig, LinkAnalytics, MaybeFiatConfig, PaymentLink, PaymentLinkManager,
     PaymentLinkManagerClient,

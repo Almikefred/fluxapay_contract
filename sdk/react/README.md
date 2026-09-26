@@ -352,6 +352,41 @@ function SubscribeButton({ payer, planId }: { payer: string; planId: string }) {
 - `useCreateInvoice()` — returns `{ mutate, data, status, loading, error }` for creating an invoice.
 - `useMarkInvoicePaid()` — returns `{ mutate, status, loading, error }` for marking an invoice as paid.
 
+### Real-Time Event Streaming (`usePaymentEvents`)
+
+Connects to the indexer SSE stream for live payment updates:
+
+```tsx
+import { usePaymentEvents } from "@fluxapay/react";
+
+function LivePaymentFeed({ merchantId, token }: { merchantId: string; token: string }) {
+  const { events, latestEvent, status, error, close } = usePaymentEvents({
+    baseUrl: "https://indexer.fluxapay.com",
+    merchantId,
+    token,
+    eventTypes: ["payment.confirmed", "payment.failed"],
+    onEvent: (event) => {
+      console.log("New payment event received:", event);
+    },
+  });
+
+  return (
+    <div>
+      <div>Connection Status: {status}</div>
+      {latestEvent && (
+        <div>Latest Event: {latestEvent.event_type} - {latestEvent.payment_id}</div>
+      )}
+      <ul>
+        {events.map((e, idx) => (
+          <li key={idx}>{e.event_type}: {e.payment_id}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
 ## License
+
 
 MIT

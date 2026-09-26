@@ -26,6 +26,7 @@ export {
   useMerchantInvoices,
   useCreateInvoice,
   useMarkInvoicePaid,
+  usePaymentEvents,
 } from "./hooks.js";
 export type {
   UseMerchantPaymentsOptions,
@@ -51,4 +52,9 @@ export type {
   MerchantAnalytics,
   PaymentStream,
   CreateStreamParams,
+  PaymentEvent,
+  ConnectionStatus,
+  UsePaymentEventsOptions,
+  UsePaymentEventsResult,
 } from "./hooks.js";
+

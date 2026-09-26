@@ -816,7 +816,34 @@ const restored = signer.restore(tickPayload);
 
 You can also use the standalone builder functions directly: `buildSubscriptionTickPayload`, `buildPullAuthorizationPayload`, `buildCreatePaymentPayload`, `buildVerifyPaymentPayload`, `buildCreateRefundPayload`.
 
+## Scoped API Keys
+
+Issue scoped API keys to restrict integrations or services to specific capabilities:
+
+```typescript
+// Create a scoped API key
+const keyRecord = await client.createApiKey({
+  merchant: "G_MERCHANT...",
+  keyHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  scopes: ["read:payments", "write:payments"],
+});
+
+// Retrieve an API key
+const record = await client.getApiKey(keyHash);
+
+// Revoke an API key
+await client.revokeApiKey("G_MERCHANT...", keyHash);
+```
+
+Available scopes:
+- `read:payments`: Query payments, refunds, and disputes.
+- `write:payments`: Create payments and charge authorizations.
+- `read:analytics`: Query payment metrics and events.
+- `manage:webhooks`: Manage webhook registrations.
+- `admin`: Full unrestricted access.
+
 ## License
+
 
 MIT
 

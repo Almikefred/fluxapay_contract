@@ -1,21 +1,21 @@
 import {
   Client as ContractClient,
-  Merchant,
-  PaymentCharge,
-  Refund,
-  Dispute,
-  PaymentStatus,
-  RefundStatus,
-  DisputeStatus,
-  FeeConfig,
-  MaybeFeeConfig,
-  CreatePaymentArgs,
+  type Merchant,
+  type PaymentCharge,
+  type Refund,
+  type Dispute,
+  type PaymentStatus,
+  type RefundStatus,
+  type DisputeStatus,
+  type FeeConfig,
+  type MaybeFeeConfig,
+  type CreatePaymentArgs,
 } from "./contracts/fluxapay/src/index.js";
 import { Networks } from "@stellar/stellar-sdk";
 import {
   FluxapayOfflineSigner,
-  OfflineTransactionPayload,
-  SubscriptionBillingClient,
+  type OfflineTransactionPayload,
+  type SubscriptionBillingClient,
   buildOfflinePayload,
   buildCreatePaymentPayload,
   buildVerifyPaymentPayload,
@@ -27,9 +27,9 @@ import {
 } from "./offline-signer.js";
 import {
   NetworkProfileSwitcher,
-  NetworkEnvironment,
+  type NetworkEnvironment,
   NetworkProfiles,
-  NetworkProfile,
+  type NetworkProfile,
   FLUXAPAY_CONTRACT_IDS,
   UNSET_CONTRACT_ID,
 } from "./network-profiles.js";
@@ -61,6 +61,12 @@ import {
   DEX_ROUTER_ERROR_MAP,
 } from "./contracts/dex-router.js";
 import { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
+import {
+  getLocalizedErrorMessage,
+  MESSAGES,
+  SUPPORTED_LOCALES,
+  type SupportedLocale,
+} from "./locales/index.js";
 
 export {
   DexRouterClient,
@@ -71,10 +77,13 @@ export {
 };
 
 
+export { getLocalizedErrorMessage, MESSAGES, SUPPORTED_LOCALES, type SupportedLocale };
 
 export interface FluxapayConfig {
   network: NetworkEnvironment;
   rpcUrl?: string;
+  /** Locale for error messages (e.g. 'en', 'fr', 'pt', 'es'). Defaults to 'en'. */
+  locale?: string;
   /**
    * PaymentProcessor contract ID. Optional — falls back to
    * `FLUXAPAY_CONTRACT_IDS[network].paymentProcessor` when omitted.
@@ -373,7 +382,27 @@ export const MerchantAuthError = {
   4: { message: "InvalidAmount" },
   5: { message: "Unauthorized" },
   6: { message: "AuthorizationAlreadyExists" },
+  7: { message: "ApiKeyNotFound" },
+  8: { message: "ApiKeyRevoked" },
 } as const;
+
+/**
+ * Issue #854: Scoped API key record for a merchant.
+ */
+export interface ApiKeyRecord {
+  key_hash: string;
+  merchant: string;
+  scopes: string[];
+  created_at: bigint;
+  revoked: boolean;
+}
+
+export interface CreateApiKeyParams {
+  merchant: string;
+  keyHash: string;
+  scopes: string[];
+}
+
 
 /**
  * Issue #185 / #665: Record of a dispute settled off-chain by mutual
@@ -528,6 +557,10 @@ export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   63: "RefundNotApproved",
   64: "RouterNotAllowed",
   65: "RouteOutputInsufficient",
+  66: "BatchContainsDuplicates",
+  67: "InputTooLong",
+  68: "TimelockNotExpired",
+  69: "InvalidEvidenceCid",
   404: "PaymentNotFound",
   405: "RefundNotFound",
   406: "InvalidAmount",
@@ -537,13 +570,25 @@ export class FluxapayError extends Error {
   readonly code: number;
   readonly contractErrorName: string;
   readonly cause?: unknown;
+  readonly locale: string;
 
-  constructor(code: number, contractErrorName: string, message?: string, cause?: unknown) {
+  constructor(
+    code: number,
+    contractErrorName: string,
+    message?: string,
+    cause?: unknown,
+    locale = "en",
+  ) {
     super(message ?? contractErrorName);
     this.name = `${contractErrorName}Error`;
     this.code = code;
     this.contractErrorName = contractErrorName;
     this.cause = cause;
+    this.locale = locale;
+  }
+
+  get localizedMessage(): string {
+    return getLocalizedErrorMessage(this.code, this.locale, this.message);
   }
 }
 
@@ -598,7 +643,7 @@ function parseContractErrorCode(error: unknown): number | null {
   return null;
 }
 
-function toFluxapayError(error: unknown): FluxapayError {
+export function toFluxapayError(error: unknown, locale = "en"): FluxapayError {
   const code = parseContractErrorCode(error);
   if (code === null) {
     if (error instanceof Error) {
@@ -613,6 +658,7 @@ function toFluxapayError(error: unknown): FluxapayError {
     contractErrorName,
     `${contractErrorName} (contract error #${code})`,
     error,
+    locale,
   );
 }
 
@@ -654,11 +700,20 @@ function isPaymentNotFound(error: unknown): boolean {
   return /PaymentNotFound|payment not found|#404\b/i.test(message);
 }
 
-async function withMappedContractError<T>(operation: () => Promise<T>): Promise<T> {
+let defaultClientLocale = "en";
+
+export function setDefaultLocale(locale: string): void {
+  defaultClientLocale = locale;
+}
+
+export async function withMappedContractError<T>(
+  operation: () => Promise<T>,
+  locale?: string,
+): Promise<T> {
   try {
     return await operation();
   } catch (error) {
-    throw toFluxapayError(error);
+    throw toFluxapayError(error, locale ?? defaultClientLocale);
   }
 }
 
@@ -700,6 +755,7 @@ function resolveContractId(explicit: string | undefined, fallback: string, label
 export class FluxapayClient {
   public contract: ContractClient;
   public networkSwitcher: NetworkProfileSwitcher;
+  public readonly locale: string;
   private fxOracleClient?: FxOracleClient;
   private merchantRegistryClient?: MerchantRegistryClient;
   private paymentLinkManagerClient?: PaymentLinkManagerClient;
@@ -708,6 +764,8 @@ export class FluxapayClient {
 
   constructor(config: FluxapayConfig) {
     this.config = config;
+    this.locale = config.locale ?? "en";
+    setDefaultLocale(this.locale);
     this.networkSwitcher = new NetworkProfileSwitcher(config.network);
 
     const rpcUrl = config.rpcUrl || this.networkSwitcher.getProfile().rpcUrl;
@@ -1294,7 +1352,47 @@ export class FluxapayClient {
   }
 
   /**
+   * Issue #854: Merchant creates a scoped API key.
+   */
+  async createApiKey(params: CreateApiKeyParams): Promise<ApiKeyRecord> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).create_api_key({
+        merchant: params.merchant,
+        key_hash: params.keyHash,
+        scopes: params.scopes,
+      });
+      return tx?.result ?? tx;
+    });
+  }
+
+  /**
+   * Issue #854: Retrieve an API key record by its key hash.
+   */
+  async getApiKey(keyHash: string): Promise<ApiKeyRecord> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).get_api_key({
+        key_hash: keyHash,
+      });
+      return tx?.result ?? tx;
+    });
+  }
+
+  /**
+   * Issue #854: Merchant revokes an active API key.
+   */
+  async revokeApiKey(merchant: string, keyHash: string): Promise<void> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).revoke_api_key({
+        merchant,
+        key_hash: keyHash,
+      });
+      return tx?.result ?? tx;
+    });
+  }
+
+  /**
    * Get all refunds for a payment
+
    */
   async getPaymentRefunds(paymentId: string) {
     return withMappedContractError(() =>
@@ -2385,23 +2483,20 @@ export class FluxapayClient {
   }
 }
 
-export { toFluxapayError, withMappedContractError };
-
 export {
-  Merchant,
-  PaymentCharge,
-  Refund,
-  Dispute,
-  PaymentStatus,
-  RefundStatus,
-  DisputeStatus,
-  FeeConfig,
-  MaybeFeeConfig,
-  CreatePaymentArgs,
-  SubscriptionPlan,
+  type Merchant,
+  type PaymentCharge,
+  type Refund,
+  type Dispute,
+  type PaymentStatus,
+  type RefundStatus,
+  type DisputeStatus,
+  type FeeConfig,
+  type MaybeFeeConfig,
+  type CreatePaymentArgs,
   FluxapayOfflineSigner,
-  OfflineTransactionPayload,
-  SubscriptionBillingClient,
+  type OfflineTransactionPayload,
+  type SubscriptionBillingClient,
   buildOfflinePayload,
   buildCreatePaymentPayload,
   buildVerifyPaymentPayload,
@@ -2411,13 +2506,9 @@ export {
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
   NetworkProfileSwitcher,
-  NetworkEnvironment,
+  type NetworkEnvironment,
   NetworkProfiles,
-  NetworkProfile,
-  PaymentStream,
-  StreamStatus,
-  StreamError,
-  CreateStreamParams,
+  type NetworkProfile,
 };
 
 export { RefundManagerClient, type RefundManagerConfig } from "./contracts/refund-manager.js";
