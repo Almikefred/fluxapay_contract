@@ -24,6 +24,13 @@ const INVERSE_RATE_DECIMALS: u32 = 14;
 /// Soroban `Symbol` limit of 32 characters).
 const MAX_PAIR_SYMBOL_LEN: usize = 32;
 
+/// Issue #811: Hard cap on the token allowlist.
+///
+/// Bounds the linear scan every `set_rate` performs. Without a cap, an admin
+/// could grow the list until the scan alone exhausted the instruction budget —
+/// which would brick rate publishing rather than merely slow it.
+const MAX_ALLOWED_TOKENS: u32 = 50;
+
 #[contract]
 pub struct FXOracle;
 
@@ -58,6 +65,9 @@ pub enum FXOracleError {
     /// Issue #636: Neither the requested `BASE_QUOTE` pair nor its inverse
     /// `QUOTE_BASE` has a stored rate (or the pair symbol is malformed).
     PairNotFound = 6,
+    /// Issue #811: One side of the pair is not on the admin-managed token
+    /// allowlist, so no rate may be published for it.
+    TokenNotAllowed = 7,
 }
 
 #[contracttype]
@@ -68,6 +78,8 @@ pub enum OracleDataKey {
     MaxDeviation(Symbol),
     Quorum,
     Submissions(Symbol),
+    /// Issue #811: `Vec<Symbol>` of tokens a rate may be published against.
+    AllowedTokens,
 }
 
 #[cfg_attr(
@@ -81,10 +93,225 @@ impl FXOracle {
     }
 
     pub fn oracle_initialize(env: Env, admin: Address, staleness_threshold: u64) {
+        let empty = Vec::new(&env);
+        Self::oracle_initialize_with_tokens(env, admin, staleness_threshold, empty);
+    }
+
+    /// Issue #811: Initialise with a populated token allowlist.
+    ///
+    /// Separate entry point rather than a changed signature on
+    /// `oracle_initialize`, which is called from deployment scripts, tests and
+    /// the SDK. Breaking all of them to add an argument most callers can supply
+    /// afterwards via `add_allowed_token` would be a poor trade.
+    ///
+    /// An **empty** allowlist means "not yet configured", and rate publishing is
+    /// allowed through — see `require_pair_allowed` for why that default is the
+    /// safe one here rather than the reverse.
+    pub fn oracle_initialize_with_tokens(
+        env: Env,
+        admin: Address,
+        staleness_threshold: u64,
+        allowed_tokens: Vec<Symbol>,
+    ) {
         AccessControl::initialize(&env, admin);
         env.storage()
             .instance()
             .set(&OracleDataKey::StalenessThreshold, &staleness_threshold);
+
+        if !allowed_tokens.is_empty() {
+            env.storage()
+                .instance()
+                .set(&OracleDataKey::AllowedTokens, &allowed_tokens);
+        }
+    }
+
+    // ── Token allowlist (Issue #811) ──────────────────────────────────────
+    //
+    // `set_rate` accepted any `pair: Symbol`. An admin key — including a
+    // compromised one — could publish a rate for a fabricated pair, and
+    // `PaymentLinkManager::use_link` would settle against it if a link were
+    // configured for that token. The allowlist makes inventing a token a
+    // separate, auditable admin action from setting its rate, so a single
+    // compromised oracle operator can no longer do both.
+
+    /// Adds `token` to the allowlist. Admin only.
+    pub fn add_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Symbol,
+    ) -> Result<(), FXOracleError> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(FXOracleError::Unauthorized);
+        }
+
+        let mut tokens = Self::get_allowed_tokens(env.clone());
+
+        // Idempotent: re-adding an existing token is a no-op rather than an
+        // error, so a re-run of a deployment script does not fail.
+        for existing in tokens.iter() {
+            if existing == token {
+                return Ok(());
+            }
+        }
+
+        if tokens.len() >= MAX_ALLOWED_TOKENS {
+            return Err(FXOracleError::BatchTooLarge);
+        }
+
+        tokens.push_back(token.clone());
+        env.storage()
+            .instance()
+            .set(&OracleDataKey::AllowedTokens, &tokens);
+
+        env.events().publish(
+            (Symbol::new(&env, "ORACLE"), Symbol::new(&env, "TOKEN_ALLOWED")),
+            token,
+        );
+
+        Ok(())
+    }
+
+    /// Removes `token` from the allowlist. Admin only.
+    ///
+    /// Existing rates for pairs involving the token are deliberately left in
+    /// place. Deleting them would make an in-flight settlement fail with
+    /// `RateNotFound` mid-payment; leaving them lets the rate age out through
+    /// the normal staleness path while no *new* rate can be published.
+    pub fn remove_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Symbol,
+    ) -> Result<(), FXOracleError> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(FXOracleError::Unauthorized);
+        }
+
+        let tokens = Self::get_allowed_tokens(env.clone());
+        let mut remaining: Vec<Symbol> = Vec::new(&env);
+        let mut found = false;
+        for existing in tokens.iter() {
+            if existing == token {
+                found = true;
+            } else {
+                remaining.push_back(existing);
+            }
+        }
+
+        if !found {
+            return Ok(()); // idempotent, as with add
+        }
+
+        env.storage()
+            .instance()
+            .set(&OracleDataKey::AllowedTokens, &remaining);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ORACLE"),
+                Symbol::new(&env, "TOKEN_DISALLOWED"),
+            ),
+            token,
+        );
+
+        Ok(())
+    }
+
+    /// The current allowlist. Empty means "not configured".
+    pub fn get_allowed_tokens(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&OracleDataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Whether `token` may appear in a pair passed to `set_rate`.
+    pub fn is_token_allowed(env: Env, token: Symbol) -> bool {
+        let tokens = Self::get_allowed_tokens(env);
+        if tokens.is_empty() {
+            return true;
+        }
+        for existing in tokens.iter() {
+            if existing == token {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Rejects a pair unless **both** sides are on the allowlist.
+    ///
+    /// # Why an empty allowlist permits everything
+    ///
+    /// An instance deployed before this existed has no allowlist. Failing
+    /// closed would stop rate publishing the moment the contract is upgraded,
+    /// taking FX settlement down until an admin populated the list — an
+    /// availability outage introduced by a security fix. Permitting an empty
+    /// list keeps the upgrade inert and makes enabling the control an explicit
+    /// step, which `oracle_initialize_with_tokens` performs for new deployments.
+    ///
+    /// The trade is stated plainly in `docs/local-invoke.md`: until the list is
+    /// populated, this check does nothing.
+    ///
+    /// # Why both sides
+    ///
+    /// Checking only the base would let `USD_FAKECOIN` through, and the quote
+    /// side is what a payment link settles *into* — the more dangerous half.
+    fn require_pair_allowed(env: &Env, pair: &Symbol) -> Result<(), FXOracleError> {
+        let tokens = Self::get_allowed_tokens(env.clone());
+        if tokens.is_empty() {
+            return Ok(());
+        }
+
+        let (base, quote) =
+            Self::split_pair(env, pair).ok_or(FXOracleError::TokenNotAllowed)?;
+
+        let contains = |needle: &Symbol| {
+            for existing in tokens.iter() {
+                if &existing == needle {
+                    return true;
+                }
+            }
+            false
+        };
+
+        if !contains(&base) || !contains(&quote) {
+            return Err(FXOracleError::TokenNotAllowed);
+        }
+
+        Ok(())
+    }
+
+    /// Splits `BASE_QUOTE` into its two sides.
+    ///
+    /// Returns `None` for a malformed symbol — no separator, several, or an
+    /// empty side. A malformed pair cannot be checked against the allowlist, so
+    /// `require_pair_allowed` treats that as a rejection rather than a pass:
+    /// an unparseable pair is exactly the shape a fabricated one takes.
+    fn split_pair(env: &Env, pair: &Symbol) -> Option<(Symbol, Symbol)> {
+        let str_repr = SymbolStr::try_from_val(env, &pair.to_symbol_val()).ok()?;
+        let text: &str = str_repr.as_ref();
+        let bytes = text.as_bytes();
+
+        let mut separator: Option<usize> = None;
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'_' {
+                if separator.is_some() {
+                    return None;
+                }
+                separator = Some(i);
+            }
+        }
+        let separator = separator?;
+        if separator == 0 || separator + 1 >= bytes.len() {
+            return None;
+        }
+
+        let base = core::str::from_utf8(&bytes[..separator]).ok()?;
+        let quote = core::str::from_utf8(&bytes[separator + 1..]).ok()?;
+
+        Some((Symbol::new(env, base), Symbol::new(env, quote)))
     }
 
     pub fn oracle_grant_role(
@@ -117,6 +344,11 @@ impl FXOracle {
         if !AccessControl::has_role(&env, &role_oracle(&env), &operator) {
             return Err(FXOracleError::Unauthorized);
         }
+
+        // Issue #811: checked before the quorum bookkeeping, so a disallowed
+        // pair cannot accumulate submissions and then be rejected only once
+        // quorum is reached.
+        Self::require_pair_allowed(&env, &pair)?;
 
         let quorum = env
             .storage()
@@ -199,6 +431,14 @@ impl FXOracle {
 
         if rates.len() > MAX_BATCH_RATES {
             return Err(FXOracleError::BatchTooLarge);
+        }
+
+        // Issue #811: every pair is validated before any is written, so a batch
+        // containing one disallowed pair does not half-apply. `store_rate` has
+        // already mutated state by the time a later entry fails, and Soroban
+        // gives us no partial rollback inside a call.
+        for (pair, _, _) in rates.iter() {
+            Self::require_pair_allowed(&env, &pair)?;
         }
 
         let count = rates.len();
