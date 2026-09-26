@@ -53,6 +53,13 @@ import {
   type CreatePaymentLinkResult,
   type BatchLinkItem,
 } from "./contracts/payment-link-manager.js";
+import {
+  DexRouterClient,
+  type DexRouterConfig,
+  type ExecuteSwapParams,
+  DexRouterError,
+  DEX_ROUTER_ERROR_MAP,
+} from "./contracts/dex-router.js";
 import { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
 import {
   getLocalizedErrorMessage,
@@ -60,6 +67,15 @@ import {
   SUPPORTED_LOCALES,
   type SupportedLocale,
 } from "./locales/index.js";
+
+export {
+  DexRouterClient,
+  type DexRouterConfig,
+  type ExecuteSwapParams,
+  DexRouterError,
+  DEX_ROUTER_ERROR_MAP,
+};
+
 
 export { getLocalizedErrorMessage, MESSAGES, SUPPORTED_LOCALES, type SupportedLocale };
 
@@ -873,6 +889,44 @@ export class FluxapayClient {
       this.contract.create_payment(toCreatePaymentArgs(params)),
     );
   }
+
+  /**
+   * Issue #856: Executes a token swap via DexRouter with slippage tolerance and max_slippage_bps guards.
+   */
+  async executeSwap(
+    params: {
+      caller: string;
+      tokenIn: string;
+      tokenOut: string;
+      amountIn: bigint;
+      minAmountOut: bigint;
+      maxSlippageBps: number;
+      dexRouterContractId?: string;
+    },
+    signerKeypair?: any,
+  ): Promise<bigint> {
+    if (params.maxSlippageBps > 5000) {
+      throw new FluxapayError(4, "SlippageExceeded", "maxSlippageBps cannot exceed 5000 (50%)");
+    }
+    const routerContractId = params.dexRouterContractId || this.config.contractId || UNSET_CONTRACT_ID;
+    const routerClient = new DexRouterClient({
+      network: this.config.network,
+      rpcUrl: this.config.rpcUrl,
+      contractId: routerContractId,
+    });
+    return routerClient.executeSwap(
+      {
+        caller: params.caller,
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        amountIn: params.amountIn,
+        minAmountOut: params.minAmountOut,
+        maxSlippageBps: params.maxSlippageBps,
+      },
+      signerKeypair,
+    );
+  }
+
 
   /**
    * Verify a payment via oracle

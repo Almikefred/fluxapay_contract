@@ -16,7 +16,7 @@ Install the official SDK from npm:
 npm install @fluxapay/sdk
 ```
 
-See [sdk/README.md](sdk/README.md) for usage examples and [sdk/CHANGELOG.md](sdk/CHANGELOG.md) for release notes.
+See [sdk/README.md](sdk/README.md) for usage examples, [docs/integration-test-guide.md](docs/integration-test-guide.md) for testnet integration testing, and [sdk/CHANGELOG.md](sdk/CHANGELOG.md) for release notes.
 
 ## CI/CD
 

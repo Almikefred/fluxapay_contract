@@ -109,6 +109,38 @@ export function requireApiKey(req: Request, res: Response, next: NextFunction): 
   next();
 }
 
+export function getExpectedAdminApiKey(): string | undefined {
+  return process.env.ADMIN_API_KEY || process.env.INDEXER_ADMIN_API_KEY || getExpectedApiKey();
+}
+
+export function requireAdminApiKey(req: Request, res: Response, next: NextFunction): void {
+  const expectedAdminKey = getExpectedAdminApiKey();
+
+  if (!expectedAdminKey) {
+    if (process.env.ALLOW_ANONYMOUS_API === "true") {
+      next();
+      return;
+    }
+    res.status(401).json({ error: "Admin API key authentication not configured" });
+    return;
+  }
+
+  const providedKey = req.headers["x-admin-api-key"] || req.headers["x-admin-key"] || extractApiKey(req);
+  const keyStr = typeof providedKey === "string" ? providedKey.trim() : null;
+
+  if (!keyStr) {
+    res.status(401).json({ error: "Missing admin API key" });
+    return;
+  }
+
+  if (keyStr !== expectedAdminKey) {
+    res.status(401).json({ error: "Invalid admin API key" });
+    return;
+  }
+
+  next();
+}
+
 /**
  * Middleware that verifies the caller's API key contains the required scope.
  * Admin scope grants access to all operations.

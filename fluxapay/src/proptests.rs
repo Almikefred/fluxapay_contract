@@ -877,4 +877,32 @@ proptest! {
         prop_assert!(after >= 0, "remaining went negative: {}", after);
         prop_assert!(after <= remaining.max(0), "after {} > remaining {}", after, remaining);
     }
+
+    /// Issue #853: payment_id_to_key helper produces consistent 32-byte keys
+    /// and exhibits collision resistance for distinct payment IDs.
+    #[test]
+    fn proptest_payment_id_to_key_collision_resistance(
+        id1 in "[a-zA-Z0-9_-]{1,64}",
+        id2 in "[a-zA-Z0-9_-]{1,64}",
+    ) {
+        use crate::data_keys::payment_id_to_key;
+        let env = Env::default();
+        let s1 = String::from_str(&env, &id1);
+        let s2 = String::from_str(&env, &id2);
+
+        let key1 = payment_id_to_key(&env, &s1);
+        let key2 = payment_id_to_key(&env, &s2);
+
+        // Determinism: hashing the same id yields identical key
+        let key1_again = payment_id_to_key(&env, &s1);
+        prop_assert_eq!(key1, key1_again);
+
+        // Collision resistance: distinct IDs must produce distinct keys
+        if id1 != id2 {
+            prop_assert_ne!(key1, key2);
+        } else {
+            prop_assert_eq!(key1, key2);
+        }
+    }
 }
+

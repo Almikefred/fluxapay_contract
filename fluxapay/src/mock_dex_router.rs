@@ -74,6 +74,43 @@ impl MockDexRouter {
             None => Err(MockDexError::SwapFailed),
         }
     }
+
+    pub fn execute_swap(
+        env: Env,
+        _caller: Address,
+        _token_in: Address,
+        _token_out: Address,
+        _amount_in: i128,
+        min_amount_out: i128,
+        max_slippage_bps: u32,
+    ) -> Result<i128, MockDexError> {
+        if max_slippage_bps > 5000 {
+            return Err(MockDexError::InsufficientOutput);
+        }
+
+        let fail_swap: bool = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, FAIL_SWAP_KEY))
+            .unwrap_or(false);
+        if fail_swap {
+            return Err(MockDexError::SwapFailed);
+        }
+
+        let stored_output = Self::read_output(&env);
+        match stored_output {
+            Some(output) => {
+                let min_from_bps = output
+                    .saturating_mul(10_000 - max_slippage_bps as i128)
+                    .saturating_div(10_000);
+                if output < min_amount_out || output < min_from_bps {
+                    return Err(MockDexError::InsufficientOutput);
+                }
+                Ok(output)
+            }
+            None => Err(MockDexError::SwapFailed),
+        }
+    }
 }
 
 pub fn configure_mock_dex(env: &Env, mock_dex: &Address, output: i128, fail_swap: bool) {

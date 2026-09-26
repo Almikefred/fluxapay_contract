@@ -597,4 +597,68 @@ describe("ISSUE #616 — Indexer REST API Server", () => {
     assert.strictEqual(filteredLedger.length, 1);
     assert.strictEqual((filteredLedger[0] as any).event_id, "e2");
   });
+
+  it("should enforce admin auth and validate ledger range on POST /admin/replay", async () => {
+    process.env.ADMIN_API_KEY = "admin_secret_123";
+    const mockDb = createMockDatabase();
+    const app = createServer(mockDb as any);
+    const server = app.listen(0);
+    const port = (server.address() as any).port;
+
+    try {
+      // 1. Missing admin key -> 401
+      const resNoAuth = await fetch(`http://localhost:${port}/admin/replay?from_ledger=100&to_ledger=200`, {
+        method: "POST",
+      });
+      assert.strictEqual(resNoAuth.status, 401);
+
+      // 2. Invalid range (to < from) -> 400
+      const resBadRange = await fetch(`http://localhost:${port}/admin/replay?from_ledger=200&to_ledger=100`, {
+        method: "POST",
+        headers: { "x-admin-api-key": "admin_secret_123" },
+      });
+      assert.strictEqual(resBadRange.status, 400);
+
+      // 3. Excessive range (> 10000 ledgers) -> 400
+      const resTooLarge = await fetch(`http://localhost:${port}/admin/replay?from_ledger=1&to_ledger=15000`, {
+        method: "POST",
+        headers: { "x-admin-api-key": "admin_secret_123" },
+      });
+      assert.strictEqual(resTooLarge.status, 400);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("should stream SSE progress and complete on POST /admin/replay", async () => {
+    process.env.ADMIN_API_KEY = "admin_secret_123";
+    const mockDb = createMockDatabase();
+    const mockReplayHandler = async (
+      from: number,
+      to: number,
+      onProgress?: (p: { processed: number; total: number; stored: number }) => void
+    ) => {
+      onProgress?.({ processed: 5, total: 10, stored: 5 });
+      return { processed: 10, total: 10, stored: 10 };
+    };
+
+    const app = createServer(mockDb as any, undefined, mockReplayHandler as any);
+    const server = app.listen(0);
+    const port = (server.address() as any).port;
+
+    try {
+      const res = await fetch(`http://localhost:${port}/admin/replay?from_ledger=100&to_ledger=110`, {
+        method: "POST",
+        headers: { "x-admin-api-key": "admin_secret_123" },
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.headers.get("content-type"), "text/event-stream");
+
+      const text = await res.text();
+      assert.ok(text.includes('"processed":5'));
+      assert.ok(text.includes('"type":"complete"'));
+    } finally {
+      server.close();
+    }
+  });
 });

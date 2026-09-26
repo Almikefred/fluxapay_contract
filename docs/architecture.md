@@ -370,6 +370,30 @@ Full SEP-6 / SEP-24 protocol integration details, request payloads, anchor statu
 
 ---
 
+### DEX Router & Slippage Tolerance (#856)
+
+FluxaPay integrates with Soroswap-compatible DEX routers (`DexRouter`) to support atomic token swaps prior to payment settlement (`swap_and_pay`) or for swap-based refunds.
+
+#### `execute_swap` Entry Point
+
+```rust
+pub fn execute_swap(
+    env: Env,
+    caller: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: i128,
+    min_amount_out: i128,
+    max_slippage_bps: u32,
+) -> Result<i128, DexRouterError>
+```
+
+- **Slippage Enforcement**: `min_amount_out` specifies the absolute minimum token output the caller is willing to receive. If the actual swap output is less than `min_amount_out`, the swap reverts with `DexRouterError::SlippageExceeded` (code 4).
+- **Secondary Quoted Price Guard**: `max_slippage_bps` enforces a relative tolerance in basis points against the simulated quoted price (`get_amounts_out`). The parameter is strictly capped at `≤ 5000` bps (50% max). If actual execution deviates beyond this range or if `max_slippage_bps > 5000`, the transaction is rejected with `SlippageExceeded`.
+- **Price Impact Guard**: Swaps also enforce an internal price impact guard to protect against pool imbalance.
+
+---
+
 ## Security Considerations
 
 - **Reentrancy Protection**: `ReentrancyLock` guards concurrent settle/refund operations

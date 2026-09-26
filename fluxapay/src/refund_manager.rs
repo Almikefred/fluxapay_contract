@@ -431,7 +431,7 @@ impl RefundManager {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::Payment(payment_id.clone()))
+            .has(&DataKey::Payment(payment_id_to_key(env, payment_id)))
         {
             let payment = PaymentCharge {
                 payment_id: payment_id.clone(),
@@ -462,7 +462,7 @@ impl RefundManager {
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(env, payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
         }
         Ok(())
@@ -604,7 +604,7 @@ impl RefundManager {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::Payment(payment_id.clone()))
+            .has(&DataKey::Payment(payment_id_to_key(env, payment_id)))
         {
             let payment = PaymentCharge {
                 payment_id: payment_id.clone(),
@@ -635,7 +635,7 @@ impl RefundManager {
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(env, payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
             // Issue #184: Track confirmed payment count per merchant for dispute rate calculation
@@ -798,7 +798,7 @@ impl RefundManager {
         let payment: PaymentCharge = if let Some(local_payment) =
             env.storage()
                 .persistent()
-                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id_to_key(env, payment_id)))
         {
             local_payment
         } else {
@@ -1092,7 +1092,7 @@ impl RefundManager {
         let payment: PaymentCharge = env
             .storage()
             .persistent()
-            .get::<DataKey, PaymentCharge>(&DataKey::Payment(refund.payment_id.clone()))
+            .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id_to_key(env, &refund.payment_id)))
             .ok_or(Error::PaymentNotFound)?;
 
         // Issue #167: Query merchant's KYC tier and apply tiered refund fee
@@ -1449,7 +1449,7 @@ impl RefundManager {
         let payment: PaymentCharge = env
             .storage()
             .persistent()
-            .get(&DataKey::Payment(payment_id.clone()))
+            .get(&DataKey::Payment(payment_id_to_key(&env, &payment_id)))
             .ok_or(Error::PaymentNotFound)?;
 
         // Issue #485: Prevent disputes on direct transfer payments
@@ -1720,7 +1720,7 @@ impl RefundManager {
         let payment: PaymentCharge = env
             .storage()
             .persistent()
-            .get(&DataKey::Payment(payment_id.clone()))
+            .get(&DataKey::Payment(payment_id_to_key(env, payment_id)))
             .ok_or(Error::PaymentNotFound)?;
 
         // Ensure payment is confirmed
@@ -4169,7 +4169,7 @@ impl RefundManager {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(env, &payment_id)), &payment);
         Self::bump_payment_ttl(env, &payment_id, &payment.status);
 
         let counter = Self::get_next_refund_id(env);
@@ -4528,7 +4528,7 @@ impl RefundManager {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
             subscription.last_payment_at = Some(now);
@@ -4665,7 +4665,7 @@ impl RefundManager {
     }
 
     fn bump_payment_ttl(env: &Env, payment_id: &String, status: &PaymentStatus) {
-        let key = DataKey::Payment(payment_id.clone());
+        let key = DataKey::Payment(payment_id_to_key(env, payment_id));
         Self::bump_ttl(env, &key, Self::payment_ttl(status));
     }
 

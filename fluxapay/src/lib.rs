@@ -1581,7 +1581,7 @@ impl RefundManager {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::Payment(payment_id.clone()))
+            .has(&DataKey::Payment(payment_id_to_key(env, payment_id)))
         {
             let payment = PaymentCharge {
                 payment_id: payment_id.clone(),
@@ -1612,7 +1612,7 @@ impl RefundManager {
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(env, payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
         }
         Ok(())
@@ -1754,7 +1754,7 @@ impl RefundManager {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::Payment(payment_id.clone()))
+            .has(&DataKey::Payment(payment_id_to_key(env, payment_id)))
         {
             let payment = PaymentCharge {
                 payment_id: payment_id.clone(),
@@ -1785,7 +1785,7 @@ impl RefundManager {
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(env, payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
             // Issue #184: Track confirmed payment count per merchant for dispute rate calculation
@@ -1948,7 +1948,7 @@ impl RefundManager {
         let payment: PaymentCharge = if let Some(local_payment) =
             env.storage()
                 .persistent()
-                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id_to_key(env, payment_id)))
         {
             local_payment
         } else {
@@ -2242,7 +2242,7 @@ impl RefundManager {
         let payment: PaymentCharge = env
             .storage()
             .persistent()
-            .get::<DataKey, PaymentCharge>(&DataKey::Payment(refund.payment_id.clone()))
+            .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id_to_key(env, &refund.payment_id)))
             .ok_or(Error::PaymentNotFound)?;
 
         // Issue #167: Query merchant's KYC tier and apply tiered refund fee
@@ -2599,7 +2599,7 @@ impl RefundManager {
         let payment: PaymentCharge = env
             .storage()
             .persistent()
-            .get(&DataKey::Payment(payment_id.clone()))
+            .get(&DataKey::Payment(payment_id_to_key(&env, &payment_id)))
             .ok_or(Error::PaymentNotFound)?;
 
         // Issue #485: Prevent disputes on direct transfer payments
@@ -2858,7 +2858,7 @@ pub use merchant_registry::{
         let payment: PaymentCharge = env
             .storage()
             .persistent()
-            .get(&DataKey::Payment(payment_id.clone()))
+            .get(&DataKey::Payment(payment_id_to_key(env, payment_id)))
             .ok_or(Error::PaymentNotFound)?;
 
         // Ensure payment is confirmed
@@ -5347,7 +5347,7 @@ pub use merchant_registry::{
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(env, &payment_id)), &payment);
         Self::bump_payment_ttl(env, &payment_id, &payment.status);
 
         let counter = Self::get_next_refund_id(env);
@@ -5706,7 +5706,7 @@ pub use merchant_registry::{
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
             subscription.last_payment_at = Some(now);
@@ -5843,7 +5843,7 @@ pub use merchant_registry::{
     }
 
     fn bump_payment_ttl(env: &Env, payment_id: &String, status: &PaymentStatus) {
-        let key = DataKey::Payment(payment_id.clone());
+        let key = DataKey::Payment(payment_id_to_key(env, payment_id));
         Self::bump_ttl(env, &key, Self::payment_ttl(status));
     }
 
@@ -7275,7 +7275,7 @@ impl PaymentProcessor {
         if env
             .storage()
             .persistent()
-            .has(&DataKey::Payment(args.payment_id.clone()))
+            .has(&DataKey::Payment(payment_id_to_key(&env, &args.payment_id)))
         {
             return Err(Error::PaymentAlreadyExists);
         }
@@ -7367,7 +7367,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(args.payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &args.payment_id)), &payment);
         Self::record_payment_status(&env, &payment);
         Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
         Self::index_payment_expiry(&env, &args.payment_id, payment.expires_at);
@@ -7565,7 +7565,7 @@ impl PaymentProcessor {
             if env
                 .storage()
                 .persistent()
-                .has(&DataKey::Payment(args.payment_id.clone()))
+                .has(&DataKey::Payment(payment_id_to_key(&env, &args.payment_id)))
             {
                 return Err(Error::PaymentAlreadyExists);
             }
@@ -7650,7 +7650,7 @@ impl PaymentProcessor {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(args.payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(&env, &args.payment_id)), &payment);
             Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
             Self::index_payment_expiry(&env, &args.payment_id, payment.expires_at);
 
@@ -7858,7 +7858,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
         let _event_name = match &new_status {
@@ -8042,7 +8042,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
         let event_name = match &new_status {
@@ -8116,7 +8116,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
 
         env.events().publish(
             (
@@ -8158,7 +8158,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
 
         env.events().publish(
             (
@@ -8253,7 +8253,7 @@ impl PaymentProcessor {
         // Store new payment
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(new_payment_id.clone()), &new_payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &new_payment_id)), &new_payment);
         Self::bump_payment_ttl(&env, &new_payment_id, &new_payment.status);
 
         // Track retry link
@@ -8514,7 +8514,7 @@ impl PaymentProcessor {
             if let Some(payment) = env
                 .storage()
                 .persistent()
-                .get::<DataKey, PaymentCharge>(&DataKey::Payment(id.clone()))
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id_to_key(&env, &id)))
             {
                 let status_match = match &status_filter {
                     Some(status) => payment.status == status.clone(),
@@ -8733,7 +8733,7 @@ impl PaymentProcessor {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
+                .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
             // Issue #399: free idempotency key so client_token can be reused.
             Self::remove_idempotency_key(&env, &payment_id);
@@ -8764,7 +8764,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
         // Issue #399: free idempotency key so client_token can be reused after cancellation.
         Self::remove_idempotency_key(&env, &payment_id);
@@ -8793,7 +8793,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
         // Issue #399: free idempotency key so client_token can be reused.
         Self::remove_idempotency_key(&env, &payment_id);
@@ -9203,7 +9203,7 @@ impl PaymentProcessor {
                 Self::record_payment_status(&env, &payment);
                 env.storage()
                     .persistent()
-                    .set(&DataKey::Payment(payment_id.clone()), &payment);
+                    .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
                 Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
                 // If merchant has AnchorConfig set, emit the
@@ -9351,7 +9351,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
         // Issue #166: Optimize event topics
@@ -9512,7 +9512,7 @@ impl PaymentProcessor {
                 {
                     env.storage()
                         .persistent()
-                        .remove(&DataKey::Payment(payment_id.clone()));
+                        .remove(&DataKey::Payment(payment_id_to_key(&env, &payment_id)));
                     pruned_count = pruned_count.saturating_add(1);
                 }
             }
@@ -9872,7 +9872,7 @@ impl PaymentProcessor {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment.payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment.payment_id)), &payment);
 
         env.events().publish(
             (Symbol::new(&env, "SWAP"), Symbol::new(&env, "EXECUTED")),
@@ -9975,7 +9975,7 @@ impl PaymentProcessor {
         payment.swap_path = Some(args.path.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(args.payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &args.payment_id)), &payment);
         Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
 
         env.events().publish(
@@ -10119,7 +10119,7 @@ impl PaymentProcessor {
     fn get_payment_internal(env: &Env, payment_id: &String) -> Result<PaymentCharge, Error> {
         env.storage()
             .persistent()
-            .get(&DataKey::Payment(payment_id.clone()))
+            .get(&DataKey::Payment(payment_id_to_key(env, payment_id)))
             .ok_or(Error::PaymentNotFound)
     }
 
@@ -10268,7 +10268,7 @@ impl PaymentProcessor {
             if let Some(payment) = env
                 .storage()
                 .persistent()
-                .get::<DataKey, PaymentCharge>(&DataKey::Payment(id))
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id_to_key(&env, &id)))
             {
                 let token_match = match &token_address {
                     Some(token) => payment.token_address.as_ref() == Some(token),
@@ -10455,7 +10455,7 @@ impl PaymentProcessor {
     }
 
     fn bump_payment_ttl(env: &Env, payment_id: &String, status: &PaymentStatus) {
-        let key = DataKey::Payment(payment_id.clone());
+        let key = DataKey::Payment(payment_id_to_key(env, payment_id));
         Self::bump_ttl(env, &key, Self::payment_ttl(status));
     }
 
