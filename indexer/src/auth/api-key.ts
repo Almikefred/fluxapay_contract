@@ -1,13 +1,68 @@
 /**
- * API Key authentication middleware for the Indexer REST API.
+ * API Key authentication & scope enforcement middleware for the Indexer REST API.
  * Supports request headers `x-api-key` or `Authorization: Bearer <api_key>`.
- * Rejects missing or invalid credentials without logging API keys.
+ * Rejects missing, invalid, or insufficiently scoped credentials.
+ *
+ * Scopes supported (Issue #854):
+ * - `read:payments`: GET payment, list payments, refunds, disputes
+ * - `write:payments`: payment creation/mutation
+ * - `read:analytics`: events and analytics queries
+ * - `manage:webhooks`: create, update, delete webhook endpoints
+ * - `admin`: full unrestricted access
  */
 
 import type { Request, Response, NextFunction } from "express";
 
+export interface ScopedApiKey {
+  key: string;
+  merchantId?: string;
+  scopes: string[];
+}
+
+// In-memory registry of scoped API keys
+const apiKeyRegistry: Map<string, ScopedApiKey> = new Map();
+
 export function getExpectedApiKey(): string | undefined {
   return process.env.API_KEY || process.env.INDEXER_API_KEY;
+}
+
+export function registerApiKey(apiKey: ScopedApiKey): void {
+  apiKeyRegistry.set(apiKey.key, apiKey);
+}
+
+export function clearRegisteredApiKeys(): void {
+  apiKeyRegistry.clear();
+}
+
+export function getKeyScopes(key: string): string[] | null {
+  // Check explicit registry
+  const registered = apiKeyRegistry.get(key);
+  if (registered) {
+    return registered.scopes;
+  }
+
+  // Check env API_KEY (defaults to admin scope for backwards compatibility)
+  const envKey = getExpectedApiKey();
+  if (envKey && key === envKey) {
+    return ["admin"];
+  }
+
+  // Check API_KEYS JSON in environment if set
+  if (process.env.API_KEYS) {
+    try {
+      const parsed = JSON.parse(process.env.API_KEYS);
+      if (Array.isArray(parsed)) {
+        const match = parsed.find((item: any) => item.key === key);
+        if (match && Array.isArray(match.scopes)) {
+          return match.scopes;
+        }
+      }
+    } catch {
+      // Ignore parse errors in environment string
+    }
+  }
+
+  return null;
 }
 
 export function extractApiKey(req: Request): string | null {
@@ -29,13 +84,11 @@ export function requireApiKey(req: Request, res: Response, next: NextFunction): 
   const expectedKey = getExpectedApiKey();
 
   // If no API key is set in environment (e.g. unconfigured local dev), permit or reject based on config
-  if (!expectedKey) {
-    // If process.env explicitly disables auth in dev mode:
+  if (!expectedKey && apiKeyRegistry.size === 0) {
     if (process.env.ALLOW_ANONYMOUS_API === "true") {
       next();
       return;
     }
-    // Otherwise, if API key is expected by default:
     res.status(401).json({ error: "API key authentication not configured" });
     return;
   }
@@ -46,10 +99,51 @@ export function requireApiKey(req: Request, res: Response, next: NextFunction): 
     return;
   }
 
-  if (providedKey !== expectedKey) {
+  const scopes = getKeyScopes(providedKey);
+  if (!scopes) {
     res.status(401).json({ error: "Invalid API key" });
     return;
   }
 
+  (req as any).apiKeyScopes = scopes;
   next();
+}
+
+/**
+ * Middleware that verifies the caller's API key contains the required scope.
+ * Admin scope grants access to all operations.
+ * If insufficient, returns 403 Insufficient Scope with required_scope.
+ */
+export function requireScope(requiredScope: string) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const expectedKey = getExpectedApiKey();
+    if (!expectedKey && apiKeyRegistry.size === 0 && process.env.ALLOW_ANONYMOUS_API === "true") {
+      next();
+      return;
+    }
+
+    const providedKey = extractApiKey(req);
+    if (!providedKey) {
+      res.status(401).json({ error: "Missing API key" });
+      return;
+    }
+
+    const scopes = getKeyScopes(providedKey);
+    if (!scopes) {
+      res.status(401).json({ error: "Invalid API key" });
+      return;
+    }
+
+    (req as any).apiKeyScopes = scopes;
+
+    if (scopes.includes("admin") || scopes.includes(requiredScope)) {
+      next();
+      return;
+    }
+
+    res.status(403).json({
+      error: "Insufficient Scope",
+      required_scope: requiredScope,
+    });
+  };
 }

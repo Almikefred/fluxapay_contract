@@ -366,7 +366,27 @@ export const MerchantAuthError = {
   4: { message: "InvalidAmount" },
   5: { message: "Unauthorized" },
   6: { message: "AuthorizationAlreadyExists" },
+  7: { message: "ApiKeyNotFound" },
+  8: { message: "ApiKeyRevoked" },
 } as const;
+
+/**
+ * Issue #854: Scoped API key record for a merchant.
+ */
+export interface ApiKeyRecord {
+  key_hash: string;
+  merchant: string;
+  scopes: string[];
+  created_at: bigint;
+  revoked: boolean;
+}
+
+export interface CreateApiKeyParams {
+  merchant: string;
+  keyHash: string;
+  scopes: string[];
+}
+
 
 /**
  * Issue #185 / #665: Record of a dispute settled off-chain by mutual
@@ -1278,7 +1298,47 @@ export class FluxapayClient {
   }
 
   /**
+   * Issue #854: Merchant creates a scoped API key.
+   */
+  async createApiKey(params: CreateApiKeyParams): Promise<ApiKeyRecord> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).create_api_key({
+        merchant: params.merchant,
+        key_hash: params.keyHash,
+        scopes: params.scopes,
+      });
+      return tx?.result ?? tx;
+    });
+  }
+
+  /**
+   * Issue #854: Retrieve an API key record by its key hash.
+   */
+  async getApiKey(keyHash: string): Promise<ApiKeyRecord> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).get_api_key({
+        key_hash: keyHash,
+      });
+      return tx?.result ?? tx;
+    });
+  }
+
+  /**
+   * Issue #854: Merchant revokes an active API key.
+   */
+  async revokeApiKey(merchant: string, keyHash: string): Promise<void> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).revoke_api_key({
+        merchant,
+        key_hash: keyHash,
+      });
+      return tx?.result ?? tx;
+    });
+  }
+
+  /**
    * Get all refunds for a payment
+
    */
   async getPaymentRefunds(paymentId: string) {
     return withMappedContractError(() =>

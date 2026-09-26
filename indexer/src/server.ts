@@ -1,20 +1,19 @@
 /**
  * FluxaPay Indexer REST API Server
  * Exposes read-only endpoints for persisted payments, disputes, refunds, and events,
- * as well as health check and manual DLQ replay endpoints.
+ * as well as health check, manual DLQ replay, and real-time SSE event streaming.
  */
 
 import express, { type Request, type Response, type NextFunction } from "express";
 import * as dotenv from "dotenv";
 import { Database } from "./database";
-import { requireApiKey } from "./auth/api-key";
+import { requireApiKey, requireScope } from "./auth/api-key";
 import {
   registerWebhookRoutes,
   startDeliveryLogRetentionJob,
   WebhookStore,
   type RetentionJobHandle,
 } from "./webhooks";
-
 dotenv.config();
 
 export type ReplayDLQHandler = () => Promise<{ attempted: number; succeeded: number; failed: number }>;
@@ -40,8 +39,9 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   // All subsequent routes require API-key authentication
   app.use(requireApiKey);
 
-  // Webhook test delivery and delivery history (Issues #808, #810).
-  // Registered after the API-key gate, so both are merchant-authenticated.
+  // Webhook test delivery and delivery history (Issues #808, #810, #854).
+  // Registered after the API-key gate, scoped to manage:webhooks.
+  app.use("/webhooks", requireScope("manage:webhooks"));
   registerWebhookRoutes(app, {
     store: new WebhookStore(database.getPool()),
     // The API key identifies the merchant; endpoint ownership is re-checked
@@ -53,7 +53,7 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   });
 
   // GET /payments/:paymentId
-  app.get("/payments/:paymentId", async (req: Request, res: Response, next: NextFunction) => {
+  app.get("/payments/:paymentId", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { paymentId } = req.params;
       const payment = await database.getPaymentById(paymentId);
@@ -68,7 +68,7 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   });
 
   // GET /merchants/:merchantId/payments?page=1&limit=20&status=Confirmed
-  app.get("/merchants/:merchantId/payments", async (req: Request, res: Response, next: NextFunction) => {
+  app.get("/merchants/:merchantId/payments", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { merchantId } = req.params;
       const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
@@ -88,7 +88,7 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   });
 
   // GET /merchants/:merchantId/disputes?status=Open
-  app.get("/merchants/:merchantId/disputes", async (req: Request, res: Response, next: NextFunction) => {
+  app.get("/merchants/:merchantId/disputes", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { merchantId } = req.params;
       const status = req.query.status ? (req.query.status as string) : undefined;
@@ -101,7 +101,7 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   });
 
   // GET /refunds/:refundId
-  app.get("/refunds/:refundId", async (req: Request, res: Response, next: NextFunction) => {
+  app.get("/refunds/:refundId", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { refundId } = req.params;
       const refund = await database.getRefundById(refundId);
@@ -116,7 +116,7 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   });
 
   // GET /events?type=PAYMENT/CONFIRMED&from=<ledger>&to=<ledger>
-  app.get("/events", async (req: Request, res: Response, next: NextFunction) => {
+  app.get("/events", requireScope("read:analytics"), async (req: Request, res: Response, next: NextFunction) => {
     try {
       const type = req.query.type ? (req.query.type as string) : undefined;
       const fromLedger = req.query.from ? parseInt(req.query.from as string, 10) : undefined;
@@ -139,7 +139,7 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
   });
 
   // POST /admin/replay-dlq - Trigger manual replay of dead-letter queue events
-  app.post("/admin/replay-dlq", async (_req: Request, res: Response, next: NextFunction) => {
+  app.post("/admin/replay-dlq", requireScope("admin"), async (_req: Request, res: Response, next: NextFunction) => {
     try {
       if (!replayDlqHandler) {
         res.status(501).json({ error: "DLQ replay handler not configured on server" });
