@@ -8,12 +8,16 @@ import express, { type Request, type Response, type NextFunction } from "express
 import * as dotenv from "dotenv";
 import { Database } from "./database";
 import { requireApiKey, requireScope } from "./auth/api-key";
+import { requireSEP10Auth } from "./auth/middleware";
+import { loadSEP10AuthConfig } from "./auth/config";
+import { sseManager } from "./sse";
 import {
   registerWebhookRoutes,
   startDeliveryLogRetentionJob,
   WebhookStore,
   type RetentionJobHandle,
 } from "./webhooks";
+
 dotenv.config();
 
 export type ReplayDLQHandler = () => Promise<{ attempted: number; succeeded: number; failed: number }>;
@@ -35,6 +39,51 @@ export function createServer(database: Database, replayDlqHandler?: ReplayDLQHan
       res.status(503).json({ status: "unhealthy", database: "disconnected", error: error.message || String(error) });
     }
   });
+
+  // Issue #855: Real-time event streaming via Server-Sent Events (SSE)
+  const sep10Config = loadSEP10AuthConfig();
+  const sseHandler = async (req: Request, res: Response): Promise<void> => {
+    const merchantId = (req.query.merchant_id as string) || req.auth?.sub;
+    if (!merchantId) {
+      res.status(400).json({ error: "Missing required query parameter: merchant_id" });
+      return;
+    }
+
+    if (req.auth && req.auth.sub !== merchantId && !sep10Config.adminAccounts.has(req.auth.sub)) {
+      res.status(403).json({ error: "Token is not authorized for this merchant" });
+      return;
+    }
+
+    if (!sseManager.canConnect(merchantId)) {
+      res.status(429).json({
+        error: "Rate limit exceeded: maximum 5 concurrent SSE connections per merchant",
+        limit: 5,
+      });
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    res.flushHeaders?.();
+
+    const eventTypes =
+      typeof req.query.event_types === "string"
+        ? req.query.event_types.split(",").map((s) => s.trim())
+        : undefined;
+
+    const clientId = `${merchantId}-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    sseManager.registerClient(clientId, merchantId, res, eventTypes);
+
+    req.on("close", () => {
+      sseManager.removeClient(clientId);
+    });
+  };
+
+  app.get("/v1/events/stream", requireSEP10Auth(sep10Config), sseHandler);
+  app.get("/events/stream", requireSEP10Auth(sep10Config), sseHandler);
 
   // All subsequent routes require API-key authentication
   app.use(requireApiKey);

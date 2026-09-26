@@ -508,3 +508,12 @@ export function useMarkInvoicePaid(): UseMarkInvoicePaidResult {
 
   return { mutate, status, loading: status === "loading", error };
 }
+
+export { usePaymentEvents } from "./usePaymentEvents.js";
+export type {
+  PaymentEvent,
+  ConnectionStatus,
+  UsePaymentEventsOptions,
+  UsePaymentEventsResult,
+} from "./usePaymentEvents.js";
+

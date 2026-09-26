@@ -25,10 +25,14 @@ declare global {
 
 function extractBearerToken(req: Request): string | null {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith("Bearer ")) {
-    return null;
+  if (header && header.startsWith("Bearer ")) {
+    return header.slice("Bearer ".length).trim() || null;
   }
-  return header.slice("Bearer ".length).trim() || null;
+  const queryToken = req.query.token;
+  if (typeof queryToken === "string" && queryToken.trim()) {
+    return queryToken.trim();
+  }
+  return null;
 }
 
 /**
