@@ -532,6 +532,26 @@ export class FluxapayError extends Error {
   }
 }
 
+/**
+ * Issue #814: raised client-side when a batch exceeds `MAX_BATCH_STATUS_IDS`.
+ *
+ * Thrown before any network call rather than letting the RPC reject it, so the
+ * caller gets an actionable message instead of a simulation failure — and so
+ * the cap is enforced even against an RPC that would have accepted more.
+ */
+export class BatchTooLargeError extends Error {
+  constructor(
+    readonly requested: number,
+    readonly limit: number,
+  ) {
+    super(`Batch of ${requested} exceeds the maximum of ${limit} payment IDs`);
+    this.name = "BatchTooLargeError";
+  }
+}
+
+/** Issue #814: maximum payment IDs accepted by `getPaymentStatuses`. */
+export const MAX_BATCH_STATUS_IDS = 50;
+
 const HOST_ERROR_CODE_REGEX = /Error\(Contract,\s*#(\d+)\)/;
 
 function parseContractErrorCode(error: unknown): number | null {
@@ -579,6 +599,44 @@ function toFluxapayError(error: unknown): FluxapayError {
     `${contractErrorName} (contract error #${code})`,
     error,
   );
+}
+
+/**
+ * Issue #814: a payment's status as the contract reports it.
+ *
+ * Deliberately loose. The contract's status enum is generated per-binding and
+ * the shape differs between a `Result`-wrapped simulation and a direct read, so
+ * pinning it here would break on the next binding regeneration.
+ */
+export type PaymentStatusValue = string | { tag: string; values?: unknown };
+
+/** Pulls the status field out of whatever shape `get_payment` returned. */
+function extractPaymentStatus(payment: unknown): PaymentStatusValue | null {
+  if (payment === null || payment === undefined) return null;
+
+  // Simulation results arrive wrapped; unwrap one level if present.
+  const unwrapped =
+    typeof payment === "object" && payment !== null && "result" in payment
+      ? (payment as { result: unknown }).result
+      : payment;
+
+  if (typeof unwrapped !== "object" || unwrapped === null) return null;
+
+  const status = (unwrapped as { status?: unknown }).status;
+  if (status === undefined || status === null) return null;
+
+  return status as PaymentStatusValue;
+}
+
+/** True when an error means "no such payment" rather than a transport failure. */
+function isPaymentNotFound(error: unknown): boolean {
+  if (error instanceof FluxapayError) {
+    return error.contractErrorName === "PaymentNotFound";
+  }
+  // Some bindings surface a missing entry as a plain message before the code
+  // mapper sees it.
+  const message = error instanceof Error ? error.message : String(error);
+  return /PaymentNotFound|payment not found|#404\b/i.test(message);
 }
 
 async function withMappedContractError<T>(operation: () => Promise<T>): Promise<T> {
@@ -1336,6 +1394,70 @@ export class FluxapayClient {
     return withMappedContractError(() =>
       (this.contract as any).get_payment_status_history({ payment_id: paymentId }),
     );
+  }
+
+  /**
+   * Issue #814: read the status of many payments in one round trip.
+   *
+   * Merchants reconciling orders were calling `getPayment` in a loop, which is
+   * N sequential RPC calls — latency scales linearly with the order book.
+   *
+   * @param paymentIds up to {@link MAX_BATCH_STATUS_IDS} IDs
+   * @returns a Map from payment ID to status, with `null` for IDs that do not
+   *          exist. A missing payment is an ordinary result here, not an error:
+   *          a merchant checking 50 orders should not lose the other 49 because
+   *          one ID was mistyped.
+   * @throws {BatchTooLargeError} if more than the limit is requested
+   *
+   * # Why the reads are issued concurrently rather than as one contract call
+   *
+   * A true single-invocation batch needs an on-chain view that takes a vector
+   * of IDs and returns a vector of statuses. `get_payment` takes one ID, so
+   * batching on-chain would mean a contract change and a redeploy. Issuing the
+   * reads concurrently against the same RPC gets the latency win — one round
+   * trip's worth of wall time instead of N — without touching the contract.
+   *
+   * If a `get_payment_summary`-style vector view lands later, this method's
+   * signature does not change; only its body does.
+   */
+  async getPaymentStatuses(
+    paymentIds: string[],
+  ): Promise<Map<string, PaymentStatusValue | null>> {
+    if (paymentIds.length > MAX_BATCH_STATUS_IDS) {
+      throw new BatchTooLargeError(paymentIds.length, MAX_BATCH_STATUS_IDS);
+    }
+
+    const results = new Map<string, PaymentStatusValue | null>();
+    if (paymentIds.length === 0) {
+      return results;
+    }
+
+    // Duplicates are collapsed so a caller passing the same ID twice does not
+    // pay for it twice; the returned Map is keyed by ID either way.
+    const unique = [...new Set(paymentIds)];
+
+    const settled = await Promise.all(
+      unique.map(async (id) => {
+        try {
+          const payment = await this.getPayment(id);
+          return { id, status: extractPaymentStatus(payment) };
+        } catch (error) {
+          // A not-found payment is reported as null. Anything else is a real
+          // failure and is rethrown, because silently mapping an RPC outage to
+          // "these 50 orders do not exist" would be far worse than an error.
+          if (isPaymentNotFound(error)) {
+            return { id, status: null };
+          }
+          throw error;
+        }
+      }),
+    );
+
+    for (const { id, status } of settled) {
+      results.set(id, status);
+    }
+
+    return results;
   }
 
   async generateReconciliationReportPaginated(params: {

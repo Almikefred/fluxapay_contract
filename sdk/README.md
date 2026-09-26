@@ -52,6 +52,58 @@ async function main() {
 }
 ```
 
+## Bulk payment status
+
+Reconciling a batch of orders with `getPayment` in a loop costs N sequential RPC
+round trips — latency grows with the order book. `getPaymentStatuses` fans the
+reads out concurrently instead:
+
+```typescript
+const statuses = await client.getPaymentStatuses([
+  "pay_001",
+  "pay_002",
+  "pay_003",
+]);
+
+// Map<string, PaymentStatusValue | null>
+for (const [id, status] of statuses) {
+  if (status === null) {
+    console.warn(`${id}: no such payment`);
+  } else {
+    console.log(`${id}: ${JSON.stringify(status)}`);
+  }
+}
+```
+
+**A missing payment is `null`, not an error.** A merchant checking 50 orders
+should not lose the other 49 because one ID was mistyped. Anything *other* than
+not-found — an RPC outage, an auth failure — is rethrown, because silently
+reporting "these 50 orders do not exist" would be far worse than an error.
+
+**Capped at 50 IDs**, enforced client-side before any request:
+
+```typescript
+import { BatchTooLargeError, MAX_BATCH_STATUS_IDS } from "@fluxapay/sdk";
+
+try {
+  await client.getPaymentStatuses(tooMany);
+} catch (err) {
+  if (err instanceof BatchTooLargeError) {
+    console.error(`Split into chunks of ${MAX_BATCH_STATUS_IDS}`);
+  }
+}
+```
+
+Duplicate IDs are collapsed into a single read; the returned Map is keyed by ID
+either way.
+
+> The reads are issued concurrently against the same RPC rather than as one
+> contract invocation. A true single-call batch needs an on-chain view taking a
+> vector of IDs, and `get_payment` takes one — so batching on-chain would mean a
+> contract change and a redeploy. This gets the latency win without that. If
+> such a view lands later, the method signature does not change; only its body
+> does.
+
 ## Contract IDs
 
 Every network environment (`mainnet`, `testnet`, `standalone`) has a canonical
