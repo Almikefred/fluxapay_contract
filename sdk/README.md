@@ -16,6 +16,10 @@ Upgrading between major versions? See the
 [SDK Migration Guide](../docs/sdk-migration-guide.md) for breaking changes
 and before/after code snippets.
 
+Running testnet integration tests? See the
+[Integration Test Guide](../docs/integration-test-guide.md) for setup
+and prerequisites.
+
 ## Quick Start
 
 ```typescript
