@@ -1,21 +1,21 @@
 import {
   Client as ContractClient,
-  Merchant,
-  PaymentCharge,
-  Refund,
-  Dispute,
-  PaymentStatus,
-  RefundStatus,
-  DisputeStatus,
-  FeeConfig,
-  MaybeFeeConfig,
-  CreatePaymentArgs,
+  type Merchant,
+  type PaymentCharge,
+  type Refund,
+  type Dispute,
+  type PaymentStatus,
+  type RefundStatus,
+  type DisputeStatus,
+  type FeeConfig,
+  type MaybeFeeConfig,
+  type CreatePaymentArgs,
 } from "./contracts/fluxapay/src/index.js";
 import { Networks } from "@stellar/stellar-sdk";
 import {
   FluxapayOfflineSigner,
-  OfflineTransactionPayload,
-  SubscriptionBillingClient,
+  type OfflineTransactionPayload,
+  type SubscriptionBillingClient,
   buildOfflinePayload,
   buildCreatePaymentPayload,
   buildVerifyPaymentPayload,
@@ -27,9 +27,9 @@ import {
 } from "./offline-signer.js";
 import {
   NetworkProfileSwitcher,
-  NetworkEnvironment,
+  type NetworkEnvironment,
   NetworkProfiles,
-  NetworkProfile,
+  type NetworkProfile,
   FLUXAPAY_CONTRACT_IDS,
   UNSET_CONTRACT_ID,
 } from "./network-profiles.js";
@@ -54,12 +54,20 @@ import {
   type BatchLinkItem,
 } from "./contracts/payment-link-manager.js";
 import { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
+import {
+  getLocalizedErrorMessage,
+  MESSAGES,
+  SUPPORTED_LOCALES,
+  type SupportedLocale,
+} from "./locales/index.js";
 
-
+export { getLocalizedErrorMessage, MESSAGES, SUPPORTED_LOCALES, type SupportedLocale };
 
 export interface FluxapayConfig {
   network: NetworkEnvironment;
   rpcUrl?: string;
+  /** Locale for error messages (e.g. 'en', 'fr', 'pt', 'es'). Defaults to 'en'. */
+  locale?: string;
   /**
    * PaymentProcessor contract ID. Optional — falls back to
    * `FLUXAPAY_CONTRACT_IDS[network].paymentProcessor` when omitted.
@@ -513,6 +521,10 @@ export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   63: "RefundNotApproved",
   64: "RouterNotAllowed",
   65: "RouteOutputInsufficient",
+  66: "BatchContainsDuplicates",
+  67: "InputTooLong",
+  68: "TimelockNotExpired",
+  69: "InvalidEvidenceCid",
   404: "PaymentNotFound",
   405: "RefundNotFound",
   406: "InvalidAmount",
@@ -522,13 +534,25 @@ export class FluxapayError extends Error {
   readonly code: number;
   readonly contractErrorName: string;
   readonly cause?: unknown;
+  readonly locale: string;
 
-  constructor(code: number, contractErrorName: string, message?: string, cause?: unknown) {
+  constructor(
+    code: number,
+    contractErrorName: string,
+    message?: string,
+    cause?: unknown,
+    locale = "en",
+  ) {
     super(message ?? contractErrorName);
     this.name = `${contractErrorName}Error`;
     this.code = code;
     this.contractErrorName = contractErrorName;
     this.cause = cause;
+    this.locale = locale;
+  }
+
+  get localizedMessage(): string {
+    return getLocalizedErrorMessage(this.code, this.locale, this.message);
   }
 }
 
@@ -583,7 +607,7 @@ function parseContractErrorCode(error: unknown): number | null {
   return null;
 }
 
-function toFluxapayError(error: unknown): FluxapayError {
+export function toFluxapayError(error: unknown, locale = "en"): FluxapayError {
   const code = parseContractErrorCode(error);
   if (code === null) {
     if (error instanceof Error) {
@@ -598,6 +622,7 @@ function toFluxapayError(error: unknown): FluxapayError {
     contractErrorName,
     `${contractErrorName} (contract error #${code})`,
     error,
+    locale,
   );
 }
 
@@ -639,11 +664,20 @@ function isPaymentNotFound(error: unknown): boolean {
   return /PaymentNotFound|payment not found|#404\b/i.test(message);
 }
 
-async function withMappedContractError<T>(operation: () => Promise<T>): Promise<T> {
+let defaultClientLocale = "en";
+
+export function setDefaultLocale(locale: string): void {
+  defaultClientLocale = locale;
+}
+
+export async function withMappedContractError<T>(
+  operation: () => Promise<T>,
+  locale?: string,
+): Promise<T> {
   try {
     return await operation();
   } catch (error) {
-    throw toFluxapayError(error);
+    throw toFluxapayError(error, locale ?? defaultClientLocale);
   }
 }
 
@@ -685,6 +719,7 @@ function resolveContractId(explicit: string | undefined, fallback: string, label
 export class FluxapayClient {
   public contract: ContractClient;
   public networkSwitcher: NetworkProfileSwitcher;
+  public readonly locale: string;
   private fxOracleClient?: FxOracleClient;
   private merchantRegistryClient?: MerchantRegistryClient;
   private paymentLinkManagerClient?: PaymentLinkManagerClient;
@@ -693,6 +728,8 @@ export class FluxapayClient {
 
   constructor(config: FluxapayConfig) {
     this.config = config;
+    this.locale = config.locale ?? "en";
+    setDefaultLocale(this.locale);
     this.networkSwitcher = new NetworkProfileSwitcher(config.network);
 
     const rpcUrl = config.rpcUrl || this.networkSwitcher.getProfile().rpcUrl;
@@ -2332,23 +2369,20 @@ export class FluxapayClient {
   }
 }
 
-export { toFluxapayError, withMappedContractError };
-
 export {
-  Merchant,
-  PaymentCharge,
-  Refund,
-  Dispute,
-  PaymentStatus,
-  RefundStatus,
-  DisputeStatus,
-  FeeConfig,
-  MaybeFeeConfig,
-  CreatePaymentArgs,
-  SubscriptionPlan,
+  type Merchant,
+  type PaymentCharge,
+  type Refund,
+  type Dispute,
+  type PaymentStatus,
+  type RefundStatus,
+  type DisputeStatus,
+  type FeeConfig,
+  type MaybeFeeConfig,
+  type CreatePaymentArgs,
   FluxapayOfflineSigner,
-  OfflineTransactionPayload,
-  SubscriptionBillingClient,
+  type OfflineTransactionPayload,
+  type SubscriptionBillingClient,
   buildOfflinePayload,
   buildCreatePaymentPayload,
   buildVerifyPaymentPayload,
@@ -2358,13 +2392,9 @@ export {
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
   NetworkProfileSwitcher,
-  NetworkEnvironment,
+  type NetworkEnvironment,
   NetworkProfiles,
-  NetworkProfile,
-  PaymentStream,
-  StreamStatus,
-  StreamError,
-  CreateStreamParams,
+  type NetworkProfile,
 };
 
 export { RefundManagerClient, type RefundManagerConfig } from "./contracts/refund-manager.js";
