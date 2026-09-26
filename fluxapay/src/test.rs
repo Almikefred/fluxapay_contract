@@ -22,11 +22,11 @@ fn test_datakey_discriminant_stability() {
     env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &11u32);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &11u32);
         assert_eq!(
             env.storage()
                 .persistent()
-                .get::<_, u32>(&DataKey::Payment(payment_id)),
+                .get::<_, u32>(&DataKey::Payment(payment_id_to_key(&env, &payment_id))),
             Some(11)
         );
 
@@ -375,11 +375,11 @@ fn test_create_payments_batch_is_atomic_on_validation_error() {
     assert!(!env
         .storage()
         .persistent()
-        .has(&DataKey::Payment(payment_id_1)));
+        .has(&DataKey::Payment(payment_id_to_key(&env, &payment_id_1))));
     assert!(!env
         .storage()
         .persistent()
-        .has(&DataKey::Payment(payment_id_2)));
+        .has(&DataKey::Payment(payment_id_to_key(&env, &payment_id_2))));
 }
 
 /// Issue #682: Batch with duplicate payment_ids returns BatchContainsDuplicates.
@@ -6503,7 +6503,7 @@ fn test_batch_expire_payments_confirmed_payment_not_expired() {
         payment.status = PaymentStatus::Confirmed;
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
+            .set(&DataKey::Payment(payment_id_to_key(&env, &payment_id)), &payment);
     });
 
     // Advance time past expiry

@@ -1,11 +1,22 @@
 //! Data keys for persistent storage in FluxaPay.
 
 use crate::merchant_registry::KycTier;
-use soroban_sdk::{contracttype, Address, BytesN, String, Symbol};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Symbol};
+
+/// Converts a payment ID String into a 32-byte hash key for storage.
+/// Reduces storage rent and improves lookups.
+pub fn payment_id_to_key(env: &Env, payment_id: &String) -> BytesN<32> {
+    env.crypto().sha256(&payment_id.to_bytes())
+}
+
+/// Converts a payment ID string slice into a 32-byte hash key for storage.
+pub fn payment_id_str_to_key(env: &Env, payment_id: &str) -> BytesN<32> {
+    env.crypto().sha256(&Bytes::from_slice(env, payment_id.as_bytes()))
+}
 
 #[contracttype]
 pub enum DataKey {
-    Payment(String),
+    Payment(BytesN<32>),
     PaymentStatusHistory(String),
     MerchantPayments(Address),
     MerchantRateLimit(Address),
