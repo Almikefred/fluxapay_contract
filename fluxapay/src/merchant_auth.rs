@@ -14,7 +14,7 @@
 /// `MERCHANT_AUTH / GRANTED`  – customer grants a new authorization
 /// `MERCHANT_AUTH / REVOKED`  – customer revokes an existing authorization
 /// `MERCHANT_AUTH / CHARGED`  – merchant pulls funds against the authorization
-use soroban_sdk::{contracterror, contracttype, token, Address, Env, Symbol};
+use soroban_sdk::{contracterror, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
 
 // ─── Data types ───────────────────────────────────────────────────────────────
 
@@ -42,11 +42,24 @@ pub struct MerchantAuthorization {
     pub created_at: u64,
 }
 
+/// Issue #854: Scoped API key record for a merchant.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApiKeyRecord {
+    pub key_hash: BytesN<32>,
+    pub merchant: Address,
+    pub scopes: Vec<String>,
+    pub created_at: u64,
+    pub revoked: bool,
+}
+
 /// Storage keys for merchant authorizations.
 #[contracttype]
 pub enum MerchantAuthDataKey {
     /// Keyed by (customer, merchant) pair.
     Authorization(Address, Address),
+    /// Keyed by API key hash.
+    ApiKey(BytesN<32>),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -66,6 +79,10 @@ pub enum MerchantAuthError {
     Unauthorized = 5,
     /// An authorization already exists; revoke it first.
     AuthorizationAlreadyExists = 6,
+    /// API key was not found.
+    ApiKeyNotFound = 7,
+    /// API key has already been revoked.
+    ApiKeyRevoked = 8,
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -318,7 +335,92 @@ impl MerchantPreAuth {
 
         Ok(auth.limit_per_period.saturating_sub(pulled).max(0))
     }
+
+    // ─── API Key Management (Issue #854) ──────────────────────────────────────
+
+    /// Merchant creates a scoped API key.
+    ///
+    /// # Parameters
+    /// * `merchant` – Merchant owner of the key; must sign.
+    /// * `key_hash` – SHA-256 hash of the generated API key.
+    /// * `scopes`   – Allowed scopes for this key (e.g. read:payments, write:payments).
+    pub fn create_api_key(
+        env: Env,
+        merchant: Address,
+        key_hash: BytesN<32>,
+        scopes: Vec<String>,
+    ) -> Result<ApiKeyRecord, MerchantAuthError> {
+        merchant.require_auth();
+
+        let record = ApiKeyRecord {
+            key_hash: key_hash.clone(),
+            merchant: merchant.clone(),
+            scopes,
+            created_at: env.ledger().timestamp(),
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&MerchantAuthDataKey::ApiKey(key_hash.clone()), &record);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT_AUTH"),
+                Symbol::new(&env, "API_KEY_CREATED"),
+            ),
+            (merchant, key_hash),
+        );
+
+        Ok(record)
+    }
+
+    /// Retrieve an API key record by its key hash.
+    pub fn get_api_key(env: Env, key_hash: BytesN<32>) -> Result<ApiKeyRecord, MerchantAuthError> {
+        env.storage()
+            .persistent()
+            .get(&MerchantAuthDataKey::ApiKey(key_hash))
+            .ok_or(MerchantAuthError::ApiKeyNotFound)
+    }
+
+    /// Merchant revokes an active API key.
+    pub fn revoke_api_key(
+        env: Env,
+        merchant: Address,
+        key_hash: BytesN<32>,
+    ) -> Result<(), MerchantAuthError> {
+        merchant.require_auth();
+
+        let key = MerchantAuthDataKey::ApiKey(key_hash.clone());
+        let mut record: ApiKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MerchantAuthError::ApiKeyNotFound)?;
+
+        if record.merchant != merchant {
+            return Err(MerchantAuthError::Unauthorized);
+        }
+        if record.revoked {
+            return Err(MerchantAuthError::ApiKeyRevoked);
+        }
+
+        record.revoked = true;
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT_AUTH"),
+                Symbol::new(&env, "API_KEY_REVOKED"),
+            ),
+            (merchant, key_hash),
+        );
+
+        Ok(())
+    }
 }
+
+pub type MerchantAuth = MerchantPreAuth;
 
 #[cfg(test)]
 mod period_reset_tests {

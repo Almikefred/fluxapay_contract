@@ -299,6 +299,14 @@ FluxaPay contract events are defined with `#[contractevent]`. Follow these steps
 - Subscribed to in `indexer/sync.yml` under the `merchant_registry` contract mapping
 - Typed in the SDK alongside the other merchant registry events
 
+### Adding SDK Error Locales (Issue #852)
+
+Contributors can add support for new languages to the SDK error system:
+1. Create a new JSON file in `sdk/src/locales/<locale>.json` (e.g., `de.json`, `sw.json`).
+2. Map each contract error code number to its translated, user-friendly message (refer to `sdk/src/locales/en.json` for the complete list of error codes).
+3. Register the new locale in `sdk/src/locales/index.ts` under `SUPPORTED_LOCALES` and the `MESSAGES` map.
+4. Run `npm test` in `sdk/` to ensure all tests pass.
+
 ---
 
 ## 8. Issue Workflow

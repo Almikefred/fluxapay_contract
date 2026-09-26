@@ -68,6 +68,8 @@ pub enum FXOracleError {
     /// Issue #811: One side of the pair is not on the admin-managed token
     /// allowlist, so no rate may be published for it.
     TokenNotAllowed = 7,
+    /// Issue #851: Batch rate update contains no pairs (empty array).
+    EmptyBatch = 8,
 }
 
 #[contracttype]
@@ -427,6 +429,13 @@ impl FXOracle {
 
         if !AccessControl::has_role(&env, &role_oracle(&env), &operator) {
             return Err(FXOracleError::Unauthorized);
+        }
+
+        // Issue #851: Reject empty batches immediately. Submitting an empty batch
+        // wastes transaction fees and ledger bandwidth while performing no useful state
+        // mutations. Enforcing this prevents silent no-ops when an operator submits zero rates.
+        if rates.is_empty() {
+            return Err(FXOracleError::EmptyBatch);
         }
 
         if rates.len() > MAX_BATCH_RATES {

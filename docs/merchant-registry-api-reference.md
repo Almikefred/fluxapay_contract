@@ -166,3 +166,52 @@ Fetches a paginated list of registered merchant records.
   - `limit: u32` — Maximum records to return.
 - **Return Type:** `Vec<Merchant>`
 - **Authorization:** Read-only / public query.
+
+---
+
+## Scoped API Keys (Issue #854)
+
+Merchants can issue granular, scoped API keys to restrict integrations or services to specific capabilities.
+
+### Supported Scopes
+- `read:payments`: Read payment statuses, transaction histories, and disputes.
+- `write:payments`: Create payment intents and charge customer authorizations.
+- `read:analytics`: Query event aggregations and payment analytics.
+- `manage:webhooks`: Register, rotate, and delete webhook destinations.
+- `admin`: Super-admin wildcard granting all scopes.
+
+### Error Response for Unauthorized Scopes
+When an API key lacks the required scope for an endpoint, indexer services return HTTP `403 Forbidden`:
+```json
+{
+  "error": "Insufficient Scope",
+  "required_scope": "read:payments"
+}
+```
+
+### Contract Methods
+
+#### `create_api_key`
+Creates a new scoped API key record identified by its SHA-256 key hash.
+- **Parameters:**
+  - `merchant: Address` — Merchant address (must sign transaction).
+  - `key_hash: BytesN<32>` — SHA-256 hash of the API key secret.
+  - `scopes: Vec<String>` — Array of allowed scope strings.
+- **Return Type:** `Result<ApiKeyRecord, MerchantAuthError>`
+- **Authorization:** Merchant signature required.
+
+#### `get_api_key`
+Retrieves an API key record by its key hash.
+- **Parameters:**
+  - `key_hash: BytesN<32>` — SHA-256 hash of the API key secret.
+- **Return Type:** `Result<ApiKeyRecord, MerchantAuthError>`
+- **Authorization:** Public read.
+
+#### `revoke_api_key`
+Revokes an existing API key, permanently disabling it.
+- **Parameters:**
+  - `merchant: Address` — Merchant address (must sign transaction).
+  - `key_hash: BytesN<32>` — Key hash to revoke.
+- **Return Type:** `Result<(), MerchantAuthError>`
+- **Authorization:** Merchant signature required.
+
