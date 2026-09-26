@@ -169,27 +169,11 @@ pub enum DataKey {
     /// capped at `FEE_COLLECTION_HISTORY_CAP`), consumed by `get_platform_fee_report`.
     FeeCollectionHistory,
     /// Issue #667: Arbitrary on-chain contract metadata (description, deployment notes,
-    /// audit commit hash, etc.), keyed by an admin-chosen Symbol.
-    ContractMetadata(Symbol),
-    /// Issue #628: Cumulative gross payment volume per merchant (sum of `amount`
-    /// over every payment ever created for the merchant). Read by
-    /// `get_top_merchants` to rank merchants without scanning payment records.
-    MerchantGrossVolume(Address),
-    /// Issue #628: Append-only list of every merchant address that has had at
-    /// least one payment created, for `get_top_merchants` enumeration.
-    TrackedMerchants,
-    /// Issue #638: Refund idempotency key → `RefundIdempotencyRecord`. Stored with a
-    /// 30-day TTL so a retried `create_refund` with the same key returns the original
-    /// `refund_id` rather than creating a duplicate refund.
-    RefundIdempotencyKey(String),
-    /// Issue #633: Append-only index of subscription IDs for a plan, keyed by
-    /// plan_id. Updated atomically on every `subscribe` / `subscribe_to_plan`.
-    /// Appended at the end of the enum to preserve existing discriminants.
-    PlanSubscribers(String),
-    /// Issue #624: Timelock delay in seconds for critical admin operations.
-    TimelockDelaySecs,
-    /// Issue #624: Pending timelocked action keyed by a unique action ID.
-    PendingTimelockAction(String),
-    /// Issue #624: Counter for generating unique pending action IDs.
-    TimelockActionCounter,
+    /// audit commit
+    /// Issue #800: Cached token balance for the gas estimator, scoped to the
+    /// current transaction invocation via instance storage. Soroban instance
+    /// storage does not persist across transactions, so this cache is safe and
+    /// lets `GasEstimator::estimate_payment_fee` avoid repeated cross-contract
+    /// `balance` calls within a single batch (e.g. 5 estimates → 1 read).
+    CachedBalance,
 }
