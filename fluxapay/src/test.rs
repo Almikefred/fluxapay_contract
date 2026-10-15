@@ -950,6 +950,85 @@ fn test_get_merchant_payments_paginated_filters_by_status() {
     assert_eq!(settled.len(), 0);
 }
 
+// ─── Issue #1071: get_merchant_payments_paged unit tests ─────────────────────
+
+#[test]
+fn test_get_merchant_payments_paged_zero_payments() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    // Merchant has never created a payment — expect empty result.
+    let page = client.get_merchant_payments_paged(&merchant_id, &0u32, &10u32);
+    assert_eq!(page.len(), 0);
+}
+
+#[test]
+fn test_get_merchant_payments_paged_one_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    let payment_id = String::from_str(&env, "paged_single_1");
+
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+    client.create_payment(&create_payment_args(&env, &payment_id, &merchant_id, 100i128));
+
+    // Offset 0, limit 10 → returns the one payment.
+    let page = client.get_merchant_payments_paged(&merchant_id, &0u32, &10u32);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0), Some(payment_id.clone()));
+
+    // Offset past the list → empty.
+    let beyond = client.get_merchant_payments_paged(&merchant_id, &1u32, &10u32);
+    assert_eq!(beyond.len(), 0);
+}
+
+#[test]
+fn test_get_merchant_payments_paged_150_payments_pagination_and_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    // Create 150 payments (IDs "paged_150_000" … "paged_150_149").
+    for i in 0u32..150 {
+        // Build a unique payment ID string per iteration.
+        let suffix = i.to_string();
+        let prefix = "paged_150_";
+        let full = soroban_sdk::String::from_str(&env, &format!("{}{}", prefix, suffix));
+        client.create_payment(&create_payment_args(&env, &full, &merchant_id, 100i128));
+    }
+
+    // Verify total count via non-paginated helper.
+    let all = client.get_merchant_payments(&merchant_id);
+    assert_eq!(all.len(), 150);
+
+    // First page: offset=0, limit=100 → exactly 100 results (cap enforced).
+    let page1 = client.get_merchant_payments_paged(&merchant_id, &0u32, &100u32);
+    assert_eq!(page1.len(), 100);
+
+    // limit=200 is silently capped at 100.
+    let page1_capped = client.get_merchant_payments_paged(&merchant_id, &0u32, &200u32);
+    assert_eq!(page1_capped.len(), 100);
+
+    // Second page: offset=100, limit=100 → remaining 50 results.
+    let page2 = client.get_merchant_payments_paged(&merchant_id, &100u32, &100u32);
+    assert_eq!(page2.len(), 50);
+
+    // Results are oldest-first: first ID of page1 matches the first payment created.
+    let first_id = String::from_str(&env, "paged_150_0");
+    assert_eq!(page1.get(0), Some(first_id));
+
+    // Offset exactly at length → empty.
+    let beyond = client.get_merchant_payments_paged(&merchant_id, &150u32, &10u32);
+    assert_eq!(beyond.len(), 0);
+}
+
 #[test]
 fn test_cancel_pending_success() {
     let env = Env::default();

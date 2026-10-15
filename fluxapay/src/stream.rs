@@ -183,6 +183,11 @@ pub enum StreamError {
     NotMultiStream = 19,
     /// Cliff period has not been reached yet.
     CliffNotReached = 20,
+    /// Issue #1070: Deposit amount for top_up_stream must be positive.
+    InvalidAmount = 21,
+    /// Issue #1070: Stream is in a terminal state (Cancelled or Exhausted) and
+    /// cannot receive additional deposits.
+    InvalidState = 22,
 }
 
 /// Issue #627: Maximum number of stream IDs accepted by `bulk_bump_stream_ttls`
@@ -1853,5 +1858,82 @@ impl PaymentStreaming {
             .persistent()
             .get(&StreamDataKey::MultiStream(stream_id))
             .ok_or(StreamError::NotMultiStream)
+    }
+
+    /// Issue #1070: Add deposit to an active or paused stream without changing the rate.
+    ///
+    /// The `sender` (original stream creator) transfers `additional_deposit`
+    /// tokens from their account into this contract. The stream's
+    /// `remaining_deposit` is updated atomically. The rate is unchanged.
+    ///
+    /// # Parameters
+    /// * `sender`             – Must be the original stream sender; must sign.
+    /// * `stream_id`          – ID of the stream to top up.
+    /// * `additional_deposit` – Positive amount of tokens to add.
+    ///
+    /// # Errors
+    /// * [`StreamError::StreamNotFound`]  – No stream with that ID.
+    /// * [`StreamError::Unauthorized`]    – Caller is not the stream's sender.
+    /// * [`StreamError::InvalidAmount`]   – `additional_deposit` is not positive.
+    /// * [`StreamError::InvalidState`]    – Stream is `Cancelled` or `Exhausted`.
+    pub fn top_up_stream(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        additional_deposit: i128,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        if additional_deposit <= 0 {
+            return Err(StreamError::InvalidAmount);
+        }
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        // Only Active and Paused streams can receive more deposit.
+        match stream.status {
+            StreamStatus::Active | StreamStatus::Paused => {}
+            StreamStatus::Cancelled | StreamStatus::Exhausted => {
+                return Err(StreamError::InvalidState);
+            }
+        }
+
+        // Persist state update before token transfer (CEI pattern).
+        stream.remaining_deposit = stream
+            .remaining_deposit
+            .saturating_add(additional_deposit);
+
+        // If the stream was Exhausted it would have been caught above; but guard
+        // against it being re-opened by ensuring status stays as-is.
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        // Interaction: transfer additional deposit from sender into this contract.
+        let token_client = token::Client::new(&env, &stream.token);
+        token_client.transfer(
+            &sender,
+            &env.current_contract_address(),
+            &additional_deposit,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "TOPPED_UP")),
+            (
+                stream_id,
+                additional_deposit,
+                stream.remaining_deposit,
+            ),
+        );
+
+        Ok(())
     }
 }
