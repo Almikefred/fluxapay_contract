@@ -3327,6 +3327,53 @@ impl PaymentProcessor {
         Self::get_merchant_payments_internal(&env, &merchant_id)
     }
 
+    /// Issue #1071: Return a paginated slice of payment IDs for a specific merchant.
+    ///
+    /// Payment IDs are returned oldest-first (insertion order). The `limit` is
+    /// capped at 100 per call to bound ledger read cost. Suspended merchants'
+    /// payment history is still readable.
+    ///
+    /// # Parameters
+    /// * `merchant_id` – Merchant whose payment history to read.
+    /// * `offset`      – Number of entries to skip (0 = start from oldest).
+    /// * `limit`       – Maximum entries to return; silently capped at 100.
+    ///
+    /// # Returns
+    /// A `Vec<String>` of payment IDs. Returns an empty vec when the merchant
+    /// has no payments or the offset is beyond the list length.
+    pub fn get_merchant_payments_paged(
+        env: Env,
+        merchant_id: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<String> {
+        // Enforce maximum page size to bound ledger read cost.
+        const MAX_PAGE_SIZE: u32 = 100;
+        let effective_limit = limit.min(MAX_PAGE_SIZE);
+
+        if effective_limit == 0 {
+            return vec![&env];
+        }
+
+        let all = Self::get_merchant_payments_internal(&env, &merchant_id);
+        let total = all.len();
+
+        if offset >= total {
+            return vec![&env];
+        }
+
+        let end = core::cmp::min(total, offset.saturating_add(effective_limit));
+        let mut page = vec![&env];
+        let mut i = offset;
+        while i < end {
+            if let Some(id) = all.get(i) {
+                page.push_back(id);
+            }
+            i += 1;
+        }
+        page
+    }
+
     pub fn get_merchant_payments_paginated(
         env: Env,
         merchant_id: Address,
