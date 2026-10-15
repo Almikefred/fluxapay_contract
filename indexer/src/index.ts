@@ -6,7 +6,7 @@
 
 import { rpc } from "stellar-sdk";
 import { Database } from "./database";
-import { ContractEvent, AnyEvent } from "./types";
+import { ContractEvent, AnyEvent, StreamEvent } from "./types";
 import { startServer } from "./server";
 import * as dotenv from "dotenv";
 
@@ -148,25 +148,7 @@ export class EventSubscriber {
 
       console.log(`Found ${response.events.length} events across configured contracts`);
 
-      for (const event of response.events) {
-        const eventId = `${event.ledger}-${event.txHash}-${event.id || Date.now()}`;
-        try {
-          const parsedEvent = this.parseEvent(event);
-          if (parsedEvent) {
-            const stored = await this.database.storeEvent(parsedEvent);
-            if (stored) {
-              console.log(`✓ Stored event ${parsedEvent.id} from contract ${parsedEvent.contractId}`);
-            }
-          }
-        } catch (error: any) {
-          console.error(`Error processing event ${eventId}:`, error);
-          await this.database.storeDeadLetterEvent(
-            eventId,
-            event,
-            error.message || String(error)
-          );
-        }
-      }
+      await this.processBatch(response.events);
 
       if (response.latestLedger) {
         this.currentLedger = response.latestLedger + 1;
@@ -174,6 +156,41 @@ export class EventSubscriber {
     } catch (error) {
       console.error("Error in pollEvents:", error);
     }
+  }
+
+  /**
+   * Process a batch of events with error isolation so one event failure does not
+   * roll back or cancel processing for the remainder of the batch.
+   */
+  async processBatch(events: any[]): Promise<{ processed: number; stored: number; errors: number }> {
+    let processed = 0;
+    let stored = 0;
+    let errors = 0;
+
+    for (const event of events) {
+      processed++;
+      const eventId = `${event.ledger}-${event.txHash}-${event.id || Date.now()}`;
+      try {
+        const parsedEvent = this.parseEvent(event);
+        if (parsedEvent) {
+          const wasStored = await this.database.storeEvent(parsedEvent);
+          if (wasStored) {
+            stored++;
+            console.log(`✓ Stored event ${parsedEvent.id} from contract ${parsedEvent.contractId}`);
+          }
+        }
+      } catch (error: any) {
+        errors++;
+        console.error(`Error processing event ${eventId}:`, error);
+        await this.database.storeDeadLetterEvent(
+          eventId,
+          event,
+          error.message || String(error)
+        );
+      }
+    }
+
+    return { processed, stored, errors };
   }
 
   parseEvent(event: any): AnyEvent | null {
@@ -197,6 +214,28 @@ export class EventSubscriber {
         } catch (e) {
           console.warn("Could not parse event value:", e);
         }
+      }
+
+      // Issue #766: Guard against null memo in STREAM/WITHDRAWN event handler
+      // When a stream withdrawal is triggered programmatically (no memo provided),
+      // destructuring or reading memo must never throw TypeError: Cannot read properties of null.
+      if (topics[0] === "STREAM" && topics[1] === "WITHDRAWN") {
+        let memo: string | null = null;
+        if (event.transaction && event.transaction.memo) {
+          memo = event.transaction.memo.value != null
+            ? event.transaction.memo.value.toString()
+            : (event.transaction.memo.toString?.() ?? null);
+        } else if (event.memo) {
+          memo = typeof event.memo === "object" && event.memo?.value != null
+            ? event.memo.value.toString()
+            : (event.memo.toString?.() ?? null);
+        } else if (value && typeof value === "object" && (value as any).memo !== undefined) {
+          const m = (value as any).memo;
+          memo = m && typeof m === "object" && m.value != null
+            ? m.value.toString()
+            : (m != null ? String(m) : null);
+        }
+        value.memo = memo;
       }
 
       const baseEvent: ContractEvent = {
@@ -258,6 +297,92 @@ export class EventSubscriber {
     return { attempted, succeeded, failed };
   }
 
+  /**
+   * Issue #858: Replay events from a specified ledger range [fromLedger, toLedger].
+   * Fetches contract events via RPC, runs them through the same pipeline as live events,
+   * skipping already-persisted events via ON CONFLICT DO NOTHING idempotency.
+   */
+  async replayLedgerRange(
+    fromLedger: number,
+    toLedger: number,
+    onProgress?: (progress: { processed: number; total: number; stored: number; currentLedger: number }) => void,
+  ): Promise<{ processed: number; stored: number; total: number }> {
+    const totalLedgers = Math.max(1, toLedger - fromLedger + 1);
+    let processed = 0;
+    let stored = 0;
+    let currentStart = fromLedger;
+
+    while (currentStart <= toLedger) {
+      try {
+        const request: Parameters<rpc.Server["getEvents"]>[0] = {
+          filters: [
+            {
+              type: "contract",
+              contractIds: this.config.contractIds,
+            },
+          ],
+          startLedger: currentStart,
+          limit: 100,
+        };
+
+        const response = await this.server.getEvents(request);
+        if (!response.events || response.events.length === 0) {
+          if (response.latestLedger && response.latestLedger < toLedger) {
+            currentStart = response.latestLedger + 1;
+          } else {
+            break;
+          }
+        } else {
+          for (const event of response.events) {
+            const ledger = typeof event.ledger === "number" ? event.ledger : parseInt(event.ledger, 10);
+            if (ledger > toLedger) break;
+
+            processed++;
+            const eventId = `${event.ledger}-${event.txHash}-${event.id || Date.now()}`;
+            try {
+              const parsedEvent = this.parseEvent(event);
+              if (parsedEvent) {
+                const wasStored = await this.database.storeEvent(parsedEvent);
+                if (wasStored) {
+                  stored++;
+                }
+              }
+            } catch (error: any) {
+              console.error(`Error processing replay event ${eventId}:`, error);
+            }
+          }
+
+          const lastLedger = response.events[response.events.length - 1].ledger;
+          const lastNum = typeof lastLedger === "number" ? lastLedger : parseInt(lastLedger, 10);
+          currentStart = Math.max(currentStart + 1, lastNum + 1);
+        }
+      } catch (err: any) {
+        console.error(`Replay error at ledger ${currentStart}:`, err);
+        currentStart++;
+      }
+
+      if (onProgress) {
+        onProgress({
+          processed,
+          total: totalLedgers,
+          stored,
+          currentLedger: Math.min(toLedger, currentStart),
+        });
+      }
+    }
+
+    if (onProgress) {
+      onProgress({
+        processed,
+        total: totalLedgers,
+        stored,
+        currentLedger: toLedger,
+      });
+    }
+
+    return { processed, stored, total: totalLedgers };
+  }
+
   async shutdown(): Promise<void> {
     console.log("Shutting down event subscriber...");
     if (this.pollTimer) clearInterval(this.pollTimer);
@@ -274,7 +399,12 @@ async function main(): Promise<void> {
 
   // Start REST API Server alongside subscriber
   const database = (subscriber as any).database;
-  await startServer(database, config.apiPort, () => subscriber.retryDLQEvents(true));
+  await startServer(
+    database,
+    config.apiPort,
+    () => subscriber.retryDLQEvents(true),
+    (from, to, onProgress) => subscriber.replayLedgerRange(from, to, onProgress),
+  );
 }
 
 if (require.main === module) {

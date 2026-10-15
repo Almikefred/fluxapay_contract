@@ -597,4 +597,236 @@ describe("ISSUE #616 — Indexer REST API Server", () => {
     assert.strictEqual(filteredLedger.length, 1);
     assert.strictEqual((filteredLedger[0] as any).event_id, "e2");
   });
+
+  it("should enforce admin auth and validate ledger range on POST /admin/replay", async () => {
+    process.env.ADMIN_API_KEY = "admin_secret_123";
+    const mockDb = createMockDatabase();
+    const app = createServer(mockDb as any);
+    const server = app.listen(0);
+    const port = (server.address() as any).port;
+
+    try {
+      // 1. Missing admin key -> 401
+      const resNoAuth = await fetch(`http://localhost:${port}/admin/replay?from_ledger=100&to_ledger=200`, {
+        method: "POST",
+      });
+      assert.strictEqual(resNoAuth.status, 401);
+
+      // 2. Invalid range (to < from) -> 400
+      const resBadRange = await fetch(`http://localhost:${port}/admin/replay?from_ledger=200&to_ledger=100`, {
+        method: "POST",
+        headers: { "x-admin-api-key": "admin_secret_123" },
+      });
+      assert.strictEqual(resBadRange.status, 400);
+
+      // 3. Excessive range (> 10000 ledgers) -> 400
+      const resTooLarge = await fetch(`http://localhost:${port}/admin/replay?from_ledger=1&to_ledger=15000`, {
+        method: "POST",
+        headers: { "x-admin-api-key": "admin_secret_123" },
+      });
+      assert.strictEqual(resTooLarge.status, 400);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("should stream SSE progress and complete on POST /admin/replay", async () => {
+    process.env.ADMIN_API_KEY = "admin_secret_123";
+    const mockDb = createMockDatabase();
+    const mockReplayHandler = async (
+      from: number,
+      to: number,
+      onProgress?: (p: { processed: number; total: number; stored: number }) => void
+    ) => {
+      onProgress?.({ processed: 5, total: 10, stored: 5 });
+      return { processed: 10, total: 10, stored: 10 };
+    };
+
+    const app = createServer(mockDb as any, undefined, mockReplayHandler as any);
+    const server = app.listen(0);
+    const port = (server.address() as any).port;
+
+    try {
+      const res = await fetch(`http://localhost:${port}/admin/replay?from_ledger=100&to_ledger=110`, {
+        method: "POST",
+        headers: { "x-admin-api-key": "admin_secret_123" },
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.headers.get("content-type"), "text/event-stream");
+
+      const text = await res.text();
+      assert.ok(text.includes('"processed":5'));
+      assert.ok(text.includes('"type":"complete"'));
+    } finally {
+      server.close();
+    }
+  });
+
+  describe("Issue #766: STREAM/WITHDRAWN null memo handling", () => {
+    it("safely handles STREAM/WITHDRAWN events with memo provided", () => {
+      const subscriber = new EventSubscriber({
+        rpcUrl: "http://localhost:8000",
+        contractIds: ["C123"],
+        dbConnectionString: "postgres://localhost/test",
+        pollInterval: 1000,
+        startLedger: 1,
+        dlqRetryIntervalMs: 1000,
+        dlqMinAgeSeconds: 10,
+        apiPort: 3001,
+      });
+
+      const eventWithMemo = {
+        id: "evt-001",
+        ledger: 100,
+        txHash: "hash-001",
+        contractId: "C123",
+        topic: ["STREAM", "WITHDRAWN", "stream_abc"],
+        value: {
+          stream_id: "stream_abc",
+          recipient: "G_RECEIVER",
+          amount: 5000,
+          remaining_deposit: 15000,
+        },
+        transaction: {
+          memo: {
+            value: "payout-invoice-42",
+          },
+        },
+      };
+
+      const parsed = subscriber.parseEvent(eventWithMemo);
+      assert.ok(parsed, "Event should be parsed successfully");
+      assert.strictEqual((parsed?.value as any).memo, "payout-invoice-42");
+    });
+
+    it("safely handles STREAM/WITHDRAWN events when transaction memo is null without throwing", () => {
+      const subscriber = new EventSubscriber({
+        rpcUrl: "http://localhost:8000",
+        contractIds: ["C123"],
+        dbConnectionString: "postgres://localhost/test",
+        pollInterval: 1000,
+        startLedger: 1,
+        dlqRetryIntervalMs: 1000,
+        dlqMinAgeSeconds: 10,
+        apiPort: 3001,
+      });
+
+      // Programmatic withdrawal with no memo: transaction.memo is null
+      const eventWithNullMemo = {
+        id: "evt-002",
+        ledger: 101,
+        txHash: "hash-002",
+        contractId: "C123",
+        topic: ["STREAM", "WITHDRAWN", "stream_xyz"],
+        value: {
+          stream_id: "stream_xyz",
+          recipient: "G_RECEIVER",
+          amount: 2500,
+          remaining_deposit: 0,
+        },
+        transaction: {
+          memo: null,
+        },
+      };
+
+      // Must not throw TypeError: Cannot read properties of null (reading 'value')
+      const parsed = subscriber.parseEvent(eventWithNullMemo);
+      assert.ok(parsed, "Event should be parsed successfully");
+      assert.strictEqual((parsed?.value as any).memo, null);
+    });
+
+    it("safely handles STREAM/WITHDRAWN events when transaction object itself is undefined", () => {
+      const subscriber = new EventSubscriber({
+        rpcUrl: "http://localhost:8000",
+        contractIds: ["C123"],
+        dbConnectionString: "postgres://localhost/test",
+        pollInterval: 1000,
+        startLedger: 1,
+        dlqRetryIntervalMs: 1000,
+        dlqMinAgeSeconds: 10,
+        apiPort: 3001,
+      });
+
+      const memolessEvent = {
+        id: "evt-003",
+        ledger: 102,
+        txHash: "hash-003",
+        contractId: "C123",
+        topic: ["STREAM", "WITHDRAWN", "stream_none"],
+        value: {
+          stream_id: "stream_none",
+          recipient: "G_RECEIVER",
+          amount: 1000,
+        },
+      };
+
+      const parsed = subscriber.parseEvent(memolessEvent);
+      assert.ok(parsed, "Event should be parsed successfully");
+      assert.strictEqual((parsed?.value as any).memo, null);
+    });
+
+    it("batch processing does not roll back or fail on a missing memo", async () => {
+      const storedEvents: any[] = [];
+      const mockDb = {
+        async storeEvent(evt: any) {
+          storedEvents.push(evt);
+          return true;
+        },
+        async storeDeadLetterEvent() {},
+      };
+
+      const subscriber = new EventSubscriber(
+        {
+          rpcUrl: "http://localhost:8000",
+          contractIds: ["C123"],
+          dbConnectionString: "postgres://localhost/test",
+          pollInterval: 1000,
+          startLedger: 1,
+          dlqRetryIntervalMs: 1000,
+          dlqMinAgeSeconds: 10,
+          apiPort: 3001,
+        },
+        mockDb as any
+      );
+
+      const batch = [
+        {
+          id: "batch-1",
+          ledger: 200,
+          txHash: "hash-b1",
+          contractId: "C123",
+          topic: ["STREAM", "WITHDRAWN"],
+          value: { stream_id: "s1", amount: 100 },
+          transaction: { memo: { value: "memo-1" } },
+        },
+        {
+          id: "batch-2",
+          ledger: 201,
+          txHash: "hash-b2",
+          contractId: "C123",
+          topic: ["STREAM", "WITHDRAWN"],
+          value: { stream_id: "s2", amount: 200 },
+          transaction: { memo: null }, // missing memo!
+        },
+        {
+          id: "batch-3",
+          ledger: 202,
+          txHash: "hash-b3",
+          contractId: "C123",
+          topic: ["STREAM", "WITHDRAWN"],
+          value: { stream_id: "s3", amount: 300 },
+          // No transaction field at all
+        },
+      ];
+
+      const result = await subscriber.processBatch(batch);
+      assert.strictEqual(result.processed, 3);
+      assert.strictEqual(result.stored, 3);
+      assert.strictEqual(result.errors, 0);
+      assert.strictEqual(storedEvents.length, 3);
+      assert.strictEqual(storedEvents[0].value.memo, "memo-1");
+      assert.strictEqual(storedEvents[1].value.memo, null);
+      assert.strictEqual(storedEvents[2].value.memo, null);
+    });
+  });
 });

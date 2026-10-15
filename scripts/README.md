@@ -1,3 +1,12 @@
+# FluxaPay Deployment Scripts
+
+## `deploy.sh`
+
+Deploys all six FluxaPay contracts to a Stellar network in dependency order,
+initialises each contract with the deployer as admin, and writes the resulting
+contract IDs to `.env.testnet`.
+
+### Usage
 # Scripts
 
 Operational scripts for deployment, SDK generation, local development, and CI checks.
@@ -14,7 +23,26 @@ Operational scripts for deployment, SDK generation, local development, and CI ch
 | `generate-sdk.sh` | Generate TypeScript SDK bindings from compiled WASM using `stellar contract bindings typescript`. | None | After contract changes |
 | `sandbox-init.sh` | Bootstrap local Stellar sandbox — builds WASM, generates local identities, funds admin via friendbot. | `STELLAR_RPC_URL`, `STELLAR_NETWORK` | Local dev first-time setup |
 | `check-mainnet-contract-ids.js` | CI informational check — warns when `sdk/src/network-profiles.ts` mainnet still has `UNSET_CONTRACT_ID` placeholders. Always exits 0. | None | CI |
-| `check-error-map-sync.ts` | CI gate — verifies `FLUXAPAY_CONTRACT_ERROR_MAP` in `sdk/src/index.ts` matches the `Error` enum in `fluxapay/src/lib.rs`. Fails CI on drift. | None | CI |
+| `check-error-map-sync.ts` | CI gate — verifies `FLUXAPAY_CONTRACT_ERROR_MAP` in `sdk/src/index.ts` matches the `Error` enum in `fluxapay/src/lib.rs`. Fails CI (exit 1) on drift **or when an expected source file cannot be found** (the missing path is printed). | None | CI |
+
+## CI Jobs
+
+### `check-error-map-sync`
+
+The `check-error-map-sync` CI job runs `npx tsx scripts/check-error-map-sync.ts` on every
+pull request and push to `main`. It is a **hard gate**: the job fails (non-zero exit)
+when the SDK error map drifts from the contract `Error` enum, and also when any expected
+source file (e.g. `fluxapay/src/lib.rs` or `sdk/src/index.ts`) is missing — the error
+message includes the missing path so the failure is actionable in CI logs.
+
+To reproduce locally:
+
+```bash
+npx tsx scripts/check-error-map-sync.ts
+```
+
+To verify the fail-loud behavior, temporarily rename a source file and re-run — the
+script must exit non-zero and print the missing path.
 
 ## Environment Variables Reference
 
@@ -56,6 +84,7 @@ Operational scripts for deployment, SDK generation, local development, and CI ch
 | `FX_PAIRS` | No | `EUR,BRL,USD` | Comma list of `SYMBOL[:feedKey]`. Stored `Symbol` = units of that currency per 1 USD |
 | `FX_RATE_DECIMALS` | No | `7` | Fixed-point decimals for stored rates (contract convention is 7) |
 | `UPDATE_INTERVAL_MS` | No | `60000` | Poll interval in milliseconds |
+| `MAX_STALENESS_SECS` | No | `86400` | On-chain rate freshness window; warns and alerts at 80% of this age |
 | `MAX_FEED_RETRIES` | No | `3` | Feed fetch attempts per cycle before the cycle is skipped + alerted |
 | `FEED_RETRY_BACKOFF_MS` | No | `2000` | Base linear backoff between feed retries |
 | `STELLAR_RPC_URL` | No | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
@@ -93,28 +122,48 @@ Operational scripts for deployment, SDK generation, local development, and CI ch
 All scripts should be executed from the repository root:
 
 ```bash
-# Deploy to testnet
-STELLAR_SECRET_KEY=S... STELLAR_NETWORK=testnet bash scripts/deploy-testnet.sh
-
-# Fund accounts
-npx node scripts/fund-accounts.js GXXXXXX GYYYYYY
-
-# Generate SDK bindings
-bash scripts/generate-sdk.sh
-
-# Bootstrap local sandbox
-bash scripts/sandbox-init.sh
-
-# Start subscription daemon
-CONTRACT_ID=... OPERATOR_SECRET=S... node scripts/subscription-daemon.js
-
-# Start the FX oracle updater (one cycle)
-ORACLE_SECRET=S... FX_ORACLE_CONTRACT_ID=C... node scripts/fx-oracle-updater.js --once
-
-# Start the FX oracle updater (long-running, every 60s)
-ORACLE_SECRET=S... FX_ORACLE_CONTRACT_ID=C... node scripts/fx-oracle-updater.js
-
-# CI checks (run automatically in CI, or manually)
-npx tsx scripts/check-error-map-sync.ts
-node scripts/check-mainnet-contract-ids.js
+./deploy.sh [network]
 ```
+
+The network may be supplied as an optional positional argument or via the
+`STELLAR_NETWORK` environment variable. The positional argument takes
+precedence over the environment variable. When neither is provided the network
+defaults to `testnet`.
+
+Accepted networks: `testnet` | `futurenet` | `standalone`.
+
+### Examples
+
+```bash
+# Deploy to testnet (default)
+./deploy.sh testnet
+
+# Deploy to futurenet via the environment variable
+STELLAR_NETWORK=futurenet ./deploy.sh
+
+# Deploy to a standalone sandbox
+./deploy.sh standalone
+
+# Seed test data after deploy
+SEED_DATA=true ./deploy.sh testnet
+
+# Skip the cargo build step
+SKIP_BUILD=true ./deploy.sh testnet
+```
+
+An unknown network value prints usage and exits non-zero.
+
+### Environment variables
+
+| Variable            | Required | Description                                              |
+| ------------------- | -------- | -------------------------------------------------------- |
+| `STELLAR_SECRET_KEY`| yes      | Deployer secret key (starts with `S`)                    |
+| `STELLAR_NETWORK`   | no       | Target network (`testnet` \| `futurenet` \| `standalone`)|
+| `STELLAR_RPC_URL`   | no       | Override the RPC endpoint                                |
+| `SEED_DATA`         | no       | Set to `true` to seed test data after deploy             |
+| `SKIP_BUILD`        | no       | Set to `true` to skip the cargo build step               |
+
+## `deploy-testnet.sh`
+
+Deprecated. Kept for backward compatibility; it prints a warning and delegates
+to `deploy.sh`, defaulting to `testnet` when no network is supplied.

@@ -38,6 +38,7 @@ fn setup(
 
     // Wire payment processor to merchant registry.
     payment_client.set_merchant_registry_address(&admin, &merchant_client.address);
+    merchant_client.set_payment_processor_address(&admin, &payment_client.address);
 
     let merchant = Address::generate(env);
     (admin, payment_client, merchant_client, merchant)
@@ -82,6 +83,7 @@ fn create_and_settle(
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
@@ -89,6 +91,7 @@ fn create_and_settle(
         payer_muxed_id: None,
         retry_of_payment_id: None,
         payer_muxed_id: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 

@@ -71,12 +71,17 @@ document on every CI run to catch drift between them.
 | 59 | `LinkMaxUsesReached` | Payment link has reached its configured `max_uses` limit. | Payment link was used too many times. | Create a new payment link with a higher `max_uses`. |
 | 60 | `DirectTransferNotDisputable` | Payment was created via a `direct_transfer` link and disputes are not allowed. | Attempting to dispute a direct-transfer payment. | Direct-transfer payments are non-disputable by design. |
 | 61 | `MaxRetriesExceeded` | Maximum retry chain depth (3) exceeded for payment retry. | Payment retry chain too deep. | Resolve the underlying payment failure before retrying. |
+| 347 | `RetryChainTooDeep` | A retry would create a chain deeper than three payments. | Retrying a payment that is already three links from its original payment. | Resolve the failure or start a new payment. |
 | 62 | `InvalidStatusTransition` | Invalid payment status transition attempted. | Attempting a disallowed state change (e.g. `Confirmed` → `Pending`). | Check the payment's current status and allowed transitions. |
 | 63 | `RefundNotApproved` | Customer called `claim_refund` before an operator approved it. | Claiming a refund that hasn't been operator-approved yet. | Wait for an operator to approve the refund first. |
 | 64 | `RouterNotAllowed` | DEX router is not in the allowed routers list. | Using a router not configured for this deployment. | Use an approved router, or have an admin update the allowed list. |
 | 65 | `RouteOutputInsufficient` | Aggregate route output is less than minimum output amount. | Swap output too low due to slippage or thin liquidity. | Re-quote with a lower minimum output, or reduce trade size. |
 | 66 | `BatchContainsDuplicates` | Batch payment creation contains duplicate payment IDs. | Submitting a batch where two or more entries share the same `payment_id`. | Ensure all `payment_id` values in the batch are unique. |
 | 67 | `InputTooLong` | A user-supplied string field exceeds its maximum allowed length. | `reason` > 256 chars in refund creation; `evidence` > 512 chars in dispute creation; `resolution_notes` > 512 chars in dispute rejection. | Shorten the field: `reason` ≤ 256 chars, `evidence` ≤ 512 chars, `resolution_notes` ≤ 512 chars. |
+| 68 | `TimelockNotExpired` | A timelocked admin action was executed before delay expired. | Executing action before timelock delay has elapsed. | Wait for the delay period to elapse. |
+| 69 | `InvalidEvidenceCid` | Evidence field is not a valid IPFS CID. | Passing a non-CID string as dispute evidence. | Pass a valid IPFS CID (v0 starting with Qm or v1 starting with bafy). |
+| 70 | `InvalidPaymentLink` | Payment link configuration or parameters are invalid. | Malformed payment link creation parameters. | Verify payment link arguments and try again. |
+| 71 | `KycLimitExceeded` | Payment amount or cumulative monthly volume exceeds merchant's KYC tier cap. | Single payment exceeds tier max, or cumulative monthly volume exceeds tier cap under ADR-0003. | Upgrade merchant KYC tier to increase payment volume limits. |
 | 404 | `PaymentNotFound` | No payment exists with the given `payment_id`. | Typo'd ID, or payment was never created. | Verify the ID via `get_payment` / listing endpoints. |
 | 405 | `RefundNotFound` | No refund exists with the given `refund_id`. | Typo'd ID, or refund was never created. | Verify the ID via `get_refund` / `get_payment_refunds`. |
 | 406 | `InvalidAmount` | Amount is zero, negative, or otherwise invalid. | Passing a non-positive amount to a payment/refund call. | Pass a strictly positive `i128` amount. |
@@ -101,6 +106,7 @@ document on every CI run to catch drift between them.
 | 12 | `ProposalThresholdNotMet` | Not enough approvals to execute the proposal. | Executing a multi-sig admin action before quorum. | Collect additional approvals before executing. |
 | 13 | `PendingAdminTransfer` | An admin transfer is already pending. | Proposing a new transfer while one is in flight. | Wait for the pending transfer to complete or expire. |
 | 14 | `InvalidRecovery` | Recovery attempt failed validation. | Wrong recovery key or malformed recovery payload. | Retry with the correct registered recovery key. |
+| 15 | `UnknownRole` | Role symbol is not in the `KNOWN_ROLES` registry. | Granting/revoking a typo'd or invented role (e.g. `SETLMENT_OPERATOR`). | Use one of: `ADMIN`, `ORACLE`, `MERCHANT`, `SETTLEMENT_OPERATOR`, `ARBITRATOR`. |
 
 ## `StreamError` (`fluxapay/src/stream.rs`)
 
@@ -130,7 +136,9 @@ document on every CI run to catch drift between them.
 | 1 | `RateNotFound` | No rate is recorded for the requested currency pair. | Querying a pair the oracle hasn't been given a rate for. | Have the oracle publish a rate for that pair first. |
 | 2 | `RateStale` | The recorded rate is older than the staleness threshold. | Oracle hasn't updated the rate recently enough. | Wait for (or trigger) a fresh oracle update. |
 | 3 | `Unauthorized` | Caller is not an authorized oracle/admin. | Calling an oracle-only update function without the role. | Grant the oracle role, or call from an authorized address. |
-| 4 | `BatchTooLarge` **/** `RateDeviationExceeded` ⚠️ | Batch rate update exceeds the max of 20 pairs, **or** rate deviation exceeds the configured limit — both variants share code 4 in the source. | Submitting > 20 pairs in one batch update, or a rate too far from the previous value. | Split batch updates to ≤ 20 pairs; check deviation limits separately. |
+| 4 | `BatchTooLarge` | Batch rate update exceeds the max of 20 pairs. | Submitting > 20 pairs in one batch update. | Split batch updates to ≤ 20 pairs. |
+| 5 | `RateDeviationExceeded` | Rate deviation exceeds the configured limit. | Publishing a rate too far from the previous value. | Check the feed or adjust the pair's deviation limit. |
+| 7 | `InvalidStalenessThreshold` | Staleness threshold is outside the allowed 60-second to 24-hour range. | Setting a threshold below 60 seconds or above 86,400 seconds. | Use a threshold between 60 and 86,400 seconds. |
 
 ## `MerchantError` (`fluxapay/src/merchant_registry.rs`)
 
@@ -144,6 +152,7 @@ document on every CI run to catch drift between them.
 | 6 | `PayoutAddressNotWhitelisted` | Payout address is not on the merchant's approved list. | Withdrawing to an address that wasn't whitelisted. | Whitelist the payout address before withdrawing to it. |
 | 7 | `WhitelistModeRequiresBusinessTier` | Only Business-tier merchants may enable whitelist mode. | Enabling customer whitelist mode below Business tier. | Upgrade the merchant to Business tier first. |
 | 8 | `PayerNotWhitelisted` | Payer is not in the merchant's customer whitelist. | Whitelist mode is on and the payer isn't listed. | Merchant must add the payer to the whitelist. |
+| 12 | `KycLimitExceeded` | Single payment or cumulative monthly volume exceeds merchant's KYC tier cap. | Merchant at tier 0 or tier 1 breached per-payment or monthly limit. | Upgrade merchant KYC tier. |
 
 ## `MerchantAuthError` (`fluxapay/src/merchant_auth.rs`)
 
@@ -175,7 +184,12 @@ document on every CI run to catch drift between them.
 | 1 | `Unauthorized` | Caller is not authorized to use this session key. | Executing a payload with a session key you don't own. | Use a session key granted to your account. |
 | 2 | `SessionNotFound` | No session exists for the given (account, session_key) pair. | Typo'd session key, or session was never granted. | Grant a session key before attempting execution. |
 | 3 | `SessionExpired` | The session key has passed its expiry time. | Executing after the session's validity window closed. | Grant a new session key. |
-| 4 | `InvalidPayload` | The execution payload failed validation. | Malformed or empty payload/hash. | Pass a well-formed payload matching the expected schema. |
+| 4 | `InvalidPayload` | The execution payload failed validation. | Malformed or empty payload/hash, or a negative spend cap. | Pass a `SessionInvocation` XDR payload and non-negative policy caps. |
+| 5 | `SignerRevoked` | The session key was revoked before execution. | The account owner called `revoke_session_key` while a payload was in flight. | Register a new session key. |
+| 6 | `SpendLimitExceeded` | One call exceeds `max_amount_per_tx`. | The invocation amount is above the per-transaction cap. | Split the charge or raise the cap. |
+| 7 | `WindowBudgetExceeded` | The rolling window budget is exhausted. | Cumulative spend in the current window would pass `max_amount_per_window`. | Wait for the window to roll, or raise the budget. |
+| 8 | `ContractNotAllowed` | The target contract is not on the session allowlist. | Payload `target_contract` is outside `allowed_contracts`. | Call an allowlisted contract, or register a wider policy. |
+| 9 | `FunctionNotAllowed` | The function selector is not on the session allowlist. | Payload `function` is outside `allowed_functions`. | Call an allowlisted function, or register a wider policy. |
 
 ---
 

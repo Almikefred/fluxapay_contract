@@ -40,6 +40,7 @@ fn setup_with_plan(env: &Env) -> (RefundManagerClient<'_>, Address, Address, Str
         &1_000_000_i128,
         &Symbol::new(env, "USDC"),
         &BillingInterval::Weekly,
+        &None,
     );
 
     (client, admin, merchant, plan_id, usdc_token)
@@ -111,6 +112,7 @@ fn test_create_subscription_plan_by_non_merchant_is_unauthorized() {
         &500_i128,
         &Symbol::new(&env, "USDC"),
         &BillingInterval::Monthly,
+        &None,
     );
 
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
@@ -584,4 +586,127 @@ fn test_subscription_zero_proration_at_exact_boundary() {
     // When days_remaining is 0 (secs_remaining / 86_400 = 0 with integer division),
     // the refund amount would be 0, so no refund is created (0 amount is not stored)
     assert_eq!(refunds.len(), 0);
+}
+
+// ── Issue #836: subscription trial period ────────────────────────────────────
+
+#[test]
+fn test_trial_plan_does_not_charge_during_trial() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager(&env);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let plan_id = String::from_str(&env, "plan_trial");
+    client.create_subscription_plan(
+        &merchant,
+        &plan_id,
+        &String::from_str(&env, "Trial Plan"),
+        &String::from_str(&env, "14-day trial"),
+        &1_000_000_i128,
+        &Symbol::new(&env, "USDC"),
+        &BillingInterval::Monthly,
+        &Some(14u32),
+    );
+
+    let plan = client.get_subscription_plan(&plan_id);
+    assert_eq!(plan.trial_days, Some(14));
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+    let sub = client.get_subscription(&sub_id);
+    assert!(sub.trial_ends_at.is_some());
+    assert_eq!(sub.next_payment_at, sub.trial_ends_at.unwrap());
+    assert!(sub.last_payment_at.is_none());
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+
+    // Still inside trial — charge must return TrialActive.
+    let result = client.try_charge_subscription(&operator, &sub_id, &usdc_token);
+    assert_eq!(result, Err(Ok(Error::TrialActive)));
+}
+
+#[test]
+fn test_trial_first_charge_after_trial_days() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager(&env);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let plan_id = String::from_str(&env, "plan_trial_charge");
+    client.create_subscription_plan(
+        &merchant,
+        &plan_id,
+        &String::from_str(&env, "Trial Plan"),
+        &String::from_str(&env, "14-day trial"),
+        &1_000_000_i128,
+        &Symbol::new(&env, "USDC"),
+        &BillingInterval::Weekly,
+        &Some(14u32),
+    );
+
+    let payer = Address::generate(&env);
+    // Fund payer so the charge can succeed.
+    let token_admin = Address::generate(&env);
+    let token_client = token::Client::new(&env, &usdc_token);
+    // usdc_token was registered with a different admin in setup — mint via StellarAssetClient if available.
+    let _ = (&token_admin, &token_client);
+
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+    let sub = client.get_subscription(&sub_id);
+    let trial_ends = sub.trial_ends_at.unwrap();
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+
+    // Advance ledger to exactly trial end.
+    env.ledger().set_timestamp(trial_ends);
+
+    // May fail transfer if unfunded, but must not return TrialActive.
+    let result = client.try_charge_subscription(&operator, &sub_id, &usdc_token);
+    assert_ne!(result, Err(Ok(Error::TrialActive)));
+}
+
+#[test]
+fn test_trial_too_long_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _usdc_token) = setup_refund_manager(&env);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let result = client.try_create_subscription_plan(
+        &merchant,
+        &String::from_str(&env, "plan_too_long"),
+        &String::from_str(&env, "Bad Trial"),
+        &String::from_str(&env, "desc"),
+        &1_000_000_i128,
+        &Symbol::new(&env, "USDC"),
+        &BillingInterval::Monthly,
+        &Some(91u32),
+    );
+    assert_eq!(result, Err(Ok(Error::TrialTooLong)));
+}
+
+#[test]
+fn test_plan_without_trial_behaves_as_before() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
+
+    let plan = client.get_subscription_plan(&plan_id);
+    assert_eq!(plan.trial_days, None);
+
+    let payer = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.trial_ends_at, None);
+    assert_eq!(sub.next_payment_at, now.saturating_add(plan.interval_secs));
 }

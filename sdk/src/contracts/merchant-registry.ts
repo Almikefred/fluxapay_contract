@@ -80,6 +80,11 @@ export interface BankAccount {
   address: string;
 }
 
+export interface MerchantPage {
+  merchants: any[];
+  nextCursor: string | null;
+}
+
 /**
  * MerchantRegistryClient provides a high-level interface for interacting with the MerchantRegistry contract.
  * Manages merchant registration, verification, and account status operations.
@@ -407,5 +412,53 @@ export class MerchantRegistryClient {
     );
     const value = (result as { result?: unknown }).result ?? result;
     return BigInt(value as number | bigint);
+  }
+
+  /**
+   * List merchants using cursor-based pagination (Issue #774).
+   *
+   * @param cursor Pagination cursor (or null for the first page)
+   * @param limit Number of items per page (maximum 50)
+   */
+  async listMerchants(cursor?: string | null, limit: number = 50): Promise<MerchantPage> {
+    const result = await withMappedContractError(() =>
+      this.getContract().list_merchants({
+        cursor: cursor ?? null,
+        limit,
+      }),
+    );
+    const page = (result as { result?: any }).result ?? result;
+    return {
+      merchants: page.merchants ?? [],
+      nextCursor: page.next_cursor ?? null,
+    };
+  }
+
+  /**
+   * Async iterator yielding all merchants across pages without manual cursor management.
+   */
+  async *listMerchantsIterator(pageSize: number = 50): AsyncGenerator<any, void, unknown> {
+    let cursor: string | null = null;
+    while (true) {
+      const page = await this.listMerchants(cursor, pageSize);
+      for (const merchant of page.merchants) {
+        yield merchant;
+      }
+      if (!page.nextCursor) {
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+  }
+
+  /**
+   * Fetch all merchants across pages into a single flat array.
+   */
+  async fetchAllMerchants(pageSize: number = 50): Promise<any[]> {
+    const all: any[] = [];
+    for await (const merchant of this.listMerchantsIterator(pageSize)) {
+      all.push(merchant);
+    }
+    return all;
   }
 }

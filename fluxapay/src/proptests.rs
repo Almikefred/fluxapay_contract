@@ -15,6 +15,21 @@
 //!   refund request in the sequence coming from a distinct requester address
 //!   against the same `payment_id`, modeling multiple parties racing to
 //!   refund one payment before any request is approved or rejected.
+//!
+//! ## Fee-split arithmetic invariants (added for #590)
+//! - `proptest_fee_split_sums_to_platform_fee` — for every valid BPS
+//!   configuration, `treasury_share + developer_share` must equal
+//!   `platform_fee` (no tokens lost to rounding).
+//! - `proptest_merchant_net_never_exceeds_gross` — the merchant's net
+//!   amount after fees must never exceed the gross payment amount.
+//!
+//! ## Stream accrual invariants (added for #589)
+//! - `proptest_stream_accrued_bounded_by_deposit` — accrued amount must
+//!   never exceed the total deposit, regardless of rate or duration.
+//! - `proptest_stream_zero_rate_returns_checkpoint` — with rate=0 the
+//!   accrued value equals the checkpoint (clamped to deposit).
+//! - `proptest_stream_withdraw_clamped` — remaining deposit after
+//!   withdrawal is always in `[0, remaining]`.
 
 extern crate alloc;
 use crate::format_id;
@@ -28,9 +43,11 @@ use soroban_sdk::{
 
 use crate::{
     access_control::{role_merchant, role_oracle, role_settlement_operator},
+    merchant_registry::KycTier,
     BillingInterval, Error, PaymentProcessor, PaymentProcessorClient, PaymentStatus, RefundManager,
     RefundManagerClient, RefundStatus, SubscriptionStatus, PAYMENT_TOLERANCE,
-    SUBSCRIPTION_RETRY_INTERVAL_SECS,
+    SUBSCRIPTION_RETRY_INTERVAL_SECS, TIER_CAP_BASIC, TIER_CAP_BUSINESS, TIER_CAP_FULL,
+    TIER_CAP_UNVERIFIED,
 };
 
 fn setup_payment_processor(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
@@ -176,11 +193,13 @@ proptest! {
             memo_type: None,
             token_address: None,
             client_token: None,
+            idempotency_key: None,
             metadata_hash: None, metadata: None,
             fee_waiver_code: None,
             retry_of_payment_id: None,
             payer_muxed_id: None,
-        };
+                tip_enabled: false,
+    };
 
         client.create_payment(&args);
 
@@ -231,11 +250,13 @@ proptest! {
             memo_type: None,
             token_address: None,
             client_token: None,
+            idempotency_key: None,
             metadata_hash: None, metadata: None,
             fee_waiver_code: None,
             retry_of_payment_id: None,
             payer_muxed_id: None,
-        };
+                tip_enabled: false,
+    };
 
         client.create_payment(&args);
 
@@ -371,7 +392,7 @@ proptest! {
 
         let payment_id = format_id(&env, "refund_inv_", nonce);
         let merchant_id = Address::generate(&env);
-        let requester = Address::generate(&env);
+        let requester = merchant_id.clone();
 
         client.register_payment(
             &payment_id,
@@ -451,7 +472,7 @@ proptest! {
         // all targeting the same payment_id before any are approved/rejected.
         let mut accepted_total: i128 = 0;
         for &amount in refund_amounts.iter() {
-            let requester = Address::generate(&env);
+            let requester = merchant_id.clone();
             let reason = soroban_sdk::String::from_str(&env, "concurrent refund");
             let result = client.try_create_refund(&payment_id, &amount, &reason, &requester);
 
@@ -468,6 +489,152 @@ proptest! {
             .map(|r| r.amount)
             .sum();
         prop_assert!(tracked_total <= payment_amount);
+    }
+
+    /// Issue #591: A merchant's running monthly volume must never exceed the
+    /// effective cap for their current KYC tier, regardless of payment count or
+    /// individual payment size.
+    #[test]
+    fn prop_monthly_volume_never_exceeds_tier_cap(
+        tier in prop_oneof![
+            Just(KycTier::Unverified),
+            Just(KycTier::Basic),
+            Just(KycTier::Full),
+            Just(KycTier::Business),
+        ],
+        amounts in prop::collection::vec(1i128..=10_000_000_000_000i128, 1..=50),
+        nonce in 0u64..u64::MAX,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+        let payment_contract = env.register(crate::PaymentProcessor, ());
+        let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+
+        let payment_client = PaymentProcessorClient::new(&env, &payment_contract);
+        let registry_client = crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_contract);
+
+        let admin = Address::generate(&env);
+        payment_client.initialize_payment_processor(&admin);
+        registry_client.initialize(&admin);
+        payment_client.set_merchant_registry_address(&admin, &registry_contract);
+
+        let merchant = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+        payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+        registry_client.register_merchant(
+            &merchant,
+            &String::from_str(&env, "Prop Merchant"),
+            &String::from_str(&env, "USDC"),
+            &None::<Address>,
+            &None::<String>,
+            &crate::MaybeFeeConfig::None,
+        );
+
+        registry_client.set_kyc_tier_with_signature(
+            &admin,
+            &merchant,
+            &tier,
+            &Some(String::from_str(&env, "sig")),
+        );
+        payment_client.set_merchant_rate_limit(&admin, &merchant, &60u64, &100u32);
+
+        let cap = match &tier {
+            KycTier::Unverified => TIER_CAP_UNVERIFIED,
+            KycTier::Basic => TIER_CAP_BASIC,
+            KycTier::Full => TIER_CAP_FULL,
+            KycTier::Business => TIER_CAP_BUSINESS,
+        };
+
+        let deposit = Address::generate(&env);
+        let mut running_total: i128 = 0;
+
+        for (idx, &generated_amount) in amounts.iter().enumerate() {
+            // Unverified merchants have a separate $100 per-payment ceiling.
+            // Keep every generated payment valid so this property isolates the
+            // monthly-volume invariant rather than the per-payment limit.
+            let amount = match &tier {
+                KycTier::Unverified => generated_amount.min(1_000_000_000),
+                KycTier::Basic => generated_amount.min(TIER_CAP_BASIC),
+                KycTier::Full => generated_amount.min(TIER_CAP_FULL),
+                KycTier::Business => generated_amount,
+            };
+            let payment_id = format_id(
+                &env,
+                "prop_cap_",
+                nonce.wrapping_add(idx as u64),
+            );
+            // Payment creation requires a verified merchant. Create while the
+            // merchant is Basic, then restore the generated tier before the
+            // verification path applies its monthly cap.
+            registry_client.set_kyc_tier_with_signature(
+                &admin,
+                &merchant,
+                &KycTier::Basic,
+                &Some(String::from_str(&env, "sig")),
+            );
+            payment_client.create_payment(&crate::CreatePaymentArgs {
+                payment_id: payment_id.clone(),
+                merchant_id: merchant.clone(),
+                payer: None,
+                amount,
+                currency: Symbol::new(&env, "USDC"),
+                deposit_address: deposit.clone(),
+                expires_at: Some(env.ledger().timestamp() + 3600),
+                duration_secs: None,
+                memo: None,
+                memo_type: None,
+                token_address: None,
+                client_token: None,
+                metadata_hash: None,
+                metadata: None,
+                fee_waiver_code: None,
+                retry_of_payment_id: None,
+                payer_muxed_id: None,
+                    tip_enabled: false,
+    });
+            registry_client.set_kyc_tier_with_signature(
+                &admin,
+                &merchant,
+                &tier,
+                &Some(String::from_str(&env, "sig")),
+            );
+
+            let result = payment_client.try_verify_payment(
+                &oracle,
+                &payment_id,
+                &BytesN::<32>::random(&env),
+                &Address::generate(&env),
+                &amount,
+                &None,
+            );
+
+            match result {
+                Ok(_) => {
+                    running_total = running_total.saturating_add(amount);
+                    prop_assert!(running_total <= cap,
+                        "tier {:?} exceeded cap {} with running total {} after amount {}",
+                        tier,
+                        cap,
+                        running_total,
+                        amount,
+                    );
+                }
+                Err(Ok(Error::TierVolumeLimitExceeded)) => {
+                    prop_assert!(
+                        running_total + amount > cap,
+                        "cap exceeded should be rejected only when {} + {} > {} (running_total={})",
+                        running_total,
+                        amount,
+                        cap,
+                        running_total,
+                    );
+                }
+                other => prop_assert!(false, "unexpected verification result for {:?}: {:?}", tier, other),
+            }
+        }
     }
 
     /// Issue #681: Subscription cannot be charged before the billing interval has elapsed.
@@ -489,6 +656,7 @@ proptest! {
             &amount,
             &Symbol::new(&env, "USDC"),
             &BillingInterval::Weekly,
+            &None,
         );
 
         let sub_id = client.subscribe(
@@ -542,6 +710,7 @@ proptest! {
             &amount,
             &Symbol::new(&env, "USDC"),
             &BillingInterval::Weekly,
+            &None,
         );
 
         let sub_id = client.subscribe(
@@ -588,6 +757,7 @@ proptest! {
             &amount,
             &Symbol::new(&env, "USDC"),
             &BillingInterval::Weekly,
+            &None,
         );
 
         let sub_id = client.subscribe(
@@ -612,4 +782,181 @@ proptest! {
             "next_retry_at {:?} should equal now + SUBSCRIPTION_RETRY_INTERVAL_SECS ({})",
             sub.next_retry_at, expected_retry);
     }
+
+    // ── Fee-split arithmetic invariants (issue #590) ────────────────────────────
+
+    /// `platform_fee = treasury_share + developer_share` for every valid BPS
+    /// configuration. Mirrors the integer-division formula in
+    /// `PaymentProcessor::settle_payment`:
+    ///   dev  = fee * developer_bps / 10_000
+    ///   treasury = fee - dev   (remainder / rounding dust)
+    #[test]
+    fn proptest_fee_split_sums_to_platform_fee(
+        fee in 0i128..=1_000_000_000_000i128,
+        treasury_bps in 0u32..=10_000u32,
+        developer_bps in 0u32..=10_000u32,
+    ) {
+        prop_assume!(treasury_bps as u64 + developer_bps as u64 <= 10_000);
+
+        let dev_amount: i128 = fee * developer_bps as i128 / 10_000;
+        let treasury_total: i128 = fee - dev_amount;
+
+        // Core invariant: the two shares must reconstruct the original fee.
+        prop_assert_eq!(
+            treasury_total + dev_amount, fee,
+            "treasury {} + dev {} != fee {}",
+            treasury_total, dev_amount, fee
+        );
+
+        // Neither share may be negative.
+        prop_assert!(treasury_total >= 0, "treasury_total negative: {}", treasury_total);
+        prop_assert!(dev_amount >= 0, "dev_amount negative: {}", dev_amount);
+
+        // Each share must not exceed the fee itself.
+        prop_assert!(treasury_total <= fee, "treasury_total {} > fee {}", treasury_total, fee);
+        prop_assert!(dev_amount <= fee, "dev_amount {} > fee {}", dev_amount, fee);
+    }
+
+    /// Merchant net amount after platform fee never exceeds gross payment amount.
+    #[test]
+    fn proptest_merchant_net_never_exceeds_gross(
+        amount in 1i128..=1_000_000_000_000i128,
+        fee_bps in 0i128..=10_000i128,
+    ) {
+        let fee = amount * fee_bps / 10_000;
+        let net = amount - fee;
+
+        prop_assert!(net >= 0, "net went negative: {}", net);
+        prop_assert!(net <= amount, "net {} > amount {}", net, amount);
+        prop_assert!(fee >= 0, "fee negative: {}", fee);
+    }
+
+    // ── Stream accrual bounded-by-deposit invariant (issue #589) ─────────────────
+
+    /// Accrued amount must never exceed the total deposit, regardless of
+    /// rate, elapsed time, or checkpoint values.
+    #[test]
+    fn proptest_stream_accrued_bounded_by_deposit(
+        checkpoint in 0i128..=i128::MAX / 4,
+        last_at in 0u64..u64::MAX / 4,
+        elapsed in 0u64..=86_400u64,
+        rate in 0i128..=i128::MAX / 86_400,
+        deposit in 1i128..=i128::MAX / 4,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let now = last_at.saturating_add(elapsed);
+        let accrued = compute_total_accrued(checkpoint, last_at, now, rate, deposit);
+        prop_assert!(accrued >= 0, "accrual negative: {}", accrued);
+        prop_assert!(
+            accrued <= deposit.max(0),
+            "accrual {} exceeded deposit {}",
+            accrued, deposit
+        );
+    }
+
+    /// Compute_total_accrued with zero rate always returns the checkpoint value
+    /// (clamped to deposit).
+    #[test]
+    fn proptest_stream_zero_rate_returns_checkpoint(
+        checkpoint in 0i128..=1_000_000_000i128,
+        last_at in 0u64..=1_000_000u64,
+        elapsed in 0u64..=10_000u64,
+        deposit in 1i128..=i128::MAX / 4,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let now = last_at.saturating_add(elapsed);
+        let accrued = compute_total_accrued(checkpoint, last_at, now, 0, deposit);
+
+        let expected = checkpoint.min(deposit.max(0)).max(0);
+        prop_assert_eq!(accrued, expected);
+    }
+
+    /// Remaining deposit after withdrawal is always in [0, remaining].
+    #[test]
+    fn proptest_stream_withdraw_clamped(
+        remaining in 0i128..=i128::MAX / 2,
+        withdraw in 0i128..=i128::MAX / 2,
+    ) {
+        use crate::stream::compute_remaining_after_withdraw;
+
+        let after = compute_remaining_after_withdraw(remaining, withdraw);
+        prop_assert!(after >= 0, "remaining went negative: {}", after);
+        prop_assert!(after <= remaining.max(0), "after {} > remaining {}", after, remaining);
+    }
+
+    /// Issue #853: payment_id_to_key helper produces consistent 32-byte keys
+    /// and exhibits collision resistance for distinct payment IDs.
+    #[test]
+    fn proptest_payment_id_to_key_collision_resistance(
+        id1 in "[a-zA-Z0-9_-]{1,64}",
+        id2 in "[a-zA-Z0-9_-]{1,64}",
+    ) {
+        use crate::data_keys::payment_id_to_key;
+        let env = Env::default();
+        let s1 = String::from_str(&env, &id1);
+        let s2 = String::from_str(&env, &id2);
+
+        let key1 = payment_id_to_key(&env, &s1);
+        let key2 = payment_id_to_key(&env, &s2);
+
+        // Determinism: hashing the same id yields identical key
+        let key1_again = payment_id_to_key(&env, &s1);
+        prop_assert_eq!(key1.clone(), key1_again);
+
+        // Collision resistance: distinct IDs must produce distinct keys
+        if id1 != id2 {
+            prop_assert_ne!(key1, key2);
+        } else {
+            prop_assert_eq!(key1, key2);
+        }
+    }
+
+    /// Issue #772: Accrual across many pause/resume cycles exhibits no negative drift.
+    #[test]
+    fn proptest_stream_pause_resume_many_cycles_no_drift(
+        rate in 1i128..=10_000,
+        cycles in 1usize..=100,
+        active_step in 1u64..=100,
+        pause_step in 1u64..=500,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let deposit = i128::MAX / 4;
+        let mut baseline_accrued = 0i128;
+        let mut last_checkpoint = 1000u64;
+        let mut current_time = 1000u64;
+        let mut total_active_elapsed = 0u64;
+
+        for _ in 0..cycles {
+            // Active period
+            current_time = current_time.saturating_add(active_step);
+            total_active_elapsed = total_active_elapsed.saturating_add(active_step);
+
+            // Snapshot at pause
+            let accrued_at_pause = compute_total_accrued(
+                baseline_accrued,
+                last_checkpoint,
+                current_time,
+                rate,
+                deposit,
+            );
+            prop_assert!(
+                accrued_at_pause >= baseline_accrued,
+                "Accrual drifted negatively at pause"
+            );
+
+            // Paused interval: time passes, no accrual happens
+            current_time = current_time.saturating_add(pause_step);
+
+            // Resume carries accrued_at_pause forward as new baseline
+            baseline_accrued = accrued_at_pause;
+            last_checkpoint = current_time;
+        }
+
+        let expected_total = (total_active_elapsed as i128).saturating_mul(rate);
+        prop_assert_eq!(baseline_accrued, expected_total);
+    }
 }
+

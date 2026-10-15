@@ -78,11 +78,13 @@ fn test_create_payment_with_g_address_payer_muxed_id_is_none() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
         retry_of_payment_id: None,
         payer_muxed_id: None,
+            tip_enabled: false,
     };
 
     let payment = payment_client.try_create_payment(&args);
@@ -117,11 +119,13 @@ fn test_verify_payment_with_muxed_sender_populates_muxed_id() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
         retry_of_payment_id: None,
         payer_muxed_id: None,
+            tip_enabled: false,
     };
 
     payment_client.create_payment(&args);
@@ -166,11 +170,13 @@ fn test_verify_payment_without_muxed_id_remains_none() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
         retry_of_payment_id: None,
         payer_muxed_id: None,
+            tip_enabled: false,
     };
 
     payment_client.create_payment(&args);
@@ -216,11 +222,13 @@ fn test_muxed_payer_auth_not_checked_in_create_or_verify() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
         retry_of_payment_id: None,
         payer_muxed_id: None,
+            tip_enabled: false,
     };
 
     payment_client.create_payment(&args);
@@ -236,4 +244,135 @@ fn test_muxed_payer_auth_not_checked_in_create_or_verify() {
     );
 
     assert!(result.is_ok());
+}
+
+/// Issue #841: when create_payment stores an expected muxed ID, verify must match it.
+#[test]
+fn test_verify_payment_muxed_id_match_succeeds() {
+    let env = Env::default();
+    let (_admin, _processor_addr, payment_client, merchant_client) =
+        setup_payment_processor_with_registry(&env);
+    let (oracle, merchant) =
+        setup_oracle_and_merchant(&env, &_admin, &payment_client, &merchant_client);
+
+    let payment_id = String::from_str(&env, "pay_mux_match_001");
+    let deposit_addr = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let muxed_id: u64 = 42_000;
+
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        payer: Some(payer.clone()),
+        amount: 100_000_000i128,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit_addr,
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+        retry_of_payment_id: None,
+        payer_muxed_id: Some(muxed_id),
+    };
+
+    let charge = payment_client.create_payment(&args);
+    assert_eq!(charge.payer_muxed_id, Some(muxed_id));
+
+    let tx_hash = BytesN::<32>::random(&env);
+    let result = payment_client.try_verify_payment(
+        &oracle,
+        &payment_id,
+        &tx_hash,
+        &payer,
+        &100_000_000i128,
+        &Some(muxed_id),
+    );
+    assert!(result.is_ok(), "matching muxed ID must confirm payment");
+}
+
+/// Issue #841: mismatching muxed sub-account ID is rejected.
+#[test]
+fn test_verify_payment_muxed_id_mismatch_rejected() {
+    let env = Env::default();
+    let (_admin, _processor_addr, payment_client, merchant_client) =
+        setup_payment_processor_with_registry(&env);
+    let (oracle, merchant) =
+        setup_oracle_and_merchant(&env, &_admin, &payment_client, &merchant_client);
+
+    let payment_id = String::from_str(&env, "pay_mux_mismatch_001");
+    let deposit_addr = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let expected: u64 = 42_000;
+    let wrong: u64 = 99_999;
+
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        payer: Some(payer.clone()),
+        amount: 100_000_000i128,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit_addr,
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+        retry_of_payment_id: None,
+        payer_muxed_id: Some(expected),
+    };
+
+    payment_client.create_payment(&args);
+
+    let tx_hash = BytesN::<32>::random(&env);
+    let result = payment_client.try_verify_payment(
+        &oracle,
+        &payment_id,
+        &tx_hash,
+        &payer,
+        &100_000_000i128,
+        &Some(wrong),
+    );
+    assert!(
+        matches!(result, Err(Ok(crate::Error::MuxedAccountMismatch))),
+        "mismatching muxed ID must return MuxedAccountMismatch, got {:?}",
+        result
+    );
+
+    // Missing muxed ID when one was required is also a mismatch.
+    let tx_hash2 = BytesN::<32>::random(&env);
+    let result_none = payment_client.try_verify_payment(
+        &oracle,
+        &payment_id,
+        &tx_hash2,
+        &payer,
+        &100_000_000i128,
+        &None,
+    );
+    assert!(
+        matches!(result_none, Err(Ok(crate::Error::MuxedAccountMismatch))),
+        "missing muxed ID must return MuxedAccountMismatch, got {:?}",
+        result_none
+    );
+}
+
+/// Issue #841: MuxedAccount type wraps (G-address, sub-account-id).
+#[test]
+fn test_muxed_account_type_wraps_address_and_id() {
+    let env = Env::default();
+    let account = Address::generate(&env);
+    let muxed = crate::MuxedAccount {
+        account: account.clone(),
+        id: 7_777,
+    };
+    assert_eq!(muxed.account, account);
+    assert_eq!(muxed.id, 7_777);
 }

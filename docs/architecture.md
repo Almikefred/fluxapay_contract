@@ -103,6 +103,22 @@ PaymentLinkManager
 
 ## Role Model
 
+Access control uses a fixed **role registry** (`KNOWN_ROLES` in
+`fluxapay/src/access_control.rs`). `grant_role` and `revoke_role` reject any
+`Symbol` not in this list with `AccessControlError::UnknownRole`, preventing
+phantom permissions from typo'd role names.
+
+| Symbol | Constant helper |
+|--------|-----------------|
+| `ADMIN` | `role_admin()` |
+| `ORACLE` | `role_oracle()` |
+| `MERCHANT` | `role_merchant()` |
+| `SETTLEMENT_OPERATOR` | `role_settlement_operator()` |
+| `ARBITRATOR` | `role_arbitrator()` |
+
+When adding a new system role, update `KNOWN_ROLES` first — it is the single
+source of truth.
+
 ### Admin Role
 
 **Permissions:**
@@ -226,8 +242,26 @@ PaymentLinkManager
 
 - **DEX Router**: Atomic token swaps for `swap_and_pay()` and swap-based refunds
 - **FX Oracle**: Optional multi-currency rate validation to prevent price slippage abuse
-- **Merchant Registry**: Verification, KYC tier tracking, merchant lookup
+- **Merchant Registry**: Verification, KYC tier tracking, merchant lookup (see [MerchantRegistry API Reference](merchant-registry-api-reference.md))
 - **Payment Link Manager**: Independent links with direct transfers and metadata validation
+
+---
+
+## MerchantRegistry API Reference
+
+For detailed entry point documentation, parameters, return types, authorization requirements, and emitted events for merchant management, see the dedicated reference document:
+
+👉 **[MerchantRegistry API Reference](merchant-registry-api-reference.md)**
+
+Key operations documented include:
+- `register_merchant` — Registration & initial tier assignment
+- `update_merchant` — Payout address and profile updates
+- `verify_merchant` / `verify_merchant_with_signature` — Verification flows
+- `set_kyc_tier` / `auto_upgrade_kyc_tier` — Tier management & automated upgrades
+- `set_fee_config` / `calculate_platform_fee` — Platform fee configurations
+- `add_to_whitelist` / `is_address_whitelisted` — Payer whitelist controls
+- `suspend_merchant` / `reinstate_merchant` — Lifecycle & suspension management
+- `get_all_merchants` — Paginated merchant catalog queries
 
 ---
 
@@ -351,6 +385,30 @@ Full SEP-6 / SEP-24 protocol integration details, request payloads, anchor statu
 
 ---
 
+### DEX Router & Slippage Tolerance (#856)
+
+FluxaPay integrates with Soroswap-compatible DEX routers (`DexRouter`) to support atomic token swaps prior to payment settlement (`swap_and_pay`) or for swap-based refunds.
+
+#### `execute_swap` Entry Point
+
+```rust
+pub fn execute_swap(
+    env: Env,
+    caller: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: i128,
+    min_amount_out: i128,
+    max_slippage_bps: u32,
+) -> Result<i128, DexRouterError>
+```
+
+- **Slippage Enforcement**: `min_amount_out` specifies the absolute minimum token output the caller is willing to receive. If the actual swap output is less than `min_amount_out`, the swap reverts with `DexRouterError::SlippageExceeded` (code 4).
+- **Secondary Quoted Price Guard**: `max_slippage_bps` enforces a relative tolerance in basis points against the simulated quoted price (`get_amounts_out`). The parameter is strictly capped at `≤ 5000` bps (50% max). If actual execution deviates beyond this range or if `max_slippage_bps > 5000`, the transaction is rejected with `SlippageExceeded`.
+- **Price Impact Guard**: Swaps also enforce an internal price impact guard to protect against pool imbalance.
+
+---
+
 ## Security Considerations
 
 - **Threat Model**: See the [FluxaPay threat model](threat-model.md) for assets,
@@ -376,3 +434,5 @@ reference table, including common causes and remediation: see
 
 - [ADR-0001: Access Control Split](ADR-0001-access-control-split.md)
 - [ADR-0002: Payment Stream Design](ADR-0002-payment-stream-design.md)
+- [ADR-0003: KYC Tier System](ADR-0003-kyc-tier-system.md)
+- [ADR-0004: Multi-Sig Admin Governance](ADR-0004-multisig-admin-governance.md)

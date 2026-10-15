@@ -365,8 +365,10 @@ fn test_unverified_merchant_cannot_create_payment() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
 
     // This should panic with Unauthorized error
@@ -428,8 +430,10 @@ fn test_verified_merchant_can_create_payment() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
 
     let payment = payment_client.create_payment(&args);
@@ -1357,8 +1361,10 @@ fn test_basic_tier_cap_enforced() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
     payment_client.verify_payment(
         &oracle,
@@ -1383,8 +1389,10 @@ fn test_basic_tier_cap_enforced() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
 
     let result = payment_client.try_verify_payment(
@@ -1430,8 +1438,10 @@ fn test_business_tier_no_cap() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
     payment_client.verify_payment(
         &oracle,
@@ -1475,8 +1485,10 @@ fn test_volume_resets_next_month() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
     payment_client.verify_payment(
         &oracle,
@@ -1504,8 +1516,10 @@ fn test_volume_resets_next_month() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
     payment_client.verify_payment(
         &oracle,
@@ -1926,8 +1940,10 @@ fn test_non_whitelisted_payer_rejected() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
 
     assert!(result.is_err(), "Expected PayerNotWhitelisted error");
@@ -1967,8 +1983,10 @@ fn test_whitelisted_payer_accepted() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     });
 
     assert_eq!(payment.merchant_id, merchant);
@@ -1976,4 +1994,231 @@ fn test_whitelisted_payer_accepted() {
     // Removing the payer from the whitelist should block subsequent payments.
     registry_client.remove_from_customer_whitelist(&merchant, &payer);
     assert!(!registry_client.is_customer_whitelisted(&merchant, &payer));
+}
+
+#[test]
+fn test_auto_upgrade_kyc_tier_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant_id = Address::generate(&env);
+    let processor_id = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.set_payment_processor_address(&admin, &processor_id);
+
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+        &MaybeFeeConfig::None,
+    );
+
+    // Auto upgrade from Unverified to Basic
+    client.auto_upgrade_kyc_tier(&processor_id, &merchant_id, &KycTier::Basic);
+
+    let merchant = client.get_merchant(&merchant_id);
+    assert_eq!(merchant.kyc_tier, KycTier::Basic);
+}
+
+#[test]
+fn test_system_callbacks_require_configured_contracts() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let refund_manager = Address::generate(&env);
+    let payment_processor = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let merchant_id = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.set_refund_manager_address(&admin, &refund_manager);
+    client.set_payment_processor_address(&admin, &payment_processor);
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+        &MaybeFeeConfig::None,
+    );
+
+    assert!(matches!(
+        client.try_suspend_merchant_by_system(
+            &attacker,
+            &merchant_id,
+            &String::from_str(&env, "griefing"),
+            &u64::MAX,
+        ),
+        Err(Ok(MerchantError::Unauthorized))
+    ));
+    assert!(matches!(
+        client.try_set_last_settlement_at(&attacker, &merchant_id, &123u64),
+        Err(Ok(MerchantError::Unauthorized))
+    ));
+    assert!(matches!(
+        client.try_increment_merchant_dispute_count(&attacker, &merchant_id),
+        Err(Ok(MerchantError::Unauthorized))
+    ));
+    assert!(matches!(
+        client.try_increment_resolved_against_count(&attacker, &merchant_id),
+        Err(Ok(MerchantError::Unauthorized))
+    ));
+
+    assert_eq!(
+        client.increment_merchant_dispute_count(&payment_processor, &merchant_id),
+        1
+    );
+    client.set_last_settlement_at(&payment_processor, &merchant_id, &123u64);
+    assert_eq!(
+        client.increment_resolved_against_count(&refund_manager, &merchant_id),
+        1
+    );
+    client.suspend_merchant_by_system(
+        &refund_manager,
+        &merchant_id,
+        &String::from_str(&env, "trusted callback"),
+        &u64::MAX,
+    );
+
+    let merchant = client.get_merchant(&merchant_id);
+    assert!(!merchant.active);
+    assert_eq!(merchant.last_settlement_at, Some(123));
+    assert_eq!(merchant.dispute_count, 1);
+    assert_eq!(merchant.resolved_against_count, 1);
+}
+
+#[test]
+fn test_kyc_tier_limits_all_tiers_and_boundaries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1700000000); // stable timestamp
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let merchant_id = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+        &MaybeFeeConfig::None,
+    );
+
+    // Tier 0 (Unverified): Max single 100 USDC (100_000_000), monthly 500 USDC (500_000_000)
+    assert!(client.try_check_kyc_limit(&merchant_id, &100_000_000).is_ok());
+    assert!(client.try_check_kyc_limit(&merchant_id, &100_000_001).is_err());
+
+    // Upgrade to Tier 1 (Basic): Max single 10,000 USDC (10_000_000_000), monthly 50,000 USDC (50_000_000_000)
+    client.set_kyc_tier_with_signature(&admin, &merchant_id, &KycTier::Basic, &MaybeFeeConfig::None);
+    assert!(client.try_check_kyc_limit(&merchant_id, &10_000_000_000).is_ok());
+    assert!(client.try_check_kyc_limit(&merchant_id, &10_000_000_001).is_err());
+
+    // Upgrade to Tier 2 (Full): Unlimited
+    client.set_kyc_tier_with_signature(&admin, &merchant_id, &KycTier::Full, &MaybeFeeConfig::None);
+    assert!(client.try_check_kyc_limit(&merchant_id, &1_000_000_000_000).is_ok());
+}
+
+#[test]
+fn test_kyc_tier_monthly_volume_reset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // 2026-01-15 00:00:00 UTC = 1768435200
+    env.ledger().with_mut(|li| li.timestamp = 1768435200);
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let merchant_id = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+        &MaybeFeeConfig::None,
+    );
+
+    // Accumulate volume up to tier 0 monthly cap (500 USDC)
+    for _ in 0..5 {
+        assert!(client.try_check_kyc_limit(&merchant_id, &100_000_000).is_ok());
+    }
+    // 6th payment in same month breaches 500 USDC cap
+    assert!(client.try_check_kyc_limit(&merchant_id, &100_000_000).is_err());
+
+    // Advance to 2026-02-01 00:00:00 UTC = 1769904000 (1st of next month)
+    env.ledger().with_mut(|li| li.timestamp = 1769904000);
+
+    // Monthly volume resets, payment succeeds again
+    assert!(client.try_check_kyc_limit(&merchant_id, &100_000_000).is_ok());
+}
+
+fn test_list_merchants_page_size_too_large() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+
+    let res = client.try_list_merchants(&None, &51);
+    assert_eq!(res, Err(Ok(MerchantError::PageSizeTooLarge)));
+}
+
+#[test]
+fn test_list_merchants_pagination_cursor_and_integrity() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+
+    // Register 5 merchants
+    for i in 0..5 {
+        let m_id = Address::generate(&env);
+        let name = String::from_str(&env, "Merchant");
+        let curr = String::from_str(&env, "USDC");
+        client.register_merchant(&m_id, &name, &curr, &None, &None, &MaybeFeeConfig::None);
+    }
+
+    // Page 1: limit 2
+    let page1 = client.list_merchants(&None, &2);
+    assert_eq!(page1.merchants.len(), 2);
+    assert!(page1.next_cursor.is_some());
+
+    // Page 2: limit 2 using next_cursor
+    let page2 = client.list_merchants(&page1.next_cursor, &2);
+    assert_eq!(page2.merchants.len(), 2);
+    assert!(page2.next_cursor.is_some());
+
+    // Page 3: limit 2 using next_cursor
+    let page3 = client.list_merchants(&page2.next_cursor, &2);
+    assert_eq!(page3.merchants.len(), 1);
+    assert!(page3.next_cursor.is_none());
+
+    // Ensure all 5 are distinct
+    let m1_0 = page1.merchants.get(0).unwrap().merchant_id;
+    let m1_1 = page1.merchants.get(1).unwrap().merchant_id;
+    let m2_0 = page2.merchants.get(0).unwrap().merchant_id;
+    let m2_1 = page2.merchants.get(1).unwrap().merchant_id;
+    let m3_0 = page3.merchants.get(0).unwrap().merchant_id;
+
+    assert_ne!(m1_0, m1_1);
+    assert_ne!(m1_1, m2_0);
+    assert_ne!(m2_0, m2_1);
+    assert_ne!(m2_1, m3_0);
 }

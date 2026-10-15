@@ -262,6 +262,7 @@ fn create_and_deactivate_subscription_plan_emit_events() {
         &1_000_000i128,
         &Symbol::new(&env, "USDC"),
         &crate::BillingInterval::Weekly,
+        &None,
     );
     assert!(
         events_contain(&env, "SUBSCRIPTION", "PLAN_CREATED"),
@@ -426,6 +427,7 @@ fn test_invoice_overdue_grace_period() {
         &100i128,
         &Symbol::new(&env, "USDC"),
         &due_date,
+        &None,
     );
 
     // Before due date -> Created status
@@ -486,6 +488,7 @@ fn test_invoice_lifecycle_events() {
         &500i128,
         &Symbol::new(&env, "USDC"),
         &due_date,
+        &None,
     );
 
     // Verify INVOICE/CREATED event emission
@@ -500,6 +503,91 @@ fn test_invoice_lifecycle_events() {
     assert!(!events_after_paid.events().is_empty());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #764 — Two-step time-locked admin ownership transfer
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_propose_and_accept_admin_after_timelock() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_refund_manager(&env);
+    let new_admin = Address::generate(&env);
+
+    // Propose admin
+    client.propose_admin(&admin, &new_admin);
+
+    // Advance ledger past MIN_TIMELOCK_LEDGERS (17,280 ledgers)
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(current_seq + crate::access_control::MIN_TIMELOCK_LEDGERS);
+
+    // Accept admin transfer
+    client.accept_admin(&new_admin);
+
+    // Verify admin was updated
+    assert_eq!(client.get_admin(), Some(new_admin));
+}
+
+#[test]
+#[should_panic(expected = "Admin transfer timelock has not expired")]
+fn test_accept_admin_before_timelock_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_refund_manager(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // Only advance 100 ledgers (less than 17,280)
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(current_seq + 100);
+
+    // Must panic because timelock has not elapsed
+    client.accept_admin(&new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Caller is not the pending admin")]
+fn test_accept_admin_by_non_pending_address_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_refund_manager(&env);
+    let new_admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(current_seq + crate::access_control::MIN_TIMELOCK_LEDGERS);
+
+    // Attacker calls accept_admin -> must panic
+    client.accept_admin(&attacker);
+}
+
+#[test]
+#[should_panic(expected = "No pending admin transfer")]
+fn test_cancel_admin_transfer_clears_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_refund_manager(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // Admin cancels the transfer
+    client.cancel_admin_transfer(&admin);
+
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(current_seq + crate::access_control::MIN_TIMELOCK_LEDGERS);
+
+    // Attempting to accept after cancellation must panic
+    client.accept_admin(&new_admin);
+}
+
 // keep the unused-import checker quiet if a feature test is removed
 #[allow(unused_imports)]
 use crate as _fluxapay;
@@ -507,3 +595,4 @@ use crate as _fluxapay;
 fn _use_into_val(env: &Env, a: Address) -> soroban_sdk::Val {
     a.into_val(env)
 }
+

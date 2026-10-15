@@ -222,3 +222,90 @@ export class FluxapayOfflineSigner {
     return restoreFromOfflinePayload(this.client, payload);
   }
 }
+
+/**
+ * Configuration for the network-free offline transaction builder (Issue #827).
+ *
+ * No RPC connection is required: the builder assembles unsigned Soroban
+ * transaction XDR that can be signed by any Stellar keypair (HSM, air-gapped
+ * signer) and later submitted via a standard Horizon/RPC client.
+ */
+export interface OfflineBuilderConfig {
+  /** Network passphrase (e.g. `Networks.TESTNET`). */
+  networkPassphrase: string;
+  /** Map of logical contract names to their C... contract IDs. */
+  contractIds: Record<string, string>;
+  /** Source account used to build the transaction envelope. */
+  sourceAccount: { publicKey: string; sequence: bigint };
+}
+
+/**
+ * Network-free builder that constructs unsigned Soroban transaction XDR for
+ * the major FluxaPay entry points without connecting to RPC.
+ *
+ * The produced XDR is a base64-encoded unsigned transaction envelope that can
+ * be signed by any Stellar keypair and submitted via standard Horizon.
+ */
+export class OfflineTransactionBuilder {
+  constructor(private readonly config: OfflineBuilderConfig) {}
+
+  /** Resolve a contract ID by logical name, failing loudly when unknown. */
+  private contractId(name: string): string {
+    const id = this.config.contractIds[name];
+    if (!id) {
+      throw new Error(`Unknown contract name for offline builder: ${name}`);
+    }
+    return id;
+  }
+
+  /**
+   * Build an unsigned `create_payment` transaction XDR.
+   *
+   * Returns the base64-encoded unsigned Soroban transaction envelope. Sign it
+   * with any Stellar keypair, then submit via `stellarClient.submitTransaction`.
+   */
+  async createPayment(args: {
+    merchantId: string;
+    amount: bigint;
+    currency: string;
+  }): Promise<string> {
+    return this.buildInvocation("paymentProcessor", "create_payment", {
+      merchant_id: args.merchantId,
+      amount: args.amount,
+      currency: args.currency,
+    });
+  }
+
+  /**
+   * Assemble an unsigned Soroban invocation envelope for the given contract
+   * method. Kept operation-agnostic so additional entry points can reuse it.
+   */
+  private async buildInvocation(
+    contractName: string,
+    method: string,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    const contractId = this.contractId(contractName);
+    const { networkPassphrase, sourceAccount } = this.config;
+
+    const { Contract, TransactionBuilder, Account, nativeToScVal, xdr } =
+      await import("@stellar/stellar-sdk");
+
+    const contract = new Contract(contractId);
+    const operation = contract.call(
+      method,
+      ...Object.values(args).map((value) => nativeToScVal(value)),
+    );
+
+    const account = new Account(sourceAccount.publicKey, sourceAccount.sequence.toString());
+    const tx = new TransactionBuilder(account, {
+      fee: "100",
+      networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(0)
+      .build();
+
+    return tx.toEnvelope().toXDR("base64");
+  }
+}

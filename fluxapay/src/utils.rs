@@ -79,6 +79,12 @@ pub fn validate_ipfs_multihash(s: &String) -> bool {
 /// Rules (issue #404):
 /// - Length: 3–64 characters (inclusive)
 /// - Allowed characters: ASCII alphanumeric, `-`, `_`
+///
+/// Issue #792: Rejects any input containing a null byte (`\x00`) or other
+/// non-printable/control bytes. Soroban strings can hold arbitrary bytes, so
+/// the parser must never assume valid UTF-8 or printable content; it operates
+/// purely on raw bytes and returns `false` (a validation error at the call
+/// site) instead of panicking.
 pub fn validate_id(s: &String) -> bool {
     let len = s.len() as usize;
     if !(3..=64).contains(&len) {
@@ -87,6 +93,10 @@ pub fn validate_id(s: &String) -> bool {
     let mut buf = [0u8; 64];
     s.copy_into_slice(&mut buf[..len]);
     for b in buf[..len].iter() {
+        // Reject null bytes and any other control/non-printable byte.
+        if *b == 0x00 || *b < 0x20 || *b == 0x7f {
+            return false;
+        }
         let valid = b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_';
         if !valid {
             return false;
@@ -214,5 +224,34 @@ mod tests {
         let id1 = format_id(&env, "refund_", 1);
         let id2 = format_id(&env, "refund_", 2);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_validate_id_rejects_null_bytes() {
+        let env = Env::default();
+        // Reproducer from fuzz_create_payment_id_parse: "\x00\x00" plus padding.
+        let id = String::from_bytes(&env, &[0x00, 0x00, b'a', b'b']);
+        assert!(!validate_id(&id));
+    }
+
+    #[test]
+    fn test_validate_id_rejects_embedded_null_byte() {
+        let env = Env::default();
+        let id = String::from_bytes(&env, &[b'a', b'b', 0x00, b'c']);
+        assert!(!validate_id(&id));
+    }
+
+    #[test]
+    fn test_validate_id_rejects_control_bytes() {
+        let env = Env::default();
+        let id = String::from_bytes(&env, &[b'a', b'b', 0x1f, b'c']);
+        assert!(!validate_id(&id));
+    }
+
+    #[test]
+    fn test_validate_id_accepts_valid() {
+        let env = Env::default();
+        let id = String::from_bytes(&env, b"pay_123-abc");
+        assert!(validate_id(&id));
     }
 }

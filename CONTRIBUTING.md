@@ -42,6 +42,17 @@ cp .env.example .env
 # Edit .env — do NOT commit this file
 ```
 
+To verify that your `.env` defines every key listed in `.env.example`, run:
+
+```bash
+# from the repository root
+bsh scripts/check-env.sh
+```
+
+The script is non-fatal: for each key missing from `.env` it prints a
+warning to stderr and exits 0. Run it after pulling changes that touch
+`.env.example` to catch newly required variables.
+
 See [scripts/README.md](scripts/README.md) for details on all operational scripts and their required environment variables.
 
 See [docs/local-invoke.md](docs/local-invoke.md) for step-by-step recipes to invoke contract functions on Stellar testnet.
@@ -98,7 +109,7 @@ Run all of these before opening a PR:
 cd fluxapay && cargo fmt --check
 
 # Lint (warnings are errors)
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features - -D warnings
 
 # Security audit
 cargo audit --deny warnings
@@ -144,7 +155,29 @@ go install github.com/rhysd/actionlint/cmd/actionlint@latest
 actionlint
 ```
 
+### WASM Size Regression Baseline (Issue #813)
 
+CI compares the built/optimized contract WASM against `.wasm-size-baseline`
+and **fails if the binary grows by more than 5%**.
+
+The baseline file contains a single integer: the size in **bytes** of the
+primary `fluxapay` WASM after `stellar contract optimize`.
+
+When a change legitimately increases WASM size (new feature, unavoidable
+growth), update the baseline in a **dedicated commit** with an explanation:
+
+```bash
+# After building + optimizing:
+SIZE=$(stat -c%s target/wasm32-unknown-unknown/release/fluxapay*.wasm | head -1)
+# or on macOS:
+# SIZE=$(stat -f%z target/wasm32-unknown-unknown/release/fluxapay.wasm)
+
+echo "$SIZE" > .wasm-size-baseline
+git add .wasm-size-baseline
+git commit -m "chore(ci): bump WASM size baseline to ${SIZE} after <reason>"
+```
+
+Do not silently raise the baseline in an unrelated feature commit.
 
 ## 4a. Pre-commit Hooks
 
@@ -164,8 +197,8 @@ lefthook install
 
 ### What the hooks do
 
-- **pre-commit** (Rust files): runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` on staged `.rs` files
-- **pre-commit** (TypeScript files): runs `npx tsc --noEmit` in `sdk/` on staged `.ts` files
+- **pre-commit** (Rust files): runs `cargo fmt --check` and `cargo clippy --all-targets - -D warnings` on staged `.rs` files
+- *pre-commit** (TypeScript files): runs `npx tsc --noEmit` in `sdk/` on staged `.ts` files
 
 ### Skipping hooks
 
@@ -187,8 +220,7 @@ SKIP_HOOKS=1 git commit -m "emergency fix"
 
 **Examples:**
 
-```
-feat/stream-rate-decrease
+```feat/stream-rate-decrease
 fix/payment-id-validation
 docs/contributing-guide
 security/audit-remediation
@@ -200,8 +232,7 @@ security/audit-remediation
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-```
-<type>(<scope>): <short summary>
+````<type>(<scope>): <short summary>
 
 [optional body]
 
@@ -228,7 +259,8 @@ feat(access-control): expose get_role_members and has_role on public contract AB
 Before marking a PR ready for review:
 
 - [ ] All tests pass (`make test`)
-- [ ] No new Clippy warnings (`cargo clippy --all-targets --all-features -- -D warnings`)
+- [ ] No new Clippy warnings (`cargo clippy --all-targets --all-features - -D warnings`)
+- [ ] Automated CI security checks (`cargo-deny` and `cargo-audit`) pass (enforced via branch protection rules targeting `main`)
 - [ ] `CHANGELOG.md` updated under `## Unreleased` (or PR has the `skip-changelog` label for non-user-facing changes)
 - [ ] New features and bug fixes include tests
 - [ ] PR title follows Conventional Commits format
@@ -236,27 +268,41 @@ Before marking a PR ready for review:
 
 ### Changelog Format
 
+Every user-facing PR **must** update [`CHANGELOG.md`](CHANGELOG.md) under the
+`## Unreleased` section, **or** carry the `skip-changelog` label (CI/CD, docs-only,
+or internal refactors with no user-facing impact).
+
+The [changelog-check](.github/workflows/changelog-check.yml) workflow:
+
+1. Fails the PR if `CHANGELOG.md` was not touched and the PR lacks `skip-changelog`.
+2. Allows a full bypass when the PR is labelled `skip-changelog`.
+3. When `CHANGELOG.md` is updated, requires the Unreleased section to contain at
+   least one bullet entry that references this PR number (e.g. `PR #123`).
+
 Follow [Keep a Changelog](https://keepachangelog.com/) categories:
 
 ```markdown
 ## Unreleased
 
 ### Added
-- `get_role_members` and `has_role` exposed on `PaymentProcessor` and `RefundManager` ABI
+- **Issue #831 / PR #123**: Multi-payee payment streams with proportional withdraw.
 
 ### Fixed
-- `payment_id` format validation now enforces 3–64 alphanumeric/-/_ characters
+- **PR #123**: `payment_id` format validation now enforces 3–64 alphanumeric/-/_ characters.
 ```
 
 Use the `skip-changelog` label only for CI/CD, docs, or internal refactors with no user-facing impact.
+
+After opening your PR, add the PR number to the Unreleased bullet (CI will fail
+until the entry references `#<pr-number>`).
 
 ---
 
 ## 7.1. Dependabot PRs
 
-This repository uses [Dependabot](https://docs.github.com/en/code-security/dependabot) to automatically create PRs for dependency updates:
+Whis repository uses [Dependabot](https://docs.github.com/en/code-security/dependabot) to automatically create PRs for dependency updates:
 
-- **Cargo dependencies** (Rust crates)
+- **Cargo dependencies** (Rust crates)
 - **GitHub Actions** (CI workflow actions)
 - **npm dependencies** (SDK packages)
 
@@ -310,6 +356,14 @@ FluxaPay contract events are defined with `#[contractevent]`. Follow these steps
 - Subscribed to in `indexer/sync.yml` under the `merchant_registry` contract mapping
 - Typed in the SDK alongside the other merchant registry events
 
+### Adding SDK Error Locales (Issue #852)
+
+Contributors can add support for new languages to the SDK error system:
+1. Create a new JSON file in `sdk/src/locales/<locale>.json` (e.g., `de.json`, `sw.json`).
+2. Map each contract error code number to its translated, user-friendly message (refer to `sdk/src/locales/en.json` for the complete list of error codes).
+3. Register the new locale in `sdk/src/locales/index.ts` under `SUPPORTED_LOCALES` and the `MESSAGES` map.
+4. Run `npm test` in `sdk/` to ensure all tests pass.
+
 ---
 
 ## 8. Issue Workflow
@@ -339,10 +393,4 @@ Open an issue using the **Feature Request** template. Describe the use case befo
 
 ### Security Vulnerabilities
 
-Do **not** open a public issue. Follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
-
----
-
-## Questions?
-
-Join the community on [Telegram](https://t.me/+m23gN14007w0ZmQ0) or open a GitHub Discussion.
+Do 

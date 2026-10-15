@@ -10,6 +10,7 @@
  * `docs/error-codes.md`).
  *
  * Exits non-zero (fails CI) if:
+ *   - an expected source file cannot be found,
  *   - a variant declared in `Error` is missing from the SDK map, or
  *   - a code in the SDK map doesn't correspond to any declared variant.
  */
@@ -22,6 +23,18 @@ const repoRoot = join(__dirname, "..");
 
 const libRsPath = join(repoRoot, "fluxapay", "src", "lib.rs");
 const indexTsPath = join(repoRoot, "sdk", "src", "index.ts");
+
+function readSourceFile(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error(
+      `check-error-map-sync: expected source file not found: ${path}\n  ${reason}`,
+    );
+    process.exit(1);
+  }
+}
 
 function parseRustErrorEnum(source: string): Map<number, string[]> {
   const enumMatch = source.match(/pub enum Error\s*{([\s\S]*?)\n}/);
@@ -67,8 +80,8 @@ function parseSdkErrorMap(source: string): Map<number, string> {
 }
 
 function main(): void {
-  const rustVariants = parseRustErrorEnum(readFileSync(libRsPath, "utf8"));
-  const sdkMap = parseSdkErrorMap(readFileSync(indexTsPath, "utf8"));
+  const rustVariants = parseRustErrorEnum(readSourceFile(libRsPath));
+  const sdkMap = parseSdkErrorMap(readSourceFile(indexTsPath));
 
   const problems: string[] = [];
 
