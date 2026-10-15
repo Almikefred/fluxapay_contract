@@ -321,8 +321,8 @@ proptest! {
 
         let t1 = last_at.saturating_add(delta1);
         let t2 = t1.saturating_add(delta2);
-        let a1 = compute_total_accrued(checkpoint, last_at, t1, rate, deposit);
-        let a2 = compute_total_accrued(checkpoint, last_at, t2, rate, deposit);
+        let a1 = compute_total_accrued(checkpoint, last_at, t1, rate, deposit, None);
+        let a2 = compute_total_accrued(checkpoint, last_at, t2, rate, deposit, None);
         prop_assert!(a2 >= a1, "accrual decreased: {} -> {} (t {} -> {})", a1, a2, t1, t2);
     }
 
@@ -338,7 +338,7 @@ proptest! {
         use crate::stream::compute_total_accrued;
 
         let now = last_at.saturating_add(now_offset);
-        let accrued = compute_total_accrued(checkpoint, last_at, now, rate, deposit);
+        let accrued = compute_total_accrued(checkpoint, last_at, now, rate, deposit, None);
         prop_assert!(accrued >= 0);
         prop_assert!(accrued <= deposit.max(0));
     }

@@ -12,6 +12,8 @@ fn setup_payment_link(env: &Env) -> (Address, PaymentLinkManagerClient<'_>) {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(env, &contract_id);
     let admin = Address::generate(env);
+    client.initialize(&admin).unwrap();
+    client.grant_merchant_role(&admin, &admin);
     (admin, client)
 }
 
@@ -46,6 +48,66 @@ fn test_create_link() {
     assert_eq!(link.amount, amount);
     assert!(link.active);
     assert!(!link.direct_transfer);
+}
+
+#[test]
+fn create_link_requires_merchant_role_and_rejects_revoked_merchants() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let link_id = String::from_str(&env, "role_link");
+
+    let attacker = Address::generate(&env);
+    assert_eq!(
+        client.try_initialize(&attacker),
+        Err(Ok(crate::Error::Unauthorized))
+    );
+
+    let ungranted = Address::generate(&env);
+    let ungranted_result = client.try_create_link(
+        &ungranted,
+        &String::from_str(&env, "ungranted_link"),
+        &None,
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Unassigned"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+    assert_eq!(ungranted_result, Err(Ok(crate::Error::Unauthorized)));
+
+    client.create_link(
+        &merchant,
+        &link_id,
+        &None,
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Role required"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+    client.revoke_merchant_role(&merchant, &merchant);
+
+    let revoked_result = client.try_create_link(
+        &merchant,
+        &String::from_str(&env, "revoked_link"),
+        &None,
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Revoked"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+    assert_eq!(revoked_result, Err(Ok(crate::Error::Unauthorized)));
 }
 
 #[test]
@@ -1198,9 +1260,10 @@ fn test_set_payment_base_url_used_as_default() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin).unwrap();
 
     let merchant = Address::generate(&env);
+    client.grant_merchant_role(&admin, &merchant);
     let base = String::from_str(&env, "https://checkout.example.com");
     client.set_payment_base_url(&admin, &base);
 
@@ -1496,7 +1559,7 @@ fn test_use_link_zero_fee_bps_collects_no_fee() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin).unwrap();
 
     let token_admin = Address::generate(&env);
     let usdc_token = env
@@ -1507,6 +1570,7 @@ fn test_use_link_zero_fee_bps_collects_no_fee() {
 
     let merchant = Address::generate(&env);
     let payer = Address::generate(&env);
+    client.grant_merchant_role(&admin, &merchant);
     token_admin_client.mint(&payer, &5000i128);
 
     let link_id = String::from_str(&env, "zero_fee_link");
@@ -1545,7 +1609,7 @@ fn test_use_link_falls_back_to_global_fee_bps_when_link_has_none() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin).unwrap();
 
     let token_admin = Address::generate(&env);
     let usdc_token = env
@@ -1556,6 +1620,7 @@ fn test_use_link_falls_back_to_global_fee_bps_when_link_has_none() {
 
     let merchant = Address::generate(&env);
     let payer = Address::generate(&env);
+    client.grant_merchant_role(&admin, &merchant);
     token_admin_client.mint(&payer, &5000i128);
 
     // Admin sets a 5% (500 bps) global default fee for links.
@@ -1603,7 +1668,7 @@ fn test_set_payment_link_fee_bps_requires_admin() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin).unwrap();
 
     let not_admin = Address::generate(&env);
 

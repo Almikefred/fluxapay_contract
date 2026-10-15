@@ -3,6 +3,7 @@ use soroban_sdk::{
     String, Symbol, Vec,
 };
 
+use crate::access_control::{role_merchant, AccessControl};
 use crate::utils;
 use crate::{format_id, PaymentCharge, PaymentStatus};
 
@@ -156,10 +157,70 @@ impl PaymentLinkManager {
     }
 
     /// Initialize the contract with an admin address.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), crate::Error> {
+        admin.require_auth();
+        if env.storage().persistent().has(&LinkDataKey::LinkAdmin) {
+            return Err(crate::Error::Unauthorized);
+        }
+        AccessControl::initialize(&env, admin.clone());
         env.storage()
             .persistent()
             .set(&LinkDataKey::LinkAdmin, &admin);
+        Ok(())
+    }
+
+    pub fn grant_merchant_role(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), crate::Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&LinkDataKey::LinkAdmin)
+            .ok_or(crate::Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(crate::Error::Unauthorized);
+        }
+
+        Self::ensure_access_control_initialized(&env, &admin);
+        AccessControl::grant_role(&env, admin, role_merchant(&env), merchant_id)
+            .map_err(|_| crate::Error::AccessControlError)
+    }
+
+    pub fn revoke_merchant_role(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), crate::Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&LinkDataKey::LinkAdmin)
+            .ok_or(crate::Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(crate::Error::Unauthorized);
+        }
+
+        Self::ensure_access_control_initialized(&env, &admin);
+        AccessControl::revoke_role(&env, admin, role_merchant(&env), merchant_id)
+            .map_err(|_| crate::Error::AccessControlError)
+    }
+
+    fn ensure_access_control_initialized(env: &Env, admin: &Address) {
+        if AccessControl::get_admin(env).is_none() {
+            AccessControl::initialize(env, admin.clone());
+        }
+    }
+
+    fn require_merchant_role(env: &Env, merchant_id: &Address) -> Result<(), crate::Error> {
+        if AccessControl::has_role(env, &role_merchant(env), merchant_id) {
+            Ok(())
+        } else {
+            Err(crate::Error::Unauthorized)
+        }
     }
 
     /// Upgrade the contract WASM.
@@ -316,6 +377,7 @@ impl PaymentLinkManager {
         base_url: Option<String>,
     ) -> Result<String, crate::Error> {
         merchant.require_auth();
+        Self::require_merchant_role(&env, &merchant)?;
         Self::build_and_store_link(
             &env,
             &merchant,
@@ -350,6 +412,7 @@ impl PaymentLinkManager {
         links: Vec<CreateLinkArgs>,
     ) -> Result<Vec<String>, crate::Error> {
         merchant.require_auth();
+        Self::require_merchant_role(&env, &merchant)?;
 
         if links.len() > MAX_LINKS_PER_BATCH {
             return Err(crate::Error::BatchTooLarge);

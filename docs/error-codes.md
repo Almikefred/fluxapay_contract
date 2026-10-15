@@ -121,6 +121,7 @@ document on every CI run to catch drift between them.
 | 13 | `StreamNotPaused` | Stream is not paused. | Resuming a stream that was never paused. | Confirm stream status before calling resume. |
 | 14 | `InvalidReceiver` | Receiver address cannot equal the sender address. | Creating a stream that pays back to its own sender. | Use a different address for the receiver. |
 | 15 | `BatchTooLarge` | A bulk operation was passed more stream IDs than the per-call cap (50). | Calling `bulk_bump_stream_ttls` with more than 50 IDs. | Split the IDs into batches of ≤ 50. |
+| 16 | `CliffNotReached` | Stream accrual is locked until its cliff timestamp. | Attempting to withdraw from a vesting stream before its cliff. | Wait until the configured cliff timestamp. |
 
 ## `FXOracleError` (`fluxapay/src/fx_oracle.rs`)
 

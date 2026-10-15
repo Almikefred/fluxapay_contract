@@ -50,6 +50,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # Keep production dependency bans, license policy, and advisories enforced.
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Check dependencies
+        run: cargo deny check bans licenses advisories --warn unsound --warn unmaintained
+
   # Job 2: Lint with Clippy
   lint:
     name: Lint (Clippy)
@@ -344,13 +362,14 @@ jobs:
   ci-success:
     name: CI Success
     if: ${{ always() }}
-    needs: [format, lint, build, wasm-size-check, test, proptest]
+    needs: [format, security-scan, lint, build, wasm-size-check, test, proptest]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check all jobs
         run: |
           if [[ "${{ needs.format.result }}" == "success" ]] && \
+             [[ "${{ needs.security-scan.result }}" == "success" ]] && \
              [[ "${{ needs.lint.result }}" == "success" ]] && \
              [[ "${{ needs.build.result }}" == "success" ]] && \
              [[ "${{ needs.wasm-size-check.result }}" == "success" ]] && \

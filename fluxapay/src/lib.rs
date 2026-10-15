@@ -1445,6 +1445,15 @@ impl RefundManager {
         AccessControl::grant_role(&env, admin, role, account).map_err(|_| Error::AccessControlError)
     }
 
+    pub fn grant_merchant_role(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), Error> {
+        AccessControl::grant_role(&env, admin, role_merchant(&env), merchant_id)
+            .map_err(|_| Error::AccessControlError)
+    }
+
     pub fn revoke_role(
         env: Env,
         admin: Address,
@@ -1452,6 +1461,15 @@ impl RefundManager {
         account: Address,
     ) -> Result<(), Error> {
         AccessControl::revoke_role(&env, admin, role, account)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    pub fn revoke_merchant_role(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), Error> {
+        AccessControl::revoke_role(&env, admin, role_merchant(&env), merchant_id)
             .map_err(|_| Error::AccessControlError)
     }
 
@@ -1964,9 +1982,28 @@ impl RefundManager {
             return Err(Error::InputTooLong);
         }
 
-        // Issue #638: Idempotency short-circuit. If this key was already used,
-        // return the original refund_id for identical params, or reject a reuse
-        // with different params.
+        // Validate refund amount does not exceed original payment amount
+        // First try to get payment from local storage
+        let payment: PaymentCharge = if let Some(local_payment) =
+            env.storage()
+                .persistent()
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
+        {
+            local_payment
+        } else {
+            return Err(Error::PaymentNotFound);
+        };
+        Self::require_not_blacklisted(env, &payment.merchant_id)?;
+        Self::require_not_blacklisted(env, &requester)?;
+
+        if requester == payment.merchant_id
+            && !AccessControl::has_role(env, &role_merchant(env), &payment.merchant_id)
+        {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check merchant authorization before returning a previous result so a
+        // revoked merchant cannot use an idempotency retry to bypass revocation.
         if let Some(ref key) = idempotency_key {
             let dk = DataKey::RefundIdempotencyKey(key.clone());
             if let Some(record) = env
@@ -1983,20 +2020,6 @@ impl RefundManager {
                 return Err(Error::DuplicateIdempotencyKey);
             }
         }
-
-        // Validate refund amount does not exceed original payment amount
-        // First try to get payment from local storage
-        let payment: PaymentCharge = if let Some(local_payment) =
-            env.storage()
-                .persistent()
-                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
-        {
-            local_payment
-        } else {
-            return Err(Error::PaymentNotFound);
-        };
-        Self::require_not_blacklisted(env, &payment.merchant_id)?;
-        Self::require_not_blacklisted(env, &requester)?;
 
         // Issue #76: Reject refunds unless payment.status == Confirmed or Overpaid
         if payment.status != PaymentStatus::Confirmed && payment.status != PaymentStatus::Overpaid {
@@ -6466,6 +6489,15 @@ impl PaymentProcessor {
         AccessControl::grant_role(&env, admin, role, account).map_err(|_| Error::AccessControlError)
     }
 
+    pub fn grant_merchant_role(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), Error> {
+        AccessControl::grant_role(&env, admin, role_merchant(&env), merchant_id)
+            .map_err(|_| Error::AccessControlError)
+    }
+
     pub fn revoke_role(
         env: Env,
         admin: Address,
@@ -6473,6 +6505,15 @@ impl PaymentProcessor {
         account: Address,
     ) -> Result<(), Error> {
         AccessControl::revoke_role(&env, admin, role, account)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    pub fn revoke_merchant_role(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), Error> {
+        AccessControl::revoke_role(&env, admin, role_merchant(&env), merchant_id)
             .map_err(|_| Error::AccessControlError)
     }
 
@@ -7178,6 +7219,10 @@ impl PaymentProcessor {
         Self::require_not_blacklisted(&env, &args.merchant_id)?;
         Self::require_not_blacklisted(&env, &args.deposit_address)?;
 
+        if !AccessControl::has_role(&env, &role_merchant(&env), &args.merchant_id) {
+            return Err(Error::Unauthorized);
+        }
+
         // Idempotency check: if client_token was already used, return the existing payment
         // (or error if it maps to a different payment_id).
         if let Some(ref token) = args.client_token {
@@ -7189,11 +7234,6 @@ impl PaymentProcessor {
                     return Err(Error::DuplicateIdempotencyKey);
                 }
             }
-        }
-
-        // Verify that the merchant has the MERCHANT role (granted on verification)
-        if !AccessControl::has_role(&env, &role_merchant(&env), &args.merchant_id) {
-            return Err(Error::Unauthorized);
         }
 
         // Issue #164: Validate token against admin-approved allowlist
@@ -10697,6 +10737,35 @@ impl PaymentProcessor {
         )
     }
 
+    /// Create a vesting stream whose accrued tokens are locked until `cliff_at`.
+    pub fn create_vesting_stream(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        token: Address,
+        rate_per_second: i128,
+        deposit: i128,
+        stream_id: String,
+        cliff_at: u64,
+    ) -> Result<PaymentStream, StreamError> {
+        if Self::is_blacklisted_address(&env, &sender)
+            || Self::is_blacklisted_address(&env, &receiver)
+        {
+            return Err(StreamError::Unauthorized);
+        }
+        PaymentStreaming::create_stream_with_cliff(
+            env,
+            sender,
+            receiver,
+            token,
+            rate_per_second,
+            deposit,
+            stream_id,
+            None,
+            cliff_at,
+        )
+    }
+
     pub fn top_up_stream(
         env: Env,
         caller: Address,
@@ -10747,7 +10816,11 @@ impl PaymentProcessor {
         PaymentStreaming::get_stream_fee_bps(env)
     }
 
-    pub fn set_stream_fee_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), Error> {
+    pub fn set_stream_fee_recipient(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<(), Error> {
         admin.require_auth();
         if AccessControl::get_admin(&env) != Some(admin) {
             return Err(Error::AccessControlError);
@@ -11234,6 +11307,25 @@ impl PaymentProcessor {
         link_args: CreateLinkArgs,
     ) -> Result<(Invoice, PaymentLink), Error> {
         merchant_id.require_auth();
+        if !AccessControl::has_role(&env, &role_merchant(&env), &merchant_id) {
+            return Err(Error::Unauthorized);
+        }
+
+        if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            match registry_client.try_get_merchant(&merchant_id) {
+                Ok(Ok(merchant))
+                    if merchant.kyc_tier != crate::merchant_registry::KycTier::Unverified
+                        && merchant.active
+                        && merchant.suspension_reason.is_none() => {}
+                _ => return Err(Error::Unauthorized),
+            }
+        }
 
         if total_amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -11507,6 +11599,8 @@ mod feature_tests;
 #[cfg(test)]
 mod memo_test;
 #[cfg(test)]
+mod merchant_auth_test;
+#[cfg(test)]
 mod partial_overpaid_test;
 #[cfg(test)]
 mod pause_test;
@@ -11522,6 +11616,8 @@ pub mod stream;
 pub use stream::{PaymentStream, PaymentStreaming, StreamError, StreamStatus};
 #[cfg(test)]
 mod stream_test;
+#[cfg(test)]
+mod stream_vesting_test;
 #[cfg(test)]
 mod subscription_test;
 
