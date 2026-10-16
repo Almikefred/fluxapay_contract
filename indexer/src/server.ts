@@ -2,7 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import * as dotenv from "dotenv";
 import { z } from "zod";
 import { Database } from "./database";
-import { requireApiKey, requireAdminApiKey, requireScope } from "./auth/api-key";
+import { extractApiKey, requireApiKey, requireAdminApiKey, requireScope } from "./auth/api-key";
 import { requireSEP10Auth } from "./auth/middleware";
 import { loadSEP10AuthConfig } from "./auth/config";
 import { sseManager } from "./sse";
@@ -11,7 +11,7 @@ import {
   registerWebhookRoutes,
   WebhookStore,
 } from "./webhooks";
-import { getCachedRate } from "./fx-rate-cache";
+import { getCachedRate, listCachedRates } from "./fx-rate-cache";
 import { createRateLimitMiddleware } from "./rate-limit";
 
 dotenv.config();
@@ -45,15 +45,24 @@ const fxConvertHits = new Map<string, number[]>();
 
 function fxConvertRateLimit(req: Request, res: Response, next: NextFunction): void {
   const ip = (req.ip || req.socket.remoteAddress || "unknown").toString();
+  fxRateLimit(`ip:${ip}`, res, next);
+}
+
+/** Issue #957: /v1/fx/rates shares the 60 req/min budget, keyed per API key. */
+function fxRatesRateLimit(req: Request, res: Response, next: NextFunction): void {
+  fxRateLimit(`key:${extractApiKey(req) ?? "unknown"}`, res, next);
+}
+
+function fxRateLimit(bucket: string, res: Response, next: NextFunction): void {
   const now = Date.now();
   const windowStart = now - FX_CONVERT_WINDOW_MS;
-  const recent = (fxConvertHits.get(ip) || []).filter((t) => t > windowStart);
+  const recent = (fxConvertHits.get(bucket) || []).filter((t) => t > windowStart);
   if (recent.length >= FX_CONVERT_LIMIT) {
     res.status(429).json({ error: "Rate limit exceeded: 60 requests per minute" });
     return;
   }
   recent.push(now);
-  fxConvertHits.set(ip, recent);
+  fxConvertHits.set(bucket, recent);
   next();
 }
 
@@ -267,6 +276,22 @@ export function createServer(
 
   // All subsequent routes require API-key authentication
   app.use(requireApiKey);
+
+  // Issue #957: every cached FX pair in one response, with per-pair staleness.
+  app.get("/v1/fx/rates", fxRatesRateLimit, (_req: Request, res: Response) => {
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const rates = listCachedRates().map((cached) => {
+      const [from, to] = cached.pair.split("_");
+      return {
+        from,
+        to,
+        rate: String(cached.rate),
+        updated_at: new Date(cached.updatedAt * 1000).toISOString(),
+        stale: nowSecs - cached.updatedAt > DEFAULT_FX_STALENESS_SECS,
+      };
+    });
+    res.status(200).json({ rates, staleness_threshold_secs: DEFAULT_FX_STALENESS_SECS });
+  });
 
   // Webhook test delivery and delivery history (Issues #808, #810, #854).
   app.use("/webhooks", requireScope("manage:webhooks"));
