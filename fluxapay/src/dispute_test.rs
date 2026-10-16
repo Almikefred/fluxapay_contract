@@ -49,9 +49,13 @@ fn create_payment_args(
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
+        retry_of_payment_id: None,
+        payer_muxed_id: None,
+        tip_enabled: false,
     }
 }
 
@@ -633,6 +637,92 @@ fn test_get_payment_disputes() {
     // Get all disputes for payment
     let disputes = refund_client.get_payment_disputes(&payment_id);
     assert_eq!(disputes.len(), 2);
+}
+
+/// Issue #575: Filter payment disputes by DisputeStatus.
+#[test]
+fn test_get_payment_disputes_by_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+
+    let payment_id = String::from_str(&env, "payment_status_filter");
+    let amount = 2000i128;
+
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    let args = create_payment_args(&env, &payment_id, &merchant, amount);
+    payment_client.create_payment(&args);
+
+    let transaction_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &transaction_hash,
+        &customer,
+        &amount,
+        &None::<u64>,
+    );
+
+    refund_client.register_payment(&payment_id, &merchant, &amount, &Symbol::new(&env, "USDC"));
+
+    // Create dispute 1
+    let dispute_id1 = refund_client.create_dispute(
+        &payment_id,
+        &500i128,
+        &String::from_str(&env, "First dispute"),
+        &String::from_str(&env, "Evidence 1"),
+        &customer,
+        &vec![&env],
+    );
+
+    // Create dispute 2
+    let dispute_id2 = refund_client.create_dispute(
+        &payment_id,
+        &700i128,
+        &String::from_str(&env, "Second dispute"),
+        &String::from_str(&env, "Evidence 2"),
+        &customer,
+        &vec![&env],
+    );
+
+    // Initial status: both are Open
+    let open_disputes =
+        refund_client.get_payment_disputes_by_status(&payment_id, &DisputeStatus::Open);
+    assert_eq!(open_disputes.len(), 2);
+
+    let review_disputes =
+        refund_client.get_payment_disputes_by_status(&payment_id, &DisputeStatus::UnderReview);
+    assert_eq!(review_disputes.len(), 0);
+
+    // Transition dispute 1 to UnderReview
+    let operator = Address::generate(&env);
+    refund_client.grant_role(&admin, &Symbol::new(&env, "SETTLEMENT_OPERATOR"), &operator);
+    refund_client.review_dispute(&operator, &dispute_id1);
+
+    // Now dispute 1 is UnderReview, dispute 2 is Open
+    let open_after =
+        refund_client.get_payment_disputes_by_status(&payment_id, &DisputeStatus::Open);
+    assert_eq!(open_after.len(), 1);
+    assert_eq!(open_after.get(0).unwrap().id, dispute_id2);
+
+    let review_after =
+        refund_client.get_payment_disputes_by_status(&payment_id, &DisputeStatus::UnderReview);
+    assert_eq!(review_after.len(), 1);
+    assert_eq!(review_after.get(0).unwrap().id, dispute_id1);
+
+    // Status with no matches returns empty vec
+    let resolved =
+        refund_client.get_payment_disputes_by_status(&payment_id, &DisputeStatus::Resolved);
+    assert_eq!(resolved.len(), 0);
+
+    // Backward-compatible original method still returns all
+    let all = refund_client.get_payment_disputes(&payment_id);
+    assert_eq!(all.len(), 2);
 }
 
 #[test]

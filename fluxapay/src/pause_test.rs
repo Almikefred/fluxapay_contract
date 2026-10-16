@@ -75,9 +75,11 @@ fn test_global_pause_blocks_creation() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
+            tip_enabled: false,
     });
 
     assert!(res.is_err());
@@ -123,9 +125,11 @@ fn test_creation_pause_blocks_only_creation() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
+            tip_enabled: false,
     });
     assert!(res.is_err());
 
@@ -179,9 +183,11 @@ fn test_all_write_ops_blocked_when_paused() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
+            tip_enabled: false,
     });
 
     // Set global pause
@@ -289,4 +295,54 @@ fn test_pause_unpause_cycle_exposes_pause_state_fields() {
         unpause_ts,
     );
     assert_pause_state(&unpaused.creation, false, &empty, None, 0);
+}
+
+/// Issue #835: GasEstimator entry points must honour the global pause flag.
+#[test]
+fn test_gas_estimator_blocked_when_paused() {
+    use crate::{GasEstimator, GasEstimatorClient, GasEstimatorError, Operation};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let processor_id = env.register(crate::PaymentProcessor, ());
+    let processor = PaymentProcessorClient::new(&env, &processor_id);
+    let admin = Address::generate(&env);
+    processor.initialize_payment_processor(&admin);
+
+    let gas_id = env.register(GasEstimator, ());
+    let gas = GasEstimatorClient::new(&env, &gas_id);
+    gas.initialize(&processor_id);
+
+    // Unpaused: estimate and estimate_payment_fee succeed.
+    let ok_estimate = gas.try_estimate(&Operation::CreatePayment);
+    assert!(ok_estimate.is_ok(), "estimate should succeed when unpaused");
+    let ok_fee = gas.try_estimate_payment_fee(&Operation::CreatePayment);
+    assert!(
+        ok_fee.is_ok(),
+        "estimate_payment_fee should succeed when unpaused"
+    );
+
+    // Set global pause on PaymentProcessor.
+    let reason = String::from_str(&env, "Emergency pause");
+    processor.set_global_pause(&admin, &true, &reason);
+
+    let paused_estimate = gas.try_estimate(&Operation::CreatePayment);
+    assert!(
+        matches!(paused_estimate, Err(Ok(GasEstimatorError::ContractPaused))),
+        "estimate must return ContractPaused when system is paused, got {:?}",
+        paused_estimate
+    );
+
+    let paused_fee = gas.try_estimate_payment_fee(&Operation::VerifyPayment);
+    assert!(
+        matches!(paused_fee, Err(Ok(GasEstimatorError::ContractPaused))),
+        "estimate_payment_fee must return ContractPaused when system is paused, got {:?}",
+        paused_fee
+    );
+
+    // Unpause restores access.
+    processor.set_global_pause(&admin, &false, &String::from_str(&env, "Recovered"));
+    assert!(gas.try_estimate(&Operation::SettlePayment).is_ok());
+    assert!(gas.try_estimate_payment_fee(&Operation::SettlePayment).is_ok());
 }

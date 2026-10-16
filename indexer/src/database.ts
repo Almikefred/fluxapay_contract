@@ -2,10 +2,43 @@
  * FluxaPay Indexer Database Module
  * Handles PostgreSQL connections, event persistence, dispute status updates,
  * dead-letter queue operations, and REST API queries.
+ *
+ * Issue #842: all queries use Drizzle ORM for compile-time schema safety.
  */
 
 import { Pool } from "pg";
+import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  gte,
+  lte,
+  sql,
+  asc,
+  inArray,
+  lt,
+  or,
+} from "drizzle-orm";
 import { AnyEvent } from "./types";
+import * as schema from "./schema";
+import {
+  contractEvents,
+  payments,
+  refunds,
+  disputes,
+  merchants,
+  streams,
+  streamWithdrawals,
+  subscriptions,
+  invoices,
+  disputeBonds,
+  deadLetterEvents,
+  settlements,
+  feeCollectionHistory,
+} from "./schema";
+import { setCachedRate } from "./fx-rate-cache";
 
 export interface DLQRecord {
   id: number;
@@ -31,17 +64,33 @@ export interface ReconciliationData {
 
 export class Database {
   private pool: Pool;
+  private db: NodePgDatabase<typeof schema>;
   private initialized = false;
 
   constructor(connectionString: string) {
     this.pool = new Pool({ connectionString });
+    this.db = drizzle(this.pool, { schema });
+  }
+
+  /**
+   * The underlying connection pool.
+   *
+   * Exposed so modules that own their own tables — the webhook store
+   * (Issues #808, #810) — can share this pool rather than opening a second
+   * one against the same database.
+   */
+  getPool(): Pool {
+    return this.pool;
+  }
+
+  /** Drizzle client — preferred for new typed queries. */
+  getDb(): NodePgDatabase<typeof schema> {
+    return this.db;
   }
 
   async initialize(): Promise<void> {
     try {
-      const client = await this.pool.connect();
-      await client.query("SELECT 1");
-      client.release();
+      await this.db.execute(sql`SELECT 1`);
       this.initialized = true;
       console.log("Database connected successfully");
     } catch (error) {
@@ -53,34 +102,35 @@ export class Database {
   async storeEvent(event: AnyEvent): Promise<boolean> {
     if (!this.initialized) throw new Error("Database not initialized");
 
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
+    return this.db.transaction(async (tx) => {
+      const existing = await tx
+        .select({ id: contractEvents.id })
+        .from(contractEvents)
+        .where(eq(contractEvents.eventId, event.id))
+        .limit(1);
 
-      // Check if event already exists (idempotency)
-      const existingEvent = await client.query(
-        "SELECT id FROM contract_events WHERE event_id = $1",
-        [event.id]
-      );
-
-      if (existingEvent.rows.length > 0) {
+      if (existing.length > 0) {
         console.log(`Event ${event.id} already processed, skipping...`);
-        await client.query("ROLLBACK");
         return false;
       }
 
-      // Determine table based on event topic
       const [eventType, eventSubtype] = event.topic;
       const table = this.getTableName(eventType, eventSubtype);
 
-      // Store in contract_events (dedup table)
-      await client.query(
-        `INSERT INTO contract_events (event_id, event_type, ledger, tx_hash, timestamp, data, contract_id)
-         VALUES ($1, $2, $3, $4, to_timestamp($5), $6, $7)
-         ON CONFLICT (event_id) DO NOTHING`,
-        [
-          event.id,
+      await tx
+        .insert(contractEvents)
+        .values({
+          eventId: event.id,
           eventType,
+          ledger: event.ledger,
+          txHash: event.txHash,
+          timestamp: new Date(event.timestamp * 1000),
+          data: event.value as any,
+          contractId: event.contractId || null,
+        })
+        .onConflictDoNothing();
+
+      await this.storeTypedEventDrizzle(table, event, tx);
           event.ledger,
           event.txHash,
           event.timestamp,
@@ -92,23 +142,21 @@ export class Database {
       // Store in type-specific table
       await this.storeTypedEvent(table, event, client);
 
+      // Issue #839: keep an in-memory FX rate cache for /v1/fx/convert.
+      this.updateFxRateCache(event);
+
       await client.query("COMMIT");
       return true;
-    } catch (error) {
-      await client.query("ROLLBACK");
-      console.error("Error storing event:", error);
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
-  private async storeTypedEvent(
+  private async storeTypedEventDrizzle(
     table: string,
     event: AnyEvent,
-    client: any
+    tx: NodePgDatabase<typeof schema>,
   ): Promise<void> {
     const value = event.value as Record<string, unknown>;
+    const ts = new Date(event.timestamp * 1000);
 
     switch (table) {
       case "payments":
@@ -160,22 +208,22 @@ export class Database {
       }
 
       case "refunds":
-        await client.query(
-          `INSERT INTO refunds (refund_id, payment_id, amount, status, created_at)
-           VALUES ($1, $2, $3, $4, to_timestamp($5))
-           ON CONFLICT (refund_id) DO UPDATE SET status = $4`,
-          [
-            value.refund_id,
-            value.payment_id,
-            value.amount,
-            event.topic[1],
-            event.timestamp,
-          ]
-        );
+        await tx
+          .insert(refunds)
+          .values({
+            refundId: String(value.refund_id),
+            paymentId: String(value.payment_id),
+            amount: BigInt(String(value.amount ?? 0)),
+            status: event.topic[1],
+            createdAt: ts,
+          })
+          .onConflictDoUpdate({
+            target: refunds.refundId,
+            set: { status: event.topic[1], updatedAt: new Date() },
+          });
         break;
 
       case "disputes": {
-        // Issue #615: Persist dispute status updates for RESOLVED, REJECTED, and ESCALATED events
         const subtype = event.topic[1];
         if (subtype === "ADJUSTMENT") {
           await client.query(
@@ -199,40 +247,45 @@ export class Database {
             console.warn(`[DisputeUpdate] Dispute ID ${value.dispute_id} not found for RESOLVED event`);
           }
         } else if (subtype === "REJECTED") {
-          const res = await client.query(
-            `UPDATE disputes
-             SET status = 'Rejected', updated_at = CURRENT_TIMESTAMP
-             WHERE dispute_id = $1`,
-            [value.dispute_id]
-          );
-          if (res.rowCount === 0) {
-            console.warn(`[DisputeUpdate] Dispute ID ${value.dispute_id} not found for REJECTED event`);
+          const res = await tx
+            .update(disputes)
+            .set({ status: "Rejected", updatedAt: new Date() })
+            .where(eq(disputes.disputeId, String(value.dispute_id)));
+          if ((res as any).rowCount === 0) {
+            console.warn(
+              `[DisputeUpdate] Dispute ID ${value.dispute_id} not found for REJECTED event`,
+            );
           }
         } else if (subtype === "ESCALATED") {
-          const res = await client.query(
-            `UPDATE disputes
-             SET escalated = true, status = 'Escalated', updated_at = CURRENT_TIMESTAMP
-             WHERE dispute_id = $1`,
-            [value.dispute_id]
-          );
-          if (res.rowCount === 0) {
-            console.warn(`[DisputeUpdate] Dispute ID ${value.dispute_id} not found for ESCALATED event`);
+          const res = await tx
+            .update(disputes)
+            .set({
+              escalated: true,
+              status: "Escalated",
+              updatedAt: new Date(),
+            })
+            .where(eq(disputes.disputeId, String(value.dispute_id)));
+          if ((res as any).rowCount === 0) {
+            console.warn(
+              `[DisputeUpdate] Dispute ID ${value.dispute_id} not found for ESCALATED event`,
+            );
           }
         } else {
-          // CREATED or default status insertion
           const status = subtype === "CREATED" ? "Open" : subtype;
-          await client.query(
-            `INSERT INTO disputes (dispute_id, payment_id, amount, status, created_at, escalated)
-             VALUES ($1, $2, $3, $4, to_timestamp($5), false)
-             ON CONFLICT (dispute_id) DO UPDATE SET status = EXCLUDED.status`,
-            [
-              value.dispute_id,
-              value.payment_id,
-              value.amount,
+          await tx
+            .insert(disputes)
+            .values({
+              disputeId: String(value.dispute_id),
+              paymentId: String(value.payment_id),
+              amount: BigInt(String(value.amount ?? 0)),
               status,
-              event.timestamp,
-            ]
-          );
+              createdAt: ts,
+              escalated: false,
+            })
+            .onConflictDoUpdate({
+              target: disputes.disputeId,
+              set: { status },
+            });
         }
         break;
       }
@@ -250,71 +303,164 @@ export class Database {
         break;
 
       case "merchants":
-        await client.query(
-          `INSERT INTO merchants (merchant_id, status, last_update)
-           VALUES ($1, $2, to_timestamp($3))
-           ON CONFLICT (merchant_id) DO UPDATE SET status = $2, last_update = to_timestamp($3)`,
-          [value.merchant_id, value.status, event.timestamp]
-        );
+        await tx
+          .insert(merchants)
+          .values({
+            merchantId: String(value.merchant_id),
+            status: value.status != null ? String(value.status) : null,
+            lastUpdate: ts,
+          })
+          .onConflictDoUpdate({
+            target: merchants.merchantId,
+            set: {
+              status: value.status != null ? String(value.status) : null,
+              lastUpdate: ts,
+            },
+          });
         break;
 
-      case "streams":
+      case "streams": {
+        const subtype = event.topic[1];
+        if (subtype === "CANCELLED") {
+          await tx
+            .update(streams)
+            .set({ status: "Cancelled", updatedAt: ts })
+            .where(eq(streams.streamId, String(value.stream_id)));
+        } else if (subtype === "PAUSED") {
+          await tx
+            .update(streams)
+            .set({ status: "Paused", updatedAt: ts })
+            .where(eq(streams.streamId, String(value.stream_id)));
+        } else if (subtype === "RESUMED") {
+          await tx
+            .update(streams)
+            .set({ status: "Active", updatedAt: ts })
+            .where(eq(streams.streamId, String(value.stream_id)));
+        } else {
+          await tx
+            .insert(streams)
+            .values({
+              streamId: String(value.stream_id),
+              sender: value.sender != null ? String(value.sender) : null,
+              receiver: value.receiver != null ? String(value.receiver) : null,
+              amount: value.amount != null ? BigInt(String(value.amount)) : null,
+              status: subtype === "CREATED" ? "Active" : subtype,
+              createdAt: ts,
+            })
+            .onConflictDoUpdate({
+              target: streams.streamId,
+              set: { status: subtype === "CREATED" ? "Active" : subtype },
+            });
+        }
+        break;
+      }
+
+      case "stream_withdrawals":
+        await tx.insert(streamWithdrawals).values({
+          streamId: String(
+            value.stream_id || (Array.isArray(value) ? value[0] : null) || "",
+          ),
+          recipient: String(
+            value.recipient ||
+              value.destination ||
+              value.receiver ||
+              (Array.isArray(value) ? value[2] || value[1] : null) ||
+              "",
+          ),
+          amount:
+            value.amount != null || value.withdrawable != null
+              ? BigInt(
+                  String(
+                    value.amount ||
+                      value.withdrawable ||
+                      (Array.isArray(value) ? value[3] : 0) ||
+                      0,
+                  ),
+                )
+              : null,
+          remainingDeposit:
+            value.remaining_deposit != null
+              ? BigInt(String(value.remaining_deposit))
+              : Array.isArray(value) && value[4] != null
+                ? BigInt(String(value[4]))
+                : null,
+          createdAt: ts,
+        });
         await client.query(
-          `INSERT INTO streams (stream_id, sender, receiver, amount, status, created_at)
-           VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
-           ON CONFLICT (stream_id) DO UPDATE SET status = $5`,
+          `INSERT INTO stream_withdrawals (stream_id, recipient, amount, remaining_deposit, memo, created_at)
+           VALUES ($1, $2, $3, $4, $5, to_timestamp($6))`,
           [
-            value.stream_id,
-            value.sender,
-            value.receiver,
-            value.amount,
-            event.topic[1],
+            value.stream_id || (Array.isArray(value) ? value[0] : null),
+            value.recipient || value.destination || value.receiver || (Array.isArray(value) ? value[2] || value[1] : null),
+            value.amount || value.withdrawable || (Array.isArray(value) ? value[3] : null),
+            value.remaining_deposit || (Array.isArray(value) ? value[4] : null),
+            value.memo !== undefined ? value.memo : null,
             event.timestamp,
           ]
         );
         break;
 
       case "subscriptions":
-        await client.query(
-          `INSERT INTO subscriptions (subscription_id, payer, status, created_at)
-           VALUES ($1, $2, $3, to_timestamp($4))
-           ON CONFLICT (subscription_id) DO UPDATE SET status = $3`,
-          [
-            value.subscription_id,
-            value.payer,
-            value.status,
-            event.timestamp,
-          ]
-        );
+        await tx
+          .insert(subscriptions)
+          .values({
+            subscriptionId: String(value.subscription_id),
+            payer: value.payer != null ? String(value.payer) : null,
+            status: value.status != null ? String(value.status) : null,
+            createdAt: ts,
+          })
+          .onConflictDoUpdate({
+            target: subscriptions.subscriptionId,
+            set: {
+              status: value.status != null ? String(value.status) : null,
+            },
+          });
         break;
 
       case "dispute_bonds":
-        await client.query(
-          `INSERT INTO dispute_bonds (dispute_id, recipient, amount, status, created_at)
-           VALUES ($1, $2, $3, $4, to_timestamp($5))`,
-          [
-            value.dispute_id,
-            value.recipient,
-            value.amount,
-            event.topic[1],
-            event.timestamp,
-          ]
-        );
+        await tx.insert(disputeBonds).values({
+          disputeId: String(value.dispute_id),
+          recipient: value.recipient != null ? String(value.recipient) : null,
+          amount: BigInt(String(value.amount ?? 0)),
+          status: event.topic[1],
+          createdAt: ts,
+        });
         break;
 
       case "invoices":
-        await client.query(
-          `INSERT INTO invoices (invoice_id, merchant_id, total_amount, status, created_at)
-           VALUES ($1, $2, $3, $4, to_timestamp($5))
-           ON CONFLICT (invoice_id) DO UPDATE SET status = $4`,
-          [
-            value.invoice_id,
-            value.merchant_id,
-            value.total_amount,
-            event.topic[1],
-            event.timestamp,
-          ]
-        );
+        await tx
+          .insert(invoices)
+          .values({
+            invoiceId: String(value.invoice_id),
+            merchantId: value.merchant_id != null ? String(value.merchant_id) : null,
+            totalAmount:
+              value.total_amount != null
+                ? BigInt(String(value.total_amount))
+                : null,
+            status: event.topic[1],
+            createdAt: ts,
+          })
+          .onConflictDoUpdate({
+            target: invoices.invoiceId,
+            set: { status: event.topic[1] },
+          });
+        break;
+
+      case "settlements":
+        await tx.insert(settlements).values({
+          paymentId: String(value.payment_id),
+          merchantId: String(value.merchant_id),
+          amount: BigInt(String(value.amount ?? 0)),
+          status: event.topic[1],
+          createdAt: ts,
+          settledAt: ts,
+          fiatAmount: value.fiat_amount != null ? String(value.fiat_amount) : null,
+          fiatCurrency:
+            value.fiat_currency != null ? String(value.fiat_currency) : null,
+          customerRef:
+            value.customer_ref != null ? String(value.customer_ref) : null,
+          tags: value.tags != null ? String(value.tags) : null,
+        });
         break;
     }
   }
@@ -329,6 +475,9 @@ export class Database {
     if (eventType === "DISPUTE" && (eventSubtype === "BOND_RETURNED" || eventSubtype === "BOND_FORFEITED")) {
       return "dispute_bonds";
     }
+    if (eventType === "SETTLEMENT" || eventSubtype === "SETTLED") {
+      return eventType === "SETTLEMENT" ? "settlements" : "payments";
+    }
 
     const tableMap: Record<string, string> = {
       PAYMENT: "payments",
@@ -338,18 +487,42 @@ export class Database {
       STREAM: "streams",
       SUBSCRIPTION: "subscriptions",
       INVOICE: "invoices",
+      SETTLEMENT: "settlements",
     };
     return tableMap[eventType] || "contract_events";
+  }
+
+  /**
+   * Issue #839: Mirror oracle rate events into the in-memory convert cache.
+   * Accepts both `FX_ORACLE` and `ORACLE` topic prefixes and pair formats
+   * like `USDC/NGN` or `USDC_NGN`.
+   */
+  private updateFxRateCache(event: AnyEvent): void {
+    const [eventType] = event.topic;
+    if (eventType !== "FX_ORACLE" && eventType !== "ORACLE") return;
+    const value = event.value as { asset?: string; pair?: string; rate?: number };
+    const rawPair = (value.asset || value.pair || "").toString();
+    if (!rawPair || typeof value.rate !== "number" || !Number.isFinite(value.rate)) return;
+    const pair = rawPair.replace("/", "_").toUpperCase();
+    setCachedRate(pair, value.rate, event.timestamp || Math.floor(Date.now() / 1000));
   }
 
   // ── Read queries (Issue #616 REST API Backing Queries) ─────────────────
 
   async getPaymentById(paymentId: string): Promise<unknown | null> {
-    const { rows } = await this.pool.query(
-      `SELECT payment_id, merchant_id, amount, currency, status, created_at, updated_at
-       FROM payments WHERE payment_id = $1`,
-      [paymentId]
-    );
+    const rows = await this.db
+      .select({
+        payment_id: payments.paymentId,
+        merchant_id: payments.merchantId,
+        amount: payments.amount,
+        currency: payments.currency,
+        status: payments.status,
+        created_at: payments.createdAt,
+        updated_at: payments.updatedAt,
+      })
+      .from(payments)
+      .where(eq(payments.paymentId, paymentId))
+      .limit(1);
     return rows.length > 0 ? rows[0] : null;
   }
 
@@ -357,7 +530,7 @@ export class Database {
     merchantId: string,
     page = 1,
     limit = 20,
-    status?: string
+    status?: string,
   ): Promise<{
     payments: unknown[];
     pagination: { page: number; limit: number; total: number; totalPages: number };
@@ -366,44 +539,53 @@ export class Database {
     const limitNum = Math.max(1, limit);
     const offset = (pageNum - 1) * limitNum;
 
-    let countSql = `SELECT COUNT(*)::int AS total FROM payments WHERE merchant_id = $1`;
-    let dataSql = `SELECT payment_id, merchant_id, amount, currency, status, created_at, updated_at
-                   FROM payments WHERE merchant_id = $1`;
-    const params: unknown[] = [merchantId];
+    const conditions = [eq(payments.merchantId, merchantId)];
+    if (status) conditions.push(eq(payments.status, status));
 
-    if (status) {
-      countSql += ` AND status = $2`;
-      dataSql += ` AND status = $2`;
-      params.push(status);
-    }
+    const [{ total }] = await this.db
+      .select({ total: count() })
+      .from(payments)
+      .where(and(...conditions));
 
-    dataSql += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    const rows = await this.db
+      .select({
+        payment_id: payments.paymentId,
+        merchant_id: payments.merchantId,
+        amount: payments.amount,
+        currency: payments.currency,
+        status: payments.status,
+        created_at: payments.createdAt,
+        updated_at: payments.updatedAt,
+      })
+      .from(payments)
+      .where(and(...conditions))
+      .orderBy(desc(payments.createdAt))
+      .limit(limitNum)
+      .offset(offset);
 
-    const countResult = await this.pool.query(countSql, params);
-    const total = countResult.rows[0]?.total || 0;
-
-    const dataParams = [...params, limitNum, offset];
-    const dataResult = await this.pool.query(dataSql, dataParams);
-    const totalPages = Math.ceil(total / limitNum) || (total === 0 ? 0 : 1);
+    const totalNum = Number(total) || 0;
+    const totalPages = Math.ceil(totalNum / limitNum) || (totalNum === 0 ? 0 : 1);
 
     return {
-      payments: dataResult.rows,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total,
-        totalPages,
-      },
+      payments: rows,
+      pagination: { page: pageNum, limit: limitNum, total: totalNum, totalPages },
     };
   }
 
   async getPaymentsByMerchant(merchantId: string, limit = 100): Promise<unknown[]> {
-    const { rows } = await this.pool.query(
-      `SELECT payment_id, merchant_id, amount, currency, status, created_at
-       FROM payments WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT $2`,
-      [merchantId, limit]
-    );
-    return rows;
+    return this.db
+      .select({
+        payment_id: payments.paymentId,
+        merchant_id: payments.merchantId,
+        amount: payments.amount,
+        currency: payments.currency,
+        status: payments.status,
+        created_at: payments.createdAt,
+      })
+      .from(payments)
+      .where(eq(payments.merchantId, merchantId))
+      .orderBy(desc(payments.createdAt))
+      .limit(limit);
   }
 
   async getReconciliationData(
@@ -504,124 +686,407 @@ export class Database {
       params.push(status);
     }
 
-    sql += ` ORDER BY d.created_at DESC`;
-    const { rows } = await this.pool.query(sql, params);
-    return rows;
+    const [{ total }] = await this.db
+      .select({ total: count() })
+      .from(payments)
+      .where(and(...conditions));
+
+    const rows = await this.db
+      .select({
+        id: payments.id,
+        payment_id: payments.paymentId,
+        merchant_id: payments.merchantId,
+        amount: payments.amount,
+        currency: payments.currency,
+        status: payments.status,
+        created_at: payments.createdAt,
+        updated_at: payments.updatedAt,
+      })
+      .from(payments)
+      .where(and(...conditions))
+      .orderBy(desc(payments.createdAt), desc(payments.id))
+      .limit(opts.limit);
+
+    return { payments: rows as Array<Record<string, unknown>>, total: Number(total) || 0 };
+  }
+
+  async getDisputesByMerchant(merchantId: string, status?: string): Promise<unknown[]> {
+    const conditions = [eq(payments.merchantId, merchantId)];
+    if (status) conditions.push(eq(disputes.status, status));
+
+    return this.db
+      .select({
+        dispute_id: disputes.disputeId,
+        payment_id: disputes.paymentId,
+        amount: disputes.amount,
+        status: disputes.status,
+        escalated: disputes.escalated,
+        resolved_at: disputes.resolvedAt,
+        created_at: disputes.createdAt,
+      })
+      .from(disputes)
+      .innerJoin(payments, eq(disputes.paymentId, payments.paymentId))
+      .where(and(...conditions))
+      .orderBy(desc(disputes.createdAt));
   }
 
   async getRefundById(refundId: string): Promise<unknown | null> {
-    const { rows } = await this.pool.query(
-      `SELECT refund_id, payment_id, amount, status, created_at, updated_at
-       FROM refunds WHERE refund_id = $1`,
-      [refundId]
-    );
+    const rows = await this.db
+      .select({
+        refund_id: refunds.refundId,
+        payment_id: refunds.paymentId,
+        amount: refunds.amount,
+        status: refunds.status,
+        created_at: refunds.createdAt,
+        updated_at: refunds.updatedAt,
+      })
+      .from(refunds)
+      .where(eq(refunds.refundId, refundId))
+      .limit(1);
     return rows.length > 0 ? rows[0] : null;
   }
 
   async getRefundsByMerchant(merchantId: string, limit = 100): Promise<unknown[]> {
-    const { rows } = await this.pool.query(
-      `SELECT r.refund_id, r.payment_id, r.amount, r.status, r.created_at
-       FROM refunds r
-       JOIN payments p ON p.payment_id = r.payment_id
-       WHERE p.merchant_id = $1
-       ORDER BY r.created_at DESC LIMIT $2`,
-      [merchantId, limit]
-    );
-    return rows;
+    return this.db
+      .select({
+        refund_id: refunds.refundId,
+        payment_id: refunds.paymentId,
+        amount: refunds.amount,
+        status: refunds.status,
+        created_at: refunds.createdAt,
+      })
+      .from(refunds)
+      .innerJoin(payments, eq(refunds.paymentId, payments.paymentId))
+      .where(eq(payments.merchantId, merchantId))
+      .orderBy(desc(refunds.createdAt))
+      .limit(limit);
   }
 
   async getEventsFiltered(
     type?: string,
     fromLedger?: number,
-    toLedger?: number
+    toLedger?: number,
   ): Promise<unknown[]> {
-    let sql = `SELECT id, event_id, event_type, ledger, tx_hash, timestamp, data, contract_id, created_at
-               FROM contract_events WHERE 1=1`;
-    const params: unknown[] = [];
-
+    const conditions = [];
     if (type) {
-      params.push(type);
-      sql += ` AND (event_type = $${params.length} OR event_type LIKE $${params.length} || '/%' OR data->>'topic' LIKE '%' || $${params.length} || '%')`;
+      conditions.push(
+        or(
+          eq(contractEvents.eventType, type),
+          sql`${contractEvents.eventType} LIKE ${type + "/%"}`,
+        )!,
+      );
     }
-
     if (fromLedger !== undefined && !isNaN(fromLedger)) {
-      params.push(fromLedger);
-      sql += ` AND ledger >= $${params.length}`;
+      conditions.push(gte(contractEvents.ledger, fromLedger));
     }
-
     if (toLedger !== undefined && !isNaN(toLedger)) {
-      params.push(toLedger);
-      sql += ` AND ledger <= $${params.length}`;
+      conditions.push(lte(contractEvents.ledger, toLedger));
     }
 
-    sql += ` ORDER BY ledger DESC, id DESC LIMIT 100`;
-    const { rows } = await this.pool.query(sql, params);
-    return rows;
+    return this.db
+      .select({
+        id: contractEvents.id,
+        event_id: contractEvents.eventId,
+        event_type: contractEvents.eventType,
+        ledger: contractEvents.ledger,
+        tx_hash: contractEvents.txHash,
+        timestamp: contractEvents.timestamp,
+        data: contractEvents.data,
+        contract_id: contractEvents.contractId,
+        created_at: contractEvents.createdAt,
+      })
+      .from(contractEvents)
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(contractEvents.ledger), desc(contractEvents.id))
+      .limit(100);
   }
 
   async checkHealth(): Promise<{ healthy: boolean; database: string; details?: string }> {
     try {
-      await this.pool.query("SELECT 1");
+      await this.db.execute(sql`SELECT 1`);
       return { healthy: true, database: "connected" };
     } catch (error: any) {
-      return { healthy: false, database: "disconnected", details: error.message || String(error) };
+      return {
+        healthy: false,
+        database: "disconnected",
+        details: error.message || String(error),
+      };
     }
   }
 
   async getAdminStats(): Promise<Record<string, number>> {
-    const { rows } = await this.pool.query(
-      `SELECT event_type, COUNT(*)::int AS count FROM contract_events GROUP BY event_type`
-    );
-    return Object.fromEntries(rows.map((r: { event_type: string; count: number }) => [r.event_type, r.count]));
+    const rows = await this.db
+      .select({
+        event_type: contractEvents.eventType,
+        count: count(),
+      })
+      .from(contractEvents)
+      .groupBy(contractEvents.eventType);
+    return Object.fromEntries(rows.map((r) => [r.event_type, Number(r.count)]));
   }
 
   // ── Dead-Letter Queue Operations (Issue #617) ──────────────────────────
 
   async storeDeadLetterEvent(eventId: string, rawData: unknown, error: string): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO dead_letter_events (event_id, raw_data, error, created_at, retry_count)
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP, 0)
-       ON CONFLICT (event_id) DO UPDATE SET
-         error = EXCLUDED.error,
-         created_at = CURRENT_TIMESTAMP`,
-      [eventId, JSON.stringify(rawData), error]
-    );
+    await this.db
+      .insert(deadLetterEvents)
+      .values({
+        eventId,
+        rawData: rawData as any,
+        error,
+        retryCount: 0,
+      })
+      .onConflictDoUpdate({
+        target: deadLetterEvents.eventId,
+        set: { error, createdAt: new Date() },
+      });
   }
 
   async getEligibleDLQEvents(minAgeSeconds = 60, limit = 100): Promise<DLQRecord[]> {
-    const { rows } = await this.pool.query(
-      `SELECT id, event_id, raw_data, error, retry_count, created_at
-       FROM dead_letter_events
-       WHERE created_at <= NOW() - ($1 || ' seconds')::INTERVAL
-       ORDER BY created_at ASC
-       LIMIT $2`,
-      [minAgeSeconds, limit]
-    );
-    return rows;
+    const rows = await this.db.execute(sql`
+      SELECT id, event_id, raw_data, error, retry_count, created_at
+      FROM dead_letter_events
+      WHERE created_at <= NOW() - (${String(minAgeSeconds)} || ' seconds')::INTERVAL
+      ORDER BY created_at ASC
+      LIMIT ${limit}
+    `);
+    return (rows as any).rows ?? (rows as unknown as DLQRecord[]);
   }
 
   async getAllDLQEvents(limit = 100): Promise<DLQRecord[]> {
-    const { rows } = await this.pool.query(
-      `SELECT id, event_id, raw_data, error, retry_count, created_at
-       FROM dead_letter_events
-       ORDER BY created_at ASC
-       LIMIT $1`,
-      [limit]
-    );
-    return rows;
+    const rows = await this.db
+      .select({
+        id: deadLetterEvents.id,
+        event_id: deadLetterEvents.eventId,
+        raw_data: deadLetterEvents.rawData,
+        error: deadLetterEvents.error,
+        retry_count: deadLetterEvents.retryCount,
+        created_at: deadLetterEvents.createdAt,
+      })
+      .from(deadLetterEvents)
+      .orderBy(asc(deadLetterEvents.createdAt))
+      .limit(limit);
+    return rows as unknown as DLQRecord[];
   }
 
   async incrementDLQRetryCount(eventId: string, error: string): Promise<void> {
-    await this.pool.query(
-      `UPDATE dead_letter_events
-       SET retry_count = retry_count + 1, error = $2
-       WHERE event_id = $1`,
-      [eventId, error]
-    );
+    await this.db
+      .update(deadLetterEvents)
+      .set({
+        retryCount: sql`${deadLetterEvents.retryCount} + 1`,
+        error,
+      })
+      .where(eq(deadLetterEvents.eventId, eventId));
   }
 
   async removeDeadLetterEvent(eventId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM dead_letter_events WHERE event_id = $1`, [eventId]);
+    await this.db
+      .delete(deadLetterEvents)
+      .where(eq(deadLetterEvents.eventId, eventId));
+  }
+
+  /**
+   * Issue #840: Stream reconciliation rows for a merchant over `[from, to]`.
+   * Uses a server-side cursor so large reports (>10k rows) are not buffered.
+   */
+  async *streamReconciliationReport(
+    merchantId: string,
+    from: Date,
+    to: Date,
+  ): AsyncGenerator<ReconciliationRow> {
+    const client = await this.pool.connect();
+    const cursorName = `recon_${Date.now()}`;
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `DECLARE ${cursorName} CURSOR FOR
+         (
+           SELECT payment_id::text AS payment_id,
+                  'payment'::text AS type,
+                  amount::text AS amount_usdc,
+                  COALESCE(fiat_amount, '') AS fiat_amount,
+                  COALESCE(fiat_currency, '') AS fiat_currency,
+                  COALESCE(status, '') AS status,
+                  COALESCE(created_at::text, '') AS created_at,
+                  COALESCE(settled_at::text, '') AS settled_at,
+                  COALESCE(customer_ref, '') AS customer_ref,
+                  COALESCE(tags, '') AS tags
+           FROM payments
+           WHERE merchant_id = $1
+             AND created_at >= $2 AND created_at <= $3
+         )
+         UNION ALL
+         (
+           SELECT r.refund_id::text,
+                  'refund'::text,
+                  r.amount::text,
+                  ''::text,
+                  ''::text,
+                  COALESCE(r.status, ''),
+                  COALESCE(r.created_at::text, ''),
+                  ''::text,
+                  ''::text,
+                  ''::text
+           FROM refunds r
+           JOIN payments p ON p.payment_id = r.payment_id
+           WHERE p.merchant_id = $1
+             AND r.created_at >= $2 AND r.created_at <= $3
+         )
+         UNION ALL
+         (
+           SELECT payment_id::text,
+                  'settlement'::text,
+                  amount::text,
+                  COALESCE(fiat_amount, ''),
+                  COALESCE(fiat_currency, ''),
+                  COALESCE(status, ''),
+                  COALESCE(created_at::text, ''),
+                  COALESCE(settled_at::text, ''),
+                  COALESCE(customer_ref, ''),
+                  COALESCE(tags, '')
+           FROM settlements
+           WHERE merchant_id = $1
+             AND COALESCE(settled_at, created_at) >= $2
+             AND COALESCE(settled_at, created_at) <= $3
+         )
+         ORDER BY created_at ASC`,
+        [merchantId, from, to],
+      );
+
+      const batchSize = 500;
+      while (true) {
+        const batch = await client.query<ReconciliationRow>(
+          `FETCH ${batchSize} FROM ${cursorName}`,
+        );
+        if (batch.rows.length === 0) break;
+        for (const row of batch.rows) {
+          yield row;
+        }
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // ------------------------------------------------------------------ Issue #1067: Invoice helpers
+
+  async getInvoices(params: {
+    merchantId?: string;
+    status?: string;
+    limit: number;
+    offset: number;
+  }) {
+    const conditions = [];
+    if (params.merchantId) {
+      conditions.push(eq(invoices.merchantId, params.merchantId));
+    }
+    if (params.status) {
+      conditions.push(eq(invoices.status, params.status));
+    }
+
+    const rows = await this.db
+      .select()
+      .from(invoices)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(invoices.createdAt))
+      .limit(params.limit)
+      .offset(params.offset);
+
+    return { invoices: rows, limit: params.limit, offset: params.offset };
+  }
+
+  async getInvoiceById(invoiceId: string) {
+    const rows = await this.db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.invoiceId, invoiceId))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Soft-delete: transitions a Pending or Overdue invoice to Voided.
+   * Returns the updated row, or null if not found / already Paid / already Voided.
+   */
+  async voidInvoice(invoiceId: string, merchantId: string) {
+    const existing = await this.getInvoiceById(invoiceId);
+    if (!existing) return null;
+    if (existing.merchantId !== merchantId) return null;
+    if (existing.status === "Voided" || existing.status === "Paid") return null;
+
+    const now = new Date();
+    const updated = await this.db
+      .update(invoices)
+      .set({ status: "Voided", voidedAt: now, updatedAt: now })
+      .where(eq(invoices.invoiceId, invoiceId))
+      .returning();
+    return updated[0] ?? null;
+  }
+
+  // ------------------------------------------------------------------ Issue #1066: Fee collection history
+
+  async getFeeCollectionHistory(params: {
+    offset: number;
+    limit: number;
+    token?: string;
+  }) {
+    const conditions = [];
+    if (params.token) {
+      conditions.push(eq(feeCollectionHistory.token, params.token));
+    }
+
+    const rows = await this.db
+      .select()
+      .from(feeCollectionHistory)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(feeCollectionHistory.collectedAt))
+      .limit(params.limit)
+      .offset(params.offset);
+
+    return { fees: rows, limit: params.limit, offset: params.offset };
+  }
+
+  // ------------------------------------------------------------------ Issue #1064: Merchant leaderboard
+
+  async getTopMerchants(limit: number) {
+    const rows = await this.db
+      .select({
+        merchantId: merchants.merchantId,
+        status: merchants.status,
+        lastUpdate: merchants.lastUpdate,
+      })
+      .from(merchants)
+      .where(eq(merchants.status, "active"))
+      .limit(limit);
+
+    // Enrich with payment volume from the payments table.
+    const enriched = await Promise.all(
+      rows.map(async (m) => {
+        const volRows = await this.db
+          .select({ total: sql<string>`COALESCE(SUM(amount::numeric), 0)`, cnt: sql<string>`COUNT(*)` })
+          .from(payments)
+          .where(eq(payments.merchantId, m.merchantId));
+        const vol = volRows[0];
+        return {
+          merchant_id: m.merchantId,
+          score: vol?.total ?? "0",
+          confirmed_payment_count: Number(vol?.cnt ?? 0),
+          cumulative_volume: vol?.total ?? "0",
+        };
+      }),
+    );
+
+    // Sort by score descending.
+    enriched.sort((a, b) => {
+      const diff = BigInt(b.score) - BigInt(a.score);
+      return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+    });
+
+    return enriched.slice(0, limit);
   }
 
   async close(): Promise<void> {

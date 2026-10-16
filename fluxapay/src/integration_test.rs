@@ -1,8 +1,9 @@
 use crate::merchant_registry::MaybeFeeConfig;
 use crate::{
     merchant_registry::{KycTier, MerchantRegistry, MerchantRegistryClient},
-    ArbitratorVoteChoice, DataKey, DisputeStatus, Error, PaymentProcessor, PaymentProcessorClient,
-    PaymentStatus, RefundManager, RefundManagerClient, RefundStatus, SettlementSplit,
+    AdminAction, ArbitratorVoteChoice, DataKey, DisputeStatus, Error, PaymentProcessor,
+    PaymentProcessorClient, PaymentStatus, RefundManager, RefundManagerClient, RefundStatus,
+    SettlementSplit,
 };
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _, Ledger as _},
@@ -58,9 +59,11 @@ fn integration_payment_args(
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
+            tip_enabled: false,
     }
 }
 
@@ -115,6 +118,52 @@ fn test_create_payment_with_verified_registry_merchant_succeeds() {
     let payment =
         payment_client.create_payment(&integration_payment_args(&env, "REG_VERIFIED", &merchant));
     assert_eq!(payment.status, PaymentStatus::Pending);
+}
+
+#[test]
+fn test_replay_cannot_overwrite_confirmed_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let merchant = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let payment_id = String::from_str(&env, "REPLAY_CONFIRMED");
+    let amount = 1000i128;
+
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+
+    let mut args = integration_payment_args(&env, "REPLAY_CONFIRMED", &merchant);
+    payment_client.create_payment(&args);
+    payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::<32>::random(&env),
+        &customer,
+        &amount,
+        &None::<u64>,
+    );
+
+    let confirmed_before = payment_client.get_payment(&payment_id);
+    assert_eq!(confirmed_before.status, PaymentStatus::Confirmed);
+
+    args.amount = 1;
+    let replay = payment_client.try_create_payment(&args);
+
+    assert_eq!(replay, Err(Ok(Error::PaymentAlreadyExists)));
+    let after_replay = payment_client.get_payment(&payment_id);
+    assert_eq!(after_replay.amount, confirmed_before.amount);
+    assert_eq!(
+        after_replay.amount_received,
+        confirmed_before.amount_received
+    );
+    assert_eq!(
+        after_replay.transaction_hash,
+        confirmed_before.transaction_hash
+    );
+    assert_eq!(after_replay.confirmed_at, confirmed_before.confirmed_at);
+    assert_eq!(after_replay.status, PaymentStatus::Confirmed);
 }
 
 #[test]
@@ -234,8 +283,10 @@ fn test_happy_path_flow() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -314,8 +365,10 @@ fn test_settlement_path() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -370,8 +423,10 @@ fn test_failure_and_expiration_path() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -497,8 +552,10 @@ fn test_upgrade_contract_storage_compatibility() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -545,8 +602,10 @@ fn test_prune_expired_payments_expired_pending() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -592,8 +651,10 @@ fn test_prune_expired_payments_non_expired_skipped() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -638,8 +699,10 @@ fn test_prune_expired_payments_non_pending_skipped() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -741,8 +804,10 @@ fn test_settle_payment_with_zero_merchant_fee() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -815,8 +880,10 @@ fn test_settle_payment_with_bps_only_fee() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -889,8 +956,10 @@ fn test_settle_payment_with_fixed_fee() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -963,8 +1032,10 @@ fn test_settle_payment_with_combined_fee() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -1023,8 +1094,10 @@ fn test_settle_payment_no_registry_configured() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -1104,8 +1177,10 @@ fn test_cross_contract_happy_path() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -1182,8 +1257,10 @@ fn test_cross_contract_unverified_merchant_rejection() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
 
     // Creating payment with unverified merchant should fail
@@ -1239,8 +1316,10 @@ fn test_cross_contract_suspended_merchant_rejection() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
 
     // Creating payment with suspended merchant should fail
@@ -1288,8 +1367,10 @@ fn test_cross_contract_registry_not_set_regression() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
+            tip_enabled: false,
     };
 
     // Should succeed because merchant has MERCHANT role (registry check skipped)
@@ -1371,11 +1452,13 @@ fn setup_dispute(
         memo_type: None,
         token_address: None,
         client_token: None,
+        idempotency_key: None,
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
         retry_of_payment_id: None,
         payer_muxed_id: None,
+            tip_enabled: false,
     };
     payment_client.create_payment(&args);
 
@@ -1525,3 +1608,193 @@ fn test_dispute_escalation_past_deadline() {
     refund_client.check_dispute_deadline(&dispute_id);
     assert_eq!(env.events().all().len(), event_count_before);
 }
+
+// =============================================================================
+// Multi-sig admin proposal integration tests
+// =============================================================================
+
+/// Helper: set up a contract with a 2-of-3 multisig configuration.
+/// Returns (admin, signer2, signer3, payment_client).
+fn setup_multisig_integration(
+    env: &Env,
+    admin: &Address,
+    payment_client: &PaymentProcessorClient<'_>,
+) -> (Address, Address) {
+    let signer2 = Address::generate(env);
+    let signer3 = Address::generate(env);
+
+    let signers = vec![env, admin.clone(), signer2.clone(), signer3.clone()];
+    payment_client.set_multisig_config(admin, &2u32, &signers);
+
+    (signer2, signer3)
+}
+
+/// Full propose → vote → execute flow with a 2-of-3 multisig.
+#[test]
+fn test_admin_proposal_full_flow_2_of_3_signers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let (signer2, _signer3) = setup_multisig_integration(&env, &admin, &payment_client);
+
+    // Signer creates a proposal to raise the dispute bond.
+    let action = AdminAction::SetDisputeBond(300_000i128);
+    let nonce = payment_client.create_proposal(&signer2, &action);
+
+    // First signer vote (the creator) is implicit; second signer reaches threshold.
+    payment_client.vote_proposal(&admin, &nonce);
+
+    // Executor (admin) applies the change.
+    payment_client.execute_proposal(&admin, &nonce);
+
+    assert_eq!(payment_client.get_dispute_bond_amount(), 300_000i128);
+}
+
+/// Only 1 of 3 signers approves → execute returns an error and config is unchanged.
+#[test]
+fn test_proposal_rejected_before_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let (signer2, _signer3) = setup_multisig_integration(&env, &admin, &payment_client);
+
+    let action = AdminAction::SetDisputeBond(99_999i128);
+    let nonce = payment_client.create_proposal(&signer2, &action);
+
+    // Only 1 approval (the creator) out of a required 2.
+    let result = payment_client.try_execute_proposal(&admin, &nonce);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+
+    // Config is unchanged.
+    assert_eq!(payment_client.get_dispute_bond_amount(), 100_000i128);
+}
+
+/// A proposal past its 48-hour expiry cannot be executed.
+#[test]
+fn test_expired_proposal_cannot_be_executed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let (signer2, _signer3) = setup_multisig_integration(&env, &admin, &payment_client);
+
+    let action = AdminAction::SetDisputeBond(500_000i128);
+    let nonce = payment_client.create_proposal(&signer2, &action);
+    payment_client.vote_proposal(&admin, &nonce);
+
+    // Advance ledger past the 48-hour expiry window.
+    env.ledger().with_mut(|l| l.timestamp += 48 * 60 * 60 + 1);
+
+    let result = payment_client.try_execute_proposal(&admin, &nonce);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+
+    // Config is unchanged.
+    assert_eq!(payment_client.get_dispute_bond_amount(), 100_000i128);
+}
+
+/// A signer cannot vote on the same proposal twice.
+#[test]
+fn test_duplicate_vote_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let (signer2, _signer3) = setup_multisig_integration(&env, &admin, &payment_client);
+
+    let action = AdminAction::SetDisputeBond(200_000i128);
+    let nonce = payment_client.create_proposal(&signer2, &action);
+
+    let result = payment_client.try_vote_proposal(&signer2, &nonce);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+}
+
+/// A non-signer cannot vote on a proposal.
+#[test]
+fn test_non_signer_vote_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let (signer2, _signer3) = setup_multisig_integration(&env, &admin, &payment_client);
+
+    let outsider = Address::generate(&env);
+    let action = AdminAction::SetDisputeBond(200_000i128);
+    let nonce = payment_client.create_proposal(&signer2, &action);
+
+    let result = payment_client.try_vote_proposal(&outsider, &nonce);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+}
+
+/// Executed proposal applies the requested config change to persistent storage.
+#[test]
+fn test_proposal_executed_applies_config_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, _, _) = setup_integration(&env);
+    let (signer2, _signer3) = setup_multisig_integration(&env, &admin, &payment_client);
+
+    // Update the refund fee to 0.5% (50 bps).
+    let new_bps: i128 = 50;
+    let action = AdminAction::SetRefundFeeBps(new_bps);
+    let nonce = payment_client.create_proposal(&signer2, &action);
+    payment_client.vote_proposal(&admin, &nonce);
+    payment_client.execute_proposal(&admin, &nonce);
+
+    assert_eq!(payment_client.get_refund_fee_bps(), new_bps);
+}
+
+/// Issue #904: Integration test verifying that a payment link created with a short TTL
+/// expires and correctly rejects incoming payments after time is advanced past the TTL.
+#[test]
+fn test_payment_link_ttl_expiry_rejects_incoming_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(crate::PaymentLinkManager, ());
+    let client = crate::PaymentLinkManagerClient::new(&env, &contract_id);
+
+    let merchant = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "ttl_exp_link");
+    let amount = 1_000i128;
+    let now = env.ledger().timestamp();
+    let ttl_secs = 60u64; // Short TTL: 60 seconds
+    let expires_at = now + ttl_secs;
+
+    // 1. Create a payment link with a short TTL
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(amount),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Test TTL link"),
+        &Some(expires_at),
+        &None, // unlimited uses
+        &false,
+        &None,
+        &crate::MaybeFiatConfig::None,
+        &None,
+    );
+
+    // 2. Confirm the payment link is initially usable before TTL expires
+    let link_before = client.get_link(&link_id);
+    assert!(link_before.active);
+    assert_eq!(link_before.expires_at, Some(expires_at));
+    assert_eq!(link_before.use_count, 0);
+
+    let initial_payment_id = client.use_link(&payer, &link_id, &amount, &None);
+    assert!(!initial_payment_id.is_empty());
+    assert_eq!(client.get_link(&link_id).use_count, 1);
+
+    // 3. Advance test time beyond the configured TTL
+    env.ledger().set_timestamp(expires_at + 1);
+
+    // 4. Attempt to use the expired payment link
+    let result = client.try_use_link(&payer, &link_id, &amount, &None);
+
+    // 5 & 6. Assert that the operation is rejected specifically with Error::LinkExpired
+    assert_eq!(result, Err(Ok(crate::Error::LinkExpired)));
+
+    // 7. Verify use_count was not incremented by the rejected attempt
+    let link_after = client.get_link(&link_id);
+    assert_eq!(link_after.use_count, 1);
+}
+
