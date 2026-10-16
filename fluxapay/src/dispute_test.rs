@@ -123,6 +123,76 @@ fn has_dispute_event(env: &Env, event_name: &str) -> bool {
     })
 }
 
+fn count_dispute_events(env: &Env, event_name: &str) -> usize {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    env.events()
+        .all()
+        .iter()
+        .filter(|event| {
+            let ContractEventBody::V0(v0) = &event.body;
+            let topics = &v0.topics;
+            if topics.len() != 2 {
+                return false;
+            }
+            let namespace: Result<Symbol, _> = ScVal::from(topics[0].clone()).try_into_val(env);
+            let name: Result<Symbol, _> = ScVal::from(topics[1].clone()).try_into_val(env);
+            matches!(
+                (namespace, name),
+                (Ok(namespace), Ok(name))
+                    if namespace == Symbol::new(env, "DISPUTE")
+                        && name == Symbol::new(env, event_name)
+            )
+        })
+        .count()
+}
+
+fn create_batch_dispute(
+    env: &Env,
+    admin: &Address,
+    payment_client: &PaymentProcessorClient<'_>,
+    refund_client: &RefundManagerClient<'_>,
+    payment_id_text: &str,
+) -> (String, Address, Address) {
+    let merchant = Address::generate(env);
+    let customer = Address::generate(env);
+    let payment_id = String::from_str(env, payment_id_text);
+
+    payment_client.grant_role(admin, &Symbol::new(env, "MERCHANT"), &merchant);
+    payment_client.create_payment(&create_payment_args(env, &payment_id, &merchant, 1_000));
+
+    let oracle = Address::generate(env);
+    payment_client.grant_role(admin, &Symbol::new(env, "ORACLE"), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::from_array(env, &[9u8; 32]),
+        &customer,
+        &1_000,
+        &None::<u64>,
+    );
+
+    let token_address = env.as_contract(&refund_client.address, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .unwrap()
+    });
+    let token_admin_client = token::StellarAssetClient::new(env, &token_address);
+    token_admin_client.mint(&customer, &100_000);
+    token_admin_client.mint(&merchant, &100_000);
+
+    refund_client.register_payment(&payment_id, &merchant, &1_000, &Symbol::new(env, "USDC"));
+    let dispute_id = refund_client.create_dispute(
+        &payment_id,
+        &1_000,
+        &String::from_str(env, "Batch resolution coverage"),
+        &String::from_str(env, "Batch evidence"),
+        &customer,
+        &vec![env],
+    );
+    (dispute_id, customer, merchant)
+}
+
 #[test]
 fn test_operator_sets_dispute_deadline() {
     let env = Env::default();
@@ -1317,4 +1387,150 @@ fn test_batch_create_disputes_rejects_oversized() {
 
     let result2 = refund_client.try_batch_create_disputes(&soroban_sdk::vec![&env], &21u32);
     assert_eq!(result2, Err(Ok(crate::Error::BatchTooLarge)));
+}
+
+#[test]
+fn test_batch_resolve_disputes_all_succeed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+    let operator = Address::generate(&env);
+    refund_client.grant_role(&admin, &Symbol::new(&env, "SETTLEMENT_OPERATOR"), &operator);
+    let (dispute_id_1, customer_1, _) = create_batch_dispute(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_resolve_1",
+    );
+    let (dispute_id_2, _, merchant_2) = create_batch_dispute(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_resolve_2",
+    );
+    let event_count_before = count_dispute_events(&env, "RESOLVED");
+    let resolutions = soroban_sdk::vec![
+        &env,
+        crate::DisputeResolution {
+            dispute_id: dispute_id_1.clone(),
+            in_favor_of: customer_1,
+            notes: String::from_str(&env, "Customer evidence confirmed"),
+        },
+        crate::DisputeResolution {
+            dispute_id: dispute_id_2.clone(),
+            in_favor_of: merchant_2,
+            notes: String::from_str(&env, "Merchant evidence confirmed"),
+        },
+    ];
+
+    let results = refund_client.batch_resolve_disputes(&operator, &resolutions);
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0), Some(Ok(())));
+    assert_eq!(results.get(1), Some(Ok(())));
+    assert_eq!(
+        refund_client.get_dispute(&dispute_id_1).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        refund_client.get_dispute(&dispute_id_2).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        count_dispute_events(&env, "RESOLVED"),
+        event_count_before + 2
+    );
+}
+
+#[test]
+fn test_batch_resolve_disputes_failure_does_not_block_other_items() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+    let operator = Address::generate(&env);
+    refund_client.grant_role(&admin, &Symbol::new(&env, "ADMIN"), &operator);
+    let (first_id, first_customer, _) = create_batch_dispute(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_partial_1",
+    );
+    let (last_id, last_customer, _) = create_batch_dispute(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_partial_2",
+    );
+    let event_count_before = count_dispute_events(&env, "RESOLVED");
+    let resolutions = soroban_sdk::vec![
+        &env,
+        crate::DisputeResolution {
+            dispute_id: first_id.clone(),
+            in_favor_of: first_customer,
+            notes: String::from_str(&env, "First dispute resolved"),
+        },
+        crate::DisputeResolution {
+            dispute_id: String::from_str(&env, "missing_dispute"),
+            in_favor_of: Address::generate(&env),
+            notes: String::from_str(&env, "This dispute does not exist"),
+        },
+        crate::DisputeResolution {
+            dispute_id: last_id.clone(),
+            in_favor_of: last_customer,
+            notes: String::from_str(&env, "Last dispute resolved"),
+        },
+    ];
+
+    let results = refund_client.batch_resolve_disputes(&operator, &resolutions);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0), Some(Ok(())));
+    assert_eq!(results.get(1), Some(Err(crate::Error::DisputeNotFound)));
+    assert_eq!(results.get(2), Some(Ok(())));
+    assert_eq!(
+        refund_client.get_dispute(&first_id).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        refund_client.get_dispute(&last_id).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        count_dispute_events(&env, "RESOLVED"),
+        event_count_before + 2
+    );
+}
+
+#[test]
+fn test_batch_resolve_disputes_rejects_oversized_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _payment_client, refund_client) = setup_contracts(&env);
+    let operator = Address::generate(&env);
+    refund_client.grant_role(&admin, &Symbol::new(&env, "SETTLEMENT_OPERATOR"), &operator);
+    let mut resolutions = soroban_sdk::vec![&env];
+    for _ in 0..=crate::MAX_DISPUTE_BATCH {
+        resolutions.push_back(crate::DisputeResolution {
+            dispute_id: String::from_str(&env, "unused_dispute"),
+            in_favor_of: Address::generate(&env),
+            notes: String::from_str(&env, "Oversized batch"),
+        });
+    }
+
+    let result = refund_client.try_batch_resolve_disputes(&operator, &resolutions);
+    assert_eq!(result, Err(Ok(crate::Error::BatchTooLarge)));
+}
+
+#[test]
+fn test_batch_resolve_disputes_requires_admin_or_settlement_operator() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _payment_client, refund_client) = setup_contracts(&env);
+    let unauthorized = Address::generate(&env);
+    let result = refund_client.try_batch_resolve_disputes(&unauthorized, &soroban_sdk::vec![&env]);
+    assert_eq!(result, Err(Ok(crate::Error::Unauthorized)));
 }

@@ -30,6 +30,8 @@ Environment variables (see `.env.example`):
 | `START_LEDGER` | `1` | Starting ledger sequence |
 | `PORT` / `INDEXER_API_PORT` | `3001` | REST API HTTP server port |
 | `API_KEY` / `INDEXER_API_KEY` | _(required in prod)_ | Secret key for REST API authentication |
+| `MERCHANT_API_KEYS` | _(required for reconciliation reports)_ | JSON object mapping each merchant API key to its merchant ID |
+| `STELLAR_SERVER_PUBLIC_KEY` | _(required for onboarding endpoint)_ | SEP-10 JWT verification key |
 | `DLQ_RETRY_INTERVAL_MS` | `60000` | DLQ automatic retry interval in milliseconds |
 | `DLQ_MIN_AGE_SECONDS` | `60` | Minimum age in seconds before a DLQ record is retried |
 
@@ -80,17 +82,55 @@ When event processing fails (e.g. malformed JSON, temporary DB error), the raw e
 
 ## REST API Endpoints (#616)
 
-All protected endpoints require an API key via header `x-api-key: <API_KEY>` or `Authorization: Bearer <API_KEY>`.
+Protected endpoints use an API key via `x-api-key` or a bearer token, except `GET /v1/merchants/me/onboarding`, which requires a SEP-10 bearer JWT. Reconciliation reports use `MERCHANT_API_KEYS` and are scoped to the merchant mapped to the presented key.
 
 | Method | Endpoint | Auth Required | Description |
 |--------|----------|---------------|-------------|
 | `GET` | `/health` | No | Liveness and PostgreSQL connection check. Returns 200 `{ status: "healthy", database: "connected" }` or 503 if DB is down. |
+| `GET` | `/v1/merchants/me/onboarding` | SEP-10 bearer JWT | Returns six merchant setup steps and `completion_pct`. Uses the token's `merchant_id` claim, falling back to `sub`. |
+| `GET` | `/v1/reports/reconciliation?from=YYYY-MM-DD&to=YYYY-MM-DD` | Merchant API key | Returns merchant-scoped payment, settlement, refund, dispute adjustment, and FX equivalent data. The inclusive date range is limited to 31 days. Set `Accept: text/csv` for CSV output. An optional `merchant_id` query must match the merchant assigned to the key. |
 | `GET` | `/payments/:paymentId` | Yes | Get payment record by payment ID. Returns 404 if not found. |
 | `GET` | `/merchants/:merchantId/payments` | Yes | Query paginated payments for a merchant. Supports query parameters `page` (default 1), `limit` (default 20), and `status`. Returns useful pagination metadata. |
 | `GET` | `/merchants/:merchantId/disputes` | Yes | Query disputes belonging to a merchant. Supports optional query parameter `status`. |
 | `GET` | `/refunds/:refundId` | Yes | Get refund record by refund ID. Returns 404 if not found. |
 | `GET` | `/events` | Yes | Query persisted events. Supports query parameters `type` (e.g. `PAYMENT/CONFIRMED`), `from` (ledger sequence), and `to` (ledger sequence). |
 | `POST` | `/admin/replay-dlq` | Yes | Manually trigger replay of failed events in the dead-letter queue. Returns `{ attempted, succeeded, failed }`. |
+
+### Merchant onboarding checklist
+
+`completion_pct` is the nearest integer percentage of all six steps, including
+`merchant_registered` (one completed step is 17%). Registration is read from
+the indexed `merchants` table. KYC is considered complete after an indexed
+`MERCHANT` event reports `status: "VERIFIED"`; its completion timestamp comes
+from that event where available.
+
+Webhook configuration, payout channels, and testnet/mainnet payment
+distinctions are not represented in the current indexer schema. Those steps
+therefore remain incomplete and include their `action_url`; the endpoint
+cannot report 100% until those state sources are integrated. This repository
+also has no dashboard application, so progress-bar and auto-dismiss behavior
+must be implemented in the dashboard project.
+
+### Reconciliation report export (#1081)
+
+Configure `MERCHANT_API_KEYS` as a JSON object whose keys are unique API secrets
+and whose values are merchant IDs, for example
+`{"merchant-secret":"G...merchant-id"}`. The report endpoint does not use the
+global indexer API key and rejects a requested `merchant_id` that does not
+match the merchant assigned to the presented key.
+
+Migration `004_reconciliation_reports.sql` adds payment reconciliation columns,
+the `fx_rate_cache`, and dispute adjustment storage. The FXOracle emits
+`FX_RATE/UPDATED` events containing each updated pair, integer fixed-point rate,
+and decimals; the indexer mirrors the latest rate into `fx_rate_cache`.
+The PaymentProcessor emits `PAYMENT/FEE_TOTAL` during settlement, which the
+indexer uses for the fee breakdown and settlement timestamp. Payment-specific
+fiat amounts, currencies, customer references, and tags are retained when
+supplied by indexed payment event data. Token amounts use the contract's
+seven-decimal convention; report totals are displayed to two decimal places.
+Dispute adjustments are signed and represent refunds caused by lost disputes;
+they are already included in the refund total and are not subtracted a second
+time when calculating net settlement.
 
 ---
 

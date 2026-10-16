@@ -16,6 +16,19 @@ export interface DLQRecord {
   created_at: Date;
 }
 
+export interface MerchantOnboardingState {
+  registeredAt: Date | string;
+  kycSubmittedAt: Date | string | null;
+}
+
+export interface ReconciliationData {
+  payments: Record<string, unknown>[];
+  settlements: Record<string, unknown>[];
+  refunds: Record<string, unknown>[];
+  disputeAdjustments: Record<string, unknown>[];
+  fxRates: Record<string, unknown>[];
+}
+
 export class Database {
   private pool: Pool;
   private initialized = false;
@@ -100,9 +113,22 @@ export class Database {
     switch (table) {
       case "payments":
         await client.query(
-          `INSERT INTO payments (payment_id, merchant_id, amount, currency, status, created_at)
-           VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
-           ON CONFLICT (payment_id) DO UPDATE SET status = $5`,
+          `INSERT INTO payments (
+             payment_id, merchant_id, amount, currency, status, created_at,
+             fee_amount, fiat_amount, fiat_currency, customer_ref, tags, settled_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5, to_timestamp($6), COALESCE($7, 0),
+             $8, $9, $10, $11, CASE WHEN $5 = 'SETTLED' THEN to_timestamp($6) END
+           )
+           ON CONFLICT (payment_id) DO UPDATE SET
+             status = $5,
+             fee_amount = CASE WHEN $7 IS NOT NULL THEN $7 ELSE payments.fee_amount END,
+             fiat_amount = COALESCE($8, payments.fiat_amount),
+             fiat_currency = COALESCE($9, payments.fiat_currency),
+             customer_ref = COALESCE($10, payments.customer_ref),
+             tags = COALESCE($11, payments.tags),
+             settled_at = CASE WHEN $5 = 'SETTLED' THEN to_timestamp($6) ELSE payments.settled_at END`,
           [
             value.payment_id,
             value.merchant_id,
@@ -110,9 +136,28 @@ export class Database {
             value.currency,
             event.topic[1],
             event.timestamp,
+            value.fee_amount ?? null,
+            value.fiat_amount ?? null,
+            value.fiat_currency ?? null,
+            value.customer_ref ?? null,
+            value.tags == null ? null : JSON.stringify(value.tags),
           ]
         );
         break;
+
+      case "payment_fee": {
+        const result = await client.query(
+          `UPDATE payments
+           SET fee_amount = $2, status = 'SETTLED',
+               settled_at = COALESCE(settled_at, to_timestamp($3))
+           WHERE payment_id = $1`,
+          [value.payment_id, value.amount, event.timestamp]
+        );
+        if (result.rowCount === 0) {
+          throw new Error(`Cannot apply settlement fee for missing payment ${String(value.payment_id)}`);
+        }
+        break;
+      }
 
       case "refunds":
         await client.query(
@@ -132,7 +177,18 @@ export class Database {
       case "disputes": {
         // Issue #615: Persist dispute status updates for RESOLVED, REJECTED, and ESCALATED events
         const subtype = event.topic[1];
-        if (subtype === "RESOLVED") {
+        if (subtype === "ADJUSTMENT") {
+          await client.query(
+            `INSERT INTO dispute_adjustments (dispute_id, payment_id, refund_id, amount, created_at)
+             VALUES ($1, $2, $3, $4, to_timestamp($5))
+             ON CONFLICT (dispute_id) DO UPDATE SET
+               payment_id = EXCLUDED.payment_id,
+               refund_id = EXCLUDED.refund_id,
+               amount = EXCLUDED.amount,
+               created_at = EXCLUDED.created_at`,
+            [value.dispute_id, value.payment_id, value.refund_id, value.amount, event.timestamp]
+          );
+        } else if (subtype === "RESOLVED") {
           const res = await client.query(
             `UPDATE disputes
              SET status = 'Resolved', resolved_at = to_timestamp($2), updated_at = CURRENT_TIMESTAMP
@@ -180,6 +236,18 @@ export class Database {
         }
         break;
       }
+
+      case "fx_rate":
+        await client.query(
+          `INSERT INTO fx_rate_cache (pair, rate, decimals, updated_at)
+           VALUES ($1, $2, $3, to_timestamp($4))
+           ON CONFLICT (pair) DO UPDATE SET
+             rate = EXCLUDED.rate,
+             decimals = EXCLUDED.decimals,
+             updated_at = EXCLUDED.updated_at`,
+          [value.pair, value.rate, value.decimals, event.timestamp]
+        );
+        break;
 
       case "merchants":
         await client.query(
@@ -252,6 +320,12 @@ export class Database {
   }
 
   private getTableName(eventType: string, eventSubtype?: string): string {
+    if (eventType === "PAYMENT" && eventSubtype === "FEE_TOTAL") {
+      return "payment_fee";
+    }
+    if (eventType === "FX_RATE" && eventSubtype === "UPDATED") {
+      return "fx_rate";
+    }
     if (eventType === "DISPUTE" && (eventSubtype === "BOND_RETURNED" || eventSubtype === "BOND_FORFEITED")) {
       return "dispute_bonds";
     }
@@ -330,6 +404,92 @@ export class Database {
       [merchantId, limit]
     );
     return rows;
+  }
+
+  async getReconciliationData(
+    merchantId: string,
+    from: Date,
+    toExclusive: Date
+  ): Promise<ReconciliationData> {
+    const [payments, settlements, refunds, disputeAdjustments, fxRates] = await Promise.all([
+      this.pool.query(
+        `SELECT payment_id, amount, currency, status, created_at, settled_at,
+                fee_amount, fiat_amount, fiat_currency, customer_ref, tags
+         FROM payments
+        WHERE merchant_id = $1 AND (
+          (created_at >= $2 AND created_at < $3)
+          OR (settled_at >= $2 AND settled_at < $3)
+          OR EXISTS (
+            SELECT 1 FROM refunds r
+            WHERE r.payment_id = payments.payment_id
+              AND r.created_at >= $2 AND r.created_at < $3
+          )
+          OR EXISTS (
+            SELECT 1 FROM dispute_adjustments a
+            WHERE a.payment_id = payments.payment_id
+              AND a.created_at >= $2 AND a.created_at < $3
+          )
+        )
+        ORDER BY created_at, payment_id`,
+        [merchantId, from, toExclusive]
+      ),
+      this.pool.query(
+        `SELECT payment_id, amount, currency, fee_amount, settled_at
+         FROM payments
+         WHERE merchant_id = $1 AND settled_at >= $2 AND settled_at < $3
+         ORDER BY settled_at, payment_id`,
+        [merchantId, from, toExclusive]
+      ),
+      this.pool.query(
+        `SELECT r.refund_id, r.payment_id, r.amount, r.status, r.created_at, p.currency
+         FROM refunds r
+         JOIN payments p ON p.payment_id = r.payment_id
+         WHERE p.merchant_id = $1
+           AND r.status IN ('PROCESSED', 'COMPLETED')
+           AND r.created_at >= $2 AND r.created_at < $3
+         ORDER BY r.created_at, r.refund_id`,
+        [merchantId, from, toExclusive]
+      ),
+      this.pool.query(
+        `SELECT a.dispute_id, a.payment_id, a.refund_id, a.amount, a.created_at, p.currency
+         FROM dispute_adjustments a
+         JOIN payments p ON p.payment_id = a.payment_id
+         WHERE p.merchant_id = $1 AND a.created_at >= $2 AND a.created_at < $3
+         ORDER BY a.created_at, a.dispute_id`,
+        [merchantId, from, toExclusive]
+      ),
+      this.pool.query(
+        `SELECT pair, rate, decimals, updated_at FROM fx_rate_cache`
+      ),
+    ]);
+
+    return {
+      payments: payments.rows,
+      settlements: settlements.rows,
+      refunds: refunds.rows,
+      disputeAdjustments: disputeAdjustments.rows,
+      fxRates: fxRates.rows,
+    };
+  }
+
+  async getMerchantOnboardingState(merchantId: string): Promise<MerchantOnboardingState | null> {
+    const { rows } = await this.pool.query(
+      `SELECT m.created_at AS "registeredAt",
+              COALESCE(
+                (
+                  SELECT MIN(e.timestamp)
+                  FROM contract_events e
+                  WHERE e.event_type = 'MERCHANT'
+                    AND e.data->>'merchant_id' = m.merchant_id
+                    AND UPPER(e.data->>'status') = 'VERIFIED'
+                ),
+                CASE WHEN UPPER(m.status) = 'VERIFIED' THEN m.last_update END
+              ) AS "kycSubmittedAt"
+       FROM merchants m
+       WHERE m.merchant_id = $1`,
+      [merchantId]
+    );
+    return rows.length > 0 ? rows[0] : null;
   }
 
   async getDisputesByMerchant(merchantId: string, status?: string): Promise<unknown[]> {

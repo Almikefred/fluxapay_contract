@@ -7,6 +7,7 @@ use crate::access_control::{role_admin, role_oracle, AccessControl};
 
 /// Maximum allowed age of a rate in seconds, regardless of admin-configured threshold.
 const MAX_RATE_AGE_SECS: u64 = 86_400; // 24 hours
+const MAX_RATE_DECIMALS: u32 = 38;
 
 /// Maximum ledger sequence gap since last rate update (~24 h at ~5 s/ledger).
 const MAX_LEDGER_GAP: u32 = 17_280;
@@ -58,6 +59,8 @@ pub enum FXOracleError {
     /// Issue #636: Neither the requested `BASE_QUOTE` pair nor its inverse
     /// `QUOTE_BASE` has a stored rate (or the pair symbol is malformed).
     PairNotFound = 6,
+    /// Rate must be positive and use at most 38 fixed-point decimals.
+    InvalidRate = 7,
 }
 
 #[contracttype]
@@ -159,7 +162,11 @@ impl FXOracle {
         // Emit event: (RATE, UPDATED), pair
         env.events().publish(
             (Symbol::new(&env, "RATE"), Symbol::new(&env, "UPDATED")),
-            pair,
+            pair.clone(),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "FX_RATE"), Symbol::new(&env, "UPDATED")),
+            (pair, rate, decimals),
         );
 
         Ok(())
@@ -204,6 +211,10 @@ impl FXOracle {
         let count = rates.len();
         for (pair, rate, decimals) in rates.iter() {
             Self::store_rate(&env, pair, rate, decimals)?;
+            env.events().publish(
+                (Symbol::new(&env, "FX_RATE"), Symbol::new(&env, "UPDATED")),
+                (pair, rate, decimals),
+            );
         }
 
         env.events().publish(
@@ -218,6 +229,10 @@ impl FXOracle {
     }
 
     fn store_rate(env: &Env, pair: Symbol, rate: i128, decimals: u32) -> Result<(), FXOracleError> {
+        if rate <= 0 || decimals > MAX_RATE_DECIMALS {
+            return Err(FXOracleError::InvalidRate);
+        }
+
         // Issue #478: Check rate deviation against configured limit
         let max_deviation_bps = env
             .storage()
