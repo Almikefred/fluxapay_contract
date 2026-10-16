@@ -1503,3 +1503,40 @@ describe("ISSUE #616 — Indexer REST API Server", () => {
     });
   });
 });
+
+describe("Issue #957 — GET /v1/fx/rates", () => {
+  it("requires an API key and returns all cached pairs with staleness", async () => {
+    process.env.API_KEY = "fx_rates_key";
+    const { setCachedRate, clearCachedRates } = await import("../src/fx-rate-cache");
+    clearCachedRates();
+    const now = Math.floor(Date.now() / 1000);
+    setCachedRate("USDC_NGN", 1620.5, now);
+    setCachedRate("USDC_GHS", 15.2, now - 10_000);
+
+    const app = createServer(createMockDatabase());
+    const server = app.listen(0);
+    const { port } = server.address() as any;
+    try {
+      const unauth = await fetch(`http://127.0.0.1:${port}/v1/fx/rates`);
+      assert.strictEqual(unauth.status, 401);
+
+      const res = await fetch(`http://127.0.0.1:${port}/v1/fx/rates`, {
+        headers: { authorization: "Bearer fx_rates_key" },
+      });
+      const body = (await res.json()) as any;
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(typeof body.staleness_threshold_secs, "number");
+      const ngn = body.rates.find((r: any) => r.to === "NGN");
+      const ghs = body.rates.find((r: any) => r.to === "GHS");
+      assert.deepStrictEqual(
+        { from: ngn.from, rate: ngn.rate, stale: ngn.stale },
+        { from: "USDC", rate: "1620.5", stale: false },
+      );
+      assert.strictEqual(ngn.updated_at, new Date(now * 1000).toISOString());
+      assert.strictEqual(ghs.stale, true);
+    } finally {
+      server.close();
+      clearCachedRates();
+    }
+  });
+});

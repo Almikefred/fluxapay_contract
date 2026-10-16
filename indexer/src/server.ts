@@ -18,7 +18,7 @@ import {
   registerWebhookRoutes,
   WebhookStore,
 } from "./webhooks";
-import { getCachedRate } from "./fx-rate-cache";
+import { getCachedRate, listCachedRates } from "./fx-rate-cache";
 import { createRateLimitMiddleware } from "./rate-limit";
 
 dotenv.config();
@@ -53,15 +53,24 @@ const fxConvertHits = new Map<string, number[]>();
 
 function fxConvertRateLimit(req: Request, res: Response, next: NextFunction): void {
   const ip = (req.ip || req.socket.remoteAddress || "unknown").toString();
+  fxRateLimit(`ip:${ip}`, res, next);
+}
+
+/** Issue #957: /v1/fx/rates shares the 60 req/min budget, keyed per API key. */
+function fxRatesRateLimit(req: Request, res: Response, next: NextFunction): void {
+  fxRateLimit(`key:${extractApiKey(req) ?? "unknown"}`, res, next);
+}
+
+function fxRateLimit(bucket: string, res: Response, next: NextFunction): void {
   const now = Date.now();
   const windowStart = now - FX_CONVERT_WINDOW_MS;
-  const recent = (fxConvertHits.get(ip) || []).filter((t) => t > windowStart);
+  const recent = (fxConvertHits.get(bucket) || []).filter((t) => t > windowStart);
   if (recent.length >= FX_CONVERT_LIMIT) {
     res.status(429).json({ error: "Rate limit exceeded: 60 requests per minute" });
     return;
   }
   recent.push(now);
-  fxConvertHits.set(ip, recent);
+  fxConvertHits.set(bucket, recent);
   next();
 }
 
