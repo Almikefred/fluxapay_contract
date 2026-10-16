@@ -19,6 +19,7 @@ Operational scripts for deployment, SDK generation, local development, and CI ch
 | `deploy_testnet.sh` | Legacy deployment script — builds and deploys 5 contracts (no PaymentLinkManager). | `STELLAR_SECRET_KEY`, `STELLAR_NETWORK` | After Rust contract changes (prefer `deploy-testnet.sh`) |
 | `fund-accounts.js` | Fund Stellar accounts via Friendbot (testnet) or local faucet (sandbox). Accepts addresses as CLI args or a `--config` JSON file. | None | Local dev setup |
 | `subscription-daemon.js` | Long-running daemon that polls for due subscriptions and calls `process_due_subscriptions` on the RefundManager contract. | `CONTRACT_ID`, `OPERATOR_SECRET` | Always running in prod |
+| `htlc-sweep.js` | Long-running daemon that polls a local HTLC index for expired (`timeout_ledger` passed) entries and calls the permissionless `claim_htlc_timeout` on the `Htlc` contract to refund the sender. Pass `--once` for a single cycle. | `HTLC_CONTRACT_ID`, `SWEEP_SECRET_KEY` | Always running in prod |
 | `fx-oracle-updater.js` | Long-running updater that polls an off-chain price feed, converts quotes to 7-decimal fixed-point, and pushes them to the FXOracle contract via a single atomic `set_rates_batch` call. Skips the cycle (and alerts) on feed outage; logs + alerts on `RateDeviationExceeded`. Pass `--once` for a single cycle. | `ORACLE_SECRET`, `FX_ORACLE_CONTRACT_ID` | Always running in prod |
 | `check-doc-links.js` | Verifies every relative link and `#anchor` in Markdown docs resolves (default `docs/faq.md`); exits 1 listing broken links. Run `node scripts/check-doc-links.js [file.md ...]`. | None | After editing docs |
 | `generate-sdk.sh` | Generate TypeScript SDK bindings from compiled WASM using `stellar contract bindings typescript`. | None | After contract changes |
@@ -73,6 +74,17 @@ script must exit non-zero and print the missing path.
 | `OPERATOR_SECRET` | Yes | — | Operator secret key (`settlement_operator` role) |
 | `POLL_INTERVAL_MS` | No | `60000` | Poll interval in milliseconds |
 | `NETWORK_PASSPHRASE` | No | `Networks.TESTNET` | Stellar network passphrase |
+
+### `htlc-sweep.js`
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `STELLAR_RPC_URL` | No | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
+| `HTLC_CONTRACT_ID` | Yes | — | Deployed `Htlc` contract address |
+| `SWEEP_SECRET_KEY` | Yes | — | Funding keypair that pays the sweep transaction fee (no HTLC-specific role needed - `claim_htlc_timeout` is permissionless) |
+| `POLL_INTERVAL_MS` | No | `60000` | Poll interval in milliseconds |
+| `NETWORK_PASSPHRASE` | No | `Networks.TESTNET` | Stellar network passphrase |
+| `HTLC_INDEX_PATH` | No | `/tmp/fluxapay_htlcs.json` | Local JSON index of `{ id, timeout_ledger, status }` entries to check for expiry |
 
 ### `fx-oracle-updater.js`
 
