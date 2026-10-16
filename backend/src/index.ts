@@ -4,6 +4,7 @@ import { Networks } from "@stellar/stellar-sdk";
 import { createAuthRouter } from "./routes/auth";
 import { createAnalyticsRouter } from "./routes/analytics";
 import { createSettlementRouter } from "./routes/settlements";
+import { createInvoicesRouter } from "./routes/invoices";
 import { requireJsonContentType } from "./middleware/requireJsonContentType";
 
 /**
@@ -91,6 +92,17 @@ app.use(
   createSettlementRouter({
     networkPassphrase: NETWORK_PASSPHRASE,
     homeDomain: HOME_DOMAIN,
+  }),
+);
+
+/**
+ * Issue #1067: Invoice lifecycle routes — list, fetch, and void invoices.
+ * Proxies to the indexer API so merchant clients have a single entry point.
+ */
+app.use(
+  "/v1/invoices",
+  createInvoicesRouter({
+    indexerUrl: process.env.INDEXER_URL || "http://localhost:3001",
   }),
 );
 

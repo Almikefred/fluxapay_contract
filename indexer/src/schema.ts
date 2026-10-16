@@ -138,9 +138,18 @@ export const invoices = pgTable("invoices", {
   merchantId: varchar("merchant_id", { length: 255 }),
   totalAmount: bigint("total_amount", { mode: "bigint" }),
   status: varchar("status", { length: 50 }),
+  dueDate: timestamp("due_date"),
+  paidAt: timestamp("paid_at"),
+  voidedAt: timestamp("voided_at"),
+  linkedPaymentId: varchar("linked_payment_id", { length: 255 }),
   createdAt: timestamp("created_at"),
   updatedAt: timestamp("updated_at").defaultNow(),
-});
+},
+(t) => ({
+  merchantIdIdx: index("idx_invoice_merchant_id").on(t.merchantId),
+  statusIdx: index("idx_invoice_status").on(t.status),
+}),
+);
 
 export const disputeBonds = pgTable("dispute_bonds", {
   id: serial("id").primaryKey(),
@@ -181,3 +190,20 @@ export const settlements = pgTable("settlements", {
   customerRef: varchar("customer_ref", { length: 255 }),
   tags: text("tags"),
 });
+
+/** Issue #1066: Platform fee collection records mirroring FeeRecord on-chain. */
+export const feeCollectionHistory = pgTable(
+  "fee_collection_history",
+  {
+    id: serial("id").primaryKey(),
+    paymentId: varchar("payment_id", { length: 255 }).notNull(),
+    feeAmount: bigint("fee_amount", { mode: "bigint" }).notNull(),
+    token: varchar("token", { length: 255 }).notNull(),
+    collectedAt: timestamp("collected_at").notNull(),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (t) => ({
+    paymentIdIdx: index("idx_fee_payment_id").on(t.paymentId),
+    collectedAtIdx: index("idx_fee_collected_at").on(t.collectedAt),
+  }),
+);

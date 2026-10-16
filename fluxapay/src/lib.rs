@@ -332,6 +332,8 @@ pub enum InvoiceStatus {
     Created,
     Paid,
     Overdue,
+    /// Issue #1067: Merchant-initiated cancellation (soft-delete).
+    Voided,
 }
 
 #[contracttype]
@@ -355,6 +357,10 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     pub payment_link_id: Option<String>,
     pub created_at: u64,
+    /// Issue #1067: Timestamp when the invoice was paid (set by mark_invoice_paid).
+    pub paid_at: Option<u64>,
+    /// Issue #1067: Timestamp when the invoice was voided (set by void_invoice).
+    pub voided_at: Option<u64>,
 }
 
 #[contracttype]
@@ -1158,6 +1164,37 @@ pub struct MerchantRanking {
     pub total_volume: i128,
     /// Number of payments created for this merchant (the `MerchantPaymentCount` index).
     pub payment_count: u64,
+}
+
+/// Issue #1066: A single platform-fee collection record appended to
+/// `DataKey::FeeCollectionHistory` from `settle_payment` / `process_refund`.
+/// Paginated by `get_fee_collection_history`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRecord {
+    /// Payment or refund ID that generated this fee event.
+    pub payment_id: String,
+    /// Fee amount collected in the token's smallest unit.
+    pub fee_amount: i128,
+    /// Token contract address the fee was collected in.
+    pub token: Address,
+    /// Ledger timestamp when the fee was collected.
+    pub collected_at: u64,
+}
+
+/// Issue #1064: Enriched merchant leaderboard entry returned by
+/// `get_top_merchants_v2`, including KYC tier and volume metrics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRankEntry {
+    pub merchant_id: Address,
+    /// Composite score used for ranking (equals cumulative gross volume).
+    pub score: i128,
+    pub kyc_tier: KycTier,
+    /// Total confirmed payments for this merchant.
+    pub confirmed_payment_count: u64,
+    /// Cumulative gross payment volume.
+    pub cumulative_volume: i128,
 }
 
 #[contracttype]
@@ -12021,6 +12058,8 @@ impl PaymentProcessor {
             status: InvoiceStatus::Created,
             payment_link_id: None,
             created_at: now,
+            paid_at: None,
+            voided_at: None,
         };
 
         env.storage()
@@ -12121,6 +12160,8 @@ impl PaymentProcessor {
             status: InvoiceStatus::Created,
             payment_link_id: Some(link_id.clone()),
             created_at: now,
+            paid_at: None,
+            voided_at: None,
         };
 
         env.storage()
@@ -12158,11 +12199,14 @@ impl PaymentProcessor {
             return Ok(());
         }
 
-        if invoice.status != InvoiceStatus::Created {
+        // Issue #1067: accept Overdue invoices too (late payment still valid).
+        if matches!(invoice.status, InvoiceStatus::Voided) {
             return Err(Error::PaymentAlreadyProcessed);
         }
 
+        let now = env.ledger().timestamp();
         invoice.status = InvoiceStatus::Paid;
+        invoice.paid_at = Some(now);
         env.storage()
             .persistent()
             .set(&DataKey::Invoice(invoice_id.clone()), &invoice);
@@ -12239,6 +12283,294 @@ impl PaymentProcessor {
             .persistent()
             .get::<DataKey, Vec<String>>(&DataKey::MerchantInvoices(merchant_id.clone()))
             .unwrap_or_else(|| Vec::new(env))
+    }
+
+    // ------------------------------------------------------------------ #1067
+
+    /// Issue #1067: Void an invoice (merchant must sign).
+    /// Transitions Created (Pending) or Overdue → Voided (soft-delete).
+    /// Paid invoices cannot be voided.
+    pub fn void_invoice(env: Env, merchant_id: Address, invoice_id: String) -> Result<(), Error> {
+        merchant_id.require_auth();
+
+        let mut invoice: Invoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Invoice(invoice_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if invoice.merchant_id != merchant_id {
+            return Err(Error::Unauthorized);
+        }
+
+        match invoice.status {
+            InvoiceStatus::Voided => return Ok(()), // idempotent
+            InvoiceStatus::Paid   => return Err(Error::PaymentAlreadyProcessed),
+            _ => {}
+        }
+
+        let now = env.ledger().timestamp();
+        invoice.status = InvoiceStatus::Voided;
+        invoice.voided_at = Some(now);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id.clone()), &invoice);
+
+        env.events().publish(
+            (Symbol::new(&env, "INVOICE"), Symbol::new(&env, "VOIDED")),
+            (invoice_id, merchant_id, now),
+        );
+
+        Ok(())
+    }
+
+    /// Issue #1067: Mark a past-due invoice as Overdue.
+    /// Permissionless — anyone may call once `now > invoice.due_date`.
+    pub fn mark_invoice_overdue(env: Env, invoice_id: String) -> Result<(), Error> {
+        let mut invoice: Invoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Invoice(invoice_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if invoice.status != InvoiceStatus::Created {
+            return Ok(()); // idempotent for Overdue, no-op for Paid/Voided
+        }
+
+        let now = env.ledger().timestamp();
+        if now <= invoice.due_date {
+            return Err(Error::InvalidExpiry);
+        }
+
+        invoice.status = InvoiceStatus::Overdue;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id.clone()), &invoice);
+
+        env.events().publish(
+            (Symbol::new(&env, "INVOICE"), Symbol::new(&env, "OVERDUE")),
+            (invoice_id, invoice.merchant_id, now),
+        );
+
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ #1065
+
+    /// Issue #1065: Verify that `preimage` SHA-256 hashes to the
+    /// `metadata_hash` stored on a payment.
+    /// Returns `true` on match, `false` when no hash was stored or hash differs.
+    /// Returns `Error::PaymentNotFound` when the payment does not exist.
+    pub fn verify_metadata_hash(
+        env: Env,
+        payment_id: String,
+        preimage: Bytes,
+    ) -> Result<bool, Error> {
+        let payment = Self::get_payment_internal(&env, &payment_id)?;
+        let stored = match payment.metadata_hash {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        let computed: BytesN<32> = env.crypto().sha256(&preimage).to_bytes();
+        Ok(computed == stored)
+    }
+
+    // ------------------------------------------------------------------ #1066
+
+    /// Issue #1066: Append a fee record to the ring-buffer history.
+    /// Called from settle_payment and process_refund. Skipped when fee is zero.
+    pub(crate) fn append_fee_record(
+        env: &Env,
+        payment_id: &String,
+        fee_amount: i128,
+        token: Address,
+    ) {
+        if fee_amount <= 0 {
+            return;
+        }
+        let now = env.ledger().timestamp();
+        let record = FeeRecord {
+            payment_id: payment_id.clone(),
+            fee_amount,
+            token,
+            collected_at: now,
+        };
+
+        let mut history: Vec<FeeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeCollectionHistory)
+            .unwrap_or_else(|| vec![env]);
+
+        // Prepend newest entry.
+        let mut updated: Vec<FeeRecord> = vec![env];
+        updated.push_back(record);
+        for r in history.iter() {
+            updated.push_back(r);
+        }
+
+        // Ring-buffer: drop oldest beyond cap.
+        while updated.len() > FEE_COLLECTION_HISTORY_CAP {
+            updated.pop_back();
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeCollectionHistory, &updated);
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeCollectionHistory, threshold, LONG_LIVE_TTL);
+    }
+
+    /// Issue #1066: Return a paginated slice of fee collection records
+    /// (newest first). `limit` is capped at 200 per call.
+    pub fn get_fee_collection_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<FeeRecord> {
+        const MAX_PAGE: u32 = 200;
+        let effective_limit = limit.min(MAX_PAGE);
+
+        let history: Vec<FeeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeCollectionHistory)
+            .unwrap_or_else(|| vec![&env]);
+
+        let total = history.len();
+        if offset >= total || effective_limit == 0 {
+            return vec![&env];
+        }
+
+        let end = (offset + effective_limit).min(total);
+        let mut page: Vec<FeeRecord> = vec![&env];
+        let mut idx = offset;
+        while idx < end {
+            if let Some(r) = history.get(idx) {
+                page.push_back(r);
+            }
+            idx += 1;
+        }
+        page
+    }
+
+    /// Issue #1066: Admin-only — lifetime total fees collected for a token.
+    pub fn get_total_fees_collected(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<i128, Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let history: Vec<FeeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeCollectionHistory)
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut total: i128 = 0;
+        for record in history.iter() {
+            if record.token == token {
+                total = total.saturating_add(record.fee_amount);
+            }
+        }
+        Ok(total)
+    }
+
+    // ------------------------------------------------------------------ #1064
+
+    /// Issue #1064: Return top merchants sorted by cumulative score descending,
+    /// enriched with KYC tier. Suspended merchants are excluded.
+    /// `limit` is capped at TOP_MERCHANTS_MAX_LIMIT (100).
+    pub fn get_top_merchants_v2(env: Env, limit: u32) -> Vec<MerchantRankEntry> {
+        let capped_limit = if limit == 0 {
+            TOP_MERCHANTS_MAX_LIMIT
+        } else {
+            limit.min(TOP_MERCHANTS_MAX_LIMIT)
+        };
+
+        let registry_addr: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantRegistryAddress);
+
+        let tracked: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TrackedMerchants)
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut entries: Vec<MerchantRankEntry> = vec![&env];
+
+        for merchant_id in tracked.iter() {
+            let volume: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantGrossVolume(merchant_id.clone()))
+                .unwrap_or(0i128);
+
+            let payment_count: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantPaymentCount(merchant_id.clone()))
+                .unwrap_or(0u64);
+
+            let kyc_tier = if let Some(ref reg_addr) = registry_addr {
+                let reg = MerchantRegistryClient::new(&env, reg_addr);
+                match reg.try_get_merchant(&merchant_id) {
+                    Ok(Ok(m)) => {
+                        if !m.active {
+                            continue; // skip suspended merchants
+                        }
+                        m.kyc_tier
+                    }
+                    _ => KycTier::Unverified,
+                }
+            } else {
+                KycTier::Unverified
+            };
+
+            entries.push_back(MerchantRankEntry {
+                merchant_id,
+                score: volume,
+                kyc_tier,
+                confirmed_payment_count: payment_count,
+                cumulative_volume: volume,
+            });
+        }
+
+        // Selection sort by score descending.
+        let mut i = 0u32;
+        while i < entries.len() {
+            let mut j = i + 1;
+            while j < entries.len() {
+                if let (Some(a), Some(b)) = (entries.get(i), entries.get(j)) {
+                    if b.score > a.score {
+                        entries.set(i, b.clone());
+                        entries.set(j, a.clone());
+                    }
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        let end = capped_limit.min(entries.len());
+        let mut result: Vec<MerchantRankEntry> = vec![&env];
+        let mut idx = 0u32;
+        while idx < end {
+            if let Some(entry) = entries.get(idx) {
+                result.push_back(entry);
+            }
+            idx += 1;
+        }
+        result
     }
 
     /// Submit a merchant-signed meta-transaction. The relayer pays the fee.
