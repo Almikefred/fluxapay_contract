@@ -23,6 +23,14 @@ export interface PaymentEvent extends ContractEvent {
   };
 }
 
+export interface PaymentFeeEvent extends ContractEvent {
+  topic: ["PAYMENT", "FEE_TOTAL"];
+  value: {
+    payment_id: string;
+    amount: string | number | bigint;
+  };
+}
+
 export interface RefundEvent extends ContractEvent {
   topic: ["REFUND", "CREATED" | "PROCESSED" | "REJECTED"];
   value: {
@@ -33,7 +41,7 @@ export interface RefundEvent extends ContractEvent {
 }
 
 export interface DisputeEvent extends ContractEvent {
-  topic: ["DISPUTE", "CREATED" | "RESOLVED" | "REJECTED" | "ESCALATED"];
+  topic: ["DISPUTE", "CREATED" | "RESOLVED" | "REJECTED" | "ESCALATED" | "ADJUSTMENT"];
   value: {
     dispute_id: string;
     payment_id: string;
@@ -77,11 +85,31 @@ export interface StreamEvent extends ContractEvent {
 }
 
 export interface SubscriptionEvent extends ContractEvent {
-  topic: ["SUBSCRIPTION", "CREATED" | "ACTIVE" | "CANCELLED" | "PAUSED"];
+  topic: [
+    "SUBSCRIPTION",
+    | "PLAN_CREATED"
+    | "PLAN_DEACTIVATED"
+    | "CREATED"
+    | "ACTIVE"
+    | "CHARGED"
+    | "CHARGE_FAILED"
+    | "DUNNING_TRIGGERED"
+    | "CANCELLED"
+    | "EXPIRED"
+    | "COMPLETED"
+    | "PAUSED"
+    | "RESUMED"
+    | "TRIAL_STARTED"
+    | "TRIAL_ENDED"
+  ];
   value: {
-    subscription_id: string;
-    payer: string;
-    status: string;
+    subscription_id?: string;
+    payer?: string;
+    status?: string;
+    plan_id?: string;
+    merchant_id?: string;
+    amount?: number;
+    interval_secs?: number;
   };
 }
 
@@ -95,10 +123,12 @@ export interface InvoiceEvent extends ContractEvent {
 }
 
 export interface FXOracleEvent extends ContractEvent {
-  topic: ["FX_ORACLE" | "ORACLE", "UPDATED" | "SET" | "REMOVED"];
+  topic: ["FX_ORACLE" | "ORACLE" | "FX_RATE", "UPDATED" | "SET" | "REMOVED"];
   value: {
-    asset: string;
-    rate: number;
+    pair?: string;
+    asset?: string;
+    rate: string | number | bigint;
+    decimals?: number;
   };
 }
 
@@ -115,7 +145,7 @@ export interface LinkUsedEvent extends ContractEvent {
   value: {
     link_id: string;
     payer: string;
-    amount: number;
+    amount: bigint | number;
     payment_id: string;
     metadata?: Record<string, string>;
   };
@@ -151,6 +181,7 @@ export type PaymentLinkEvent =
 
 export type AnyEvent =
   | PaymentEvent
+  | PaymentFeeEvent
   | RefundEvent
   | DisputeEvent
   | DisputeBondEvent

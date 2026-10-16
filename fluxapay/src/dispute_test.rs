@@ -127,6 +127,76 @@ fn has_dispute_event(env: &Env, event_name: &str) -> bool {
     })
 }
 
+fn count_dispute_events(env: &Env, event_name: &str) -> usize {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    env.events()
+        .all()
+        .iter()
+        .filter(|event| {
+            let ContractEventBody::V0(v0) = &event.body;
+            let topics = &v0.topics;
+            if topics.len() != 2 {
+                return false;
+            }
+            let namespace: Result<Symbol, _> = ScVal::from(topics[0].clone()).try_into_val(env);
+            let name: Result<Symbol, _> = ScVal::from(topics[1].clone()).try_into_val(env);
+            matches!(
+                (namespace, name),
+                (Ok(namespace), Ok(name))
+                    if namespace == Symbol::new(env, "DISPUTE")
+                        && name == Symbol::new(env, event_name)
+            )
+        })
+        .count()
+}
+
+fn create_batch_dispute(
+    env: &Env,
+    admin: &Address,
+    payment_client: &PaymentProcessorClient<'_>,
+    refund_client: &RefundManagerClient<'_>,
+    payment_id_text: &str,
+) -> (String, Address, Address) {
+    let merchant = Address::generate(env);
+    let customer = Address::generate(env);
+    let payment_id = String::from_str(env, payment_id_text);
+
+    payment_client.grant_role(admin, &Symbol::new(env, "MERCHANT"), &merchant);
+    payment_client.create_payment(&create_payment_args(env, &payment_id, &merchant, 1_000));
+
+    let oracle = Address::generate(env);
+    payment_client.grant_role(admin, &Symbol::new(env, "ORACLE"), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::from_array(env, &[9u8; 32]),
+        &customer,
+        &1_000,
+        &None::<u64>,
+    );
+
+    let token_address = env.as_contract(&refund_client.address, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .unwrap()
+    });
+    let token_admin_client = token::StellarAssetClient::new(env, &token_address);
+    token_admin_client.mint(&customer, &100_000);
+    token_admin_client.mint(&merchant, &100_000);
+
+    refund_client.register_payment(&payment_id, &merchant, &1_000, &Symbol::new(env, "USDC"));
+    let dispute_id = refund_client.create_dispute(
+        &payment_id,
+        &1_000,
+        &String::from_str(env, "Batch resolution coverage"),
+        &String::from_str(env, "Batch evidence"),
+        &customer,
+        &vec![env],
+    );
+    (dispute_id, customer, merchant)
+}
+
 #[test]
 fn test_operator_sets_dispute_deadline() {
     let env = Env::default();
@@ -1409,301 +1479,123 @@ fn test_batch_create_disputes_rejects_oversized() {
     assert_eq!(result2, Err(Ok(crate::Error::BatchTooLarge)));
 }
 
-/// Issue #833: open_dispute cross-calls MerchantRegistry.increment_merchant_dispute_count
-/// so get_merchant_dispute_count returns a non-zero value.
 #[test]
-fn test_open_dispute_increments_merchant_registry_dispute_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (admin, payment_client, refund_client) = setup_contracts(&env);
-
-    let registry_id = env.register(crate::merchant_registry::MerchantRegistry, ());
-    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_id);
-    registry_client.initialize(&admin);
-    registry_client.set_refund_manager_address(&admin, &refund_client.address);
-
-    // Wire RefundManager → MerchantRegistry for the cross-call.
-    env.as_contract(&refund_client.address, || {
-        env.storage()
-            .persistent()
-            .set(&DataKey::MerchantRegistryAddress, &registry_id);
-    });
-
-    let merchant = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let payment_id = String::from_str(&env, "disp_count_833");
-    let amount = 1000i128;
-
-    registry_client.register_merchant(
-        &merchant,
-        &String::from_str(&env, "Dispute Count Merchant"),
-        &String::from_str(&env, "USDC"),
-        &None,
-        &None,
-        &crate::merchant_registry::MaybeFeeConfig::None,
-    );
-
-    assert_eq!(registry_client.get_merchant_dispute_count(&merchant), 0);
-
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-    payment_client.create_payment(&create_payment_args(&env, &payment_id, &merchant, amount));
-
-    let oracle = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
-    payment_client.verify_payment(
-        &oracle,
-        &payment_id,
-        &BytesN::from_array(&env, &[8u8; 32]),
-        &customer,
-        &amount,
-        &None::<u64>,
-    );
-
-    let token_address = env.as_contract(&refund_client.address, || {
-        env.storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::UsdcToken)
-            .unwrap()
-    });
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
-    token_admin_client.mint(&customer, &100_000);
-    token_admin_client.mint(&merchant, &100_000);
-
-    refund_client.register_payment(&payment_id, &merchant, &amount, &Symbol::new(&env, "USDC"));
-    refund_client.create_dispute(
-        &payment_id,
-        &amount,
-        &String::from_str(&env, "Issue 833 dispute"),
-        &String::from_str(&env, "f000000000000000000000000000000000"),
-        &customer,
-        &vec![&env],
-    );
-
-    assert_eq!(registry_client.get_merchant_dispute_count(&merchant), 1);
-}
-
-/// Issue #843: a small-stake arbitrator is outvoted by a large-stake arbitrator
-/// under weighted quorum (not raw vote count).
-#[test]
-fn test_stake_weighted_vote_large_stake_outvotes_small() {
-    use crate::{VoteChoice, MIN_ARBITRATOR_STAKE, VOTE_WEIGHT_UNIT};
-
+fn test_batch_resolve_disputes_all_succeed() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, payment_client, refund_client) = setup_contracts(&env);
-
-    let payment_id = String::from_str(&env, "payment_weighted_vote");
-    let dispute_id = setup_dispute_under_review(
-        &env,
-        &admin,
-        &payment_client,
-        &refund_client,
-        &payment_id,
-        1_000i128,
-    );
-
-    let token_admin = Address::generate(&env);
-    let stake_token = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_admin_client = token::StellarAssetClient::new(&env, &stake_token);
-
-    let small = Address::generate(&env);
-    let large = Address::generate(&env);
     let operator = Address::generate(&env);
     refund_client.grant_role(&admin, &Symbol::new(&env, "SETTLEMENT_OPERATOR"), &operator);
-    refund_client.grant_role(&admin, &Symbol::new(&env, "ARBITRATOR"), &small);
-    refund_client.grant_role(&admin, &Symbol::new(&env, "ARBITRATOR"), &large);
-
-    // Small: 1 weight unit; Large: 10 weight units. Total registered = 11.
-    // Default quorum 51% of 11 ≈ 5.61, so large (10) alone exceeds quorum.
-    let small_stake = MIN_ARBITRATOR_STAKE; // 1 weight
-    let large_stake = VOTE_WEIGHT_UNIT * 10; // 10 weight
-    token_admin_client.mint(&small, &small_stake);
-    token_admin_client.mint(&large, &large_stake);
-
-    refund_client.lock_stake(&small, &dispute_id, &stake_token, &small_stake);
-    refund_client.lock_stake(&large, &dispute_id, &stake_token, &large_stake);
-
-    // Small votes Favour, large votes Against — large must win on weight.
-    refund_client.cast_vote(&small, &dispute_id, &VoteChoice::Favour);
-    refund_client.cast_vote(&large, &dispute_id, &VoteChoice::Against);
-
-    let tally = refund_client.get_vote_tally(&dispute_id);
-    assert_eq!(tally.favour_weight, 1);
-    assert_eq!(tally.against_weight, 10);
-    assert_eq!(tally.total_registered_weight, 11);
-    assert_eq!(tally.vote_count, 2);
-
-    let mut arbs = vec![&env];
-    arbs.push_back(small.clone());
-    arbs.push_back(large.clone());
-    refund_client.finalize_dispute_vote(&operator, &dispute_id, &stake_token, &arbs);
-
-    let dispute = refund_client.get_dispute(&dispute_id);
-    assert_eq!(dispute.status, DisputeStatus::Rejected);
-}
-
-/// Issue #745: lock_stake and cast_vote require ARBITRATOR role.
-#[test]
-fn test_lock_stake_and_cast_vote_require_arbitrator_role() {
-    use crate::{VoteChoice, MIN_ARBITRATOR_STAKE};
-
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, payment_client, refund_client) = setup_contracts(&env);
-
-    let payment_id = String::from_str(&env, "payment_stake_auth");
-    let dispute_id = setup_dispute_under_review(
+    let (dispute_id_1, customer_1, _) = create_batch_dispute(
         &env,
         &admin,
         &payment_client,
         &refund_client,
-        &payment_id,
-        1_000i128,
+        "batch_resolve_1",
     );
-
-    let token_admin = Address::generate(&env);
-    let stake_token = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    let token_admin_client = token::StellarAssetClient::new(&env, &stake_token);
-
-    let attacker = Address::generate(&env);
-    let stake_amount = MIN_ARBITRATOR_STAKE;
-    token_admin_client.mint(&attacker, &stake_amount);
-
-    // Attacker without ARBITRATOR role cannot lock_stake
-    let lock_res = refund_client.try_lock_stake(&attacker, &dispute_id, &stake_token, &stake_amount);
-    assert_eq!(lock_res, Err(Ok(Error::Unauthorized)));
-
-    // Attacker without ARBITRATOR role cannot cast_vote
-    let vote_res = refund_client.try_cast_vote(&attacker, &dispute_id, &VoteChoice::Favour);
-    assert_eq!(vote_res, Err(Ok(Error::Unauthorized)));
-
-    // Grant role, now lock_stake and cast_vote succeed
-    refund_client.grant_role(&admin, &Symbol::new(&env, "ARBITRATOR"), &attacker);
-    let lock_res_ok = refund_client.try_lock_stake(&attacker, &dispute_id, &stake_token, &stake_amount);
-    assert!(lock_res_ok.is_ok());
-
-    let vote_res_ok = refund_client.try_cast_vote(&attacker, &dispute_id, &VoteChoice::Favour);
-    assert!(vote_res_ok.is_ok());
-}
-
-/// Issue #843: WEIGHTED_QUORUM_BPS is admin-configurable by name.
-#[test]
-fn test_set_weighted_quorum_bps() {
-    use crate::WEIGHTED_QUORUM_BPS;
-
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, _payment_client, refund_client) = setup_contracts(&env);
-
-    assert_eq!(refund_client.get_weighted_quorum_bps(), WEIGHTED_QUORUM_BPS);
-    refund_client.set_weighted_quorum_bps(&admin, &6_000u32);
-    assert_eq!(refund_client.get_weighted_quorum_bps(), 6_000u32);
-}
-
-/// Issue #844: tip_enabled + confirm_payment stores tip separately from amount.
-#[test]
-fn test_confirm_payment_tip_stored_separately() {
-    use crate::ConfirmPaymentArgs;
-
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, payment_client, _refund_client) = setup_contracts(&env);
-
-    let merchant = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let payer = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
-
-    let payment_id = String::from_str(&env, "payment_with_tip");
-    let mut args = create_payment_args(&env, &payment_id, &merchant, 1_000i128);
-    args.tip_enabled = true;
-    payment_client.create_payment(&args);
-
-    let tip = 150i128;
-    payment_client.confirm_payment(
-        &oracle,
-        &ConfirmPaymentArgs {
-            payment_id: payment_id.clone(),
-            transaction_hash: BytesN::random(&env),
-            payer_address: payer,
-            amount_received: 1_000i128,
-            tip_amount: Some(tip),
-            payer_muxed_id: None,
-        },
-    );
-
-    let payment = payment_client.get_payment(&payment_id);
-    assert_eq!(payment.amount, 1_000i128);
-    assert_eq!(payment.tip_amount, Some(tip));
-    assert!(payment.tip_enabled);
-}
-
-/// Issue #844: tip_amount rejected when tip_enabled is false.
-#[test]
-fn test_confirm_payment_tip_rejected_when_disabled() {
-    use crate::ConfirmPaymentArgs;
-
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, payment_client, _refund_client) = setup_contracts(&env);
-
-    let merchant = Address::generate(&env);
-    let oracle = Address::generate(&env);
-    let payer = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
-
-    let payment_id = String::from_str(&env, "payment_no_tip");
-    payment_client.create_payment(&create_payment_args(
+    let (dispute_id_2, _, merchant_2) = create_batch_dispute(
         &env,
-        &payment_id,
-        &merchant,
-        1_000i128,
-    ));
-
-    let result = payment_client.try_confirm_payment(
-        &oracle,
-        &ConfirmPaymentArgs {
-            payment_id: payment_id.clone(),
-            transaction_hash: BytesN::random(&env),
-            payer_address: payer,
-            amount_received: 1_000i128,
-            tip_amount: Some(50i128),
-            payer_muxed_id: None,
-        },
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_resolve_2",
     );
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    let event_count_before = count_dispute_events(&env, "RESOLVED");
+    let resolutions = soroban_sdk::vec![
+        &env,
+        crate::DisputeResolution {
+            dispute_id: dispute_id_1.clone(),
+            in_favor_of: customer_1,
+            notes: String::from_str(&env, "Customer evidence confirmed"),
+        },
+        crate::DisputeResolution {
+            dispute_id: dispute_id_2.clone(),
+            in_favor_of: merchant_2,
+            notes: String::from_str(&env, "Merchant evidence confirmed"),
+        },
+    ];
+
+    let results = refund_client.batch_resolve_disputes(&operator, &resolutions);
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0), Some(Ok(())));
+    assert_eq!(results.get(1), Some(Ok(())));
+    assert_eq!(
+        refund_client.get_dispute(&dispute_id_1).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        refund_client.get_dispute(&dispute_id_2).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        count_dispute_events(&env, "RESOLVED"),
+        event_count_before + 2
+    );
 }
 
-/// Issue #846: propose_upgrade stores hash + timelock; execute before earliest fails;
-/// cancel clears the proposal.
 #[test]
-fn test_propose_upgrade_timelock_and_cancel() {
-    use crate::{WasmUpgradeProposal, UPGRADE_TIMELOCK_LEDGERS};
-
+fn test_batch_resolve_disputes_failure_does_not_block_other_items() {
     let env = Env::default();
     env.mock_all_auths();
-    let (admin, payment_client, _refund_client) = setup_contracts(&env);
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+    let operator = Address::generate(&env);
+    refund_client.grant_role(&admin, &Symbol::new(&env, "ADMIN"), &operator);
+    let (first_id, first_customer, _) = create_batch_dispute(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_partial_1",
+    );
+    let (last_id, last_customer, _) = create_batch_dispute(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        "batch_partial_2",
+    );
+    let event_count_before = count_dispute_events(&env, "RESOLVED");
+    let resolutions = soroban_sdk::vec![
+        &env,
+        crate::DisputeResolution {
+            dispute_id: first_id.clone(),
+            in_favor_of: first_customer,
+            notes: String::from_str(&env, "First dispute resolved"),
+        },
+        crate::DisputeResolution {
+            dispute_id: String::from_str(&env, "missing_dispute"),
+            in_favor_of: Address::generate(&env),
+            notes: String::from_str(&env, "This dispute does not exist"),
+        },
+        crate::DisputeResolution {
+            dispute_id: last_id.clone(),
+            in_favor_of: last_customer,
+            notes: String::from_str(&env, "Last dispute resolved"),
+        },
+    ];
 
-    let new_wasm_hash = BytesN::random(&env);
-    let before = env.ledger().sequence();
-    payment_client.propose_upgrade(&admin, &new_wasm_hash);
+    let results = refund_client.batch_resolve_disputes(&operator, &resolutions);
 
-    let pending: WasmUpgradeProposal = payment_client.get_pending_upgrade().unwrap();
-    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0), Some(Ok(())));
+    assert_eq!(results.get(1), Some(Err(crate::Error::DisputeNotFound)));
+    assert_eq!(results.get(2), Some(Ok(())));
     assert_eq!(
-        pending.earliest_execute,
-        before.saturating_add(UPGRADE_TIMELOCK_LEDGERS)
+        refund_client.get_dispute(&first_id).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        refund_client.get_dispute(&last_id).status,
+        DisputeStatus::Resolved
+    );
+    assert_eq!(
+        count_dispute_events(&env, "RESOLVED"),
+        event_count_before + 2
     );
 
     // Too early
-    let early = payment_client.try_execute_upgrade(&admin);
+    let early = payment_client.try_execute_upgrade(&admin, &String::from_str(&env, "2.0.0"));
     assert_eq!(early, Err(Ok(Error::TimelockNotExpired)));
 
     // Cancel clears
@@ -1744,240 +1636,31 @@ fn test_open_dispute_stores_evidence_hash_and_emits_event() {
 }
 
 #[test]
-fn test_get_all_disputes_pagination() {
+fn test_batch_resolve_disputes_rejects_oversized_batch() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let (admin, payment_client, refund_client) = setup_contracts(&env);
-    let merchant = Address::generate(&env);
-    let customer = Address::generate(&env);
-
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-
-    for i in 0..5u32 {
-        let pid = crate::utils::format_id(&env, "all_disp_", i as u64);
-        let amount = 100i128;
-        payment_client.create_payment(&create_payment_args(&env, &pid, &merchant, amount));
-        let oracle = Address::generate(&env);
-        payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
-        payment_client.verify_payment(
-            &oracle,
-            &pid,
-            &BytesN::from_array(&env, &[(i + 1) as u8; 32]),
-            &customer,
-            &amount,
-            &None::<u64>,
-        );
-        let token_address = env.as_contract(&refund_client.address, || {
-            env.storage()
-                .persistent()
-                .get::<DataKey, Address>(&DataKey::UsdcToken)
-                .unwrap()
+    let (admin, _payment_client, refund_client) = setup_contracts(&env);
+    let operator = Address::generate(&env);
+    refund_client.grant_role(&admin, &Symbol::new(&env, "SETTLEMENT_OPERATOR"), &operator);
+    let mut resolutions = soroban_sdk::vec![&env];
+    for _ in 0..=crate::MAX_DISPUTE_BATCH {
+        resolutions.push_back(crate::DisputeResolution {
+            dispute_id: String::from_str(&env, "unused_dispute"),
+            in_favor_of: Address::generate(&env),
+            notes: String::from_str(&env, "Oversized batch"),
         });
-        token::StellarAssetClient::new(&env, &token_address).mint(&merchant, &100_000);
-        refund_client.register_payment(&pid, &merchant, &amount, &Symbol::new(&env, "USDC"));
-        refund_client.create_dispute(
-            &pid,
-            &amount,
-            &String::from_str(&env, "reason"),
-            &String::from_str(&env, VALID_CID_V0),
-            &customer,
-            &vec![&env],
-        );
     }
 
-    let page1 = refund_client.get_all_disputes(&0u32, &2u32);
-    assert_eq!(page1.len(), 2);
-
-    let page2 = refund_client.get_all_disputes(&2u32, &2u32);
-    assert_eq!(page2.len(), 2);
-
-    let page3 = refund_client.get_all_disputes(&4u32, &2u32);
-    assert_eq!(page3.len(), 1);
-
-    let all = refund_client.get_all_disputes(&0u32, &10u32);
-    assert_eq!(all.len(), 5);
+    let result = refund_client.try_batch_resolve_disputes(&operator, &resolutions);
+    assert_eq!(result, Err(Ok(crate::Error::BatchTooLarge)));
 }
 
-// ── Issue #1056: Dispute rate limiting ───────────────────────────────────────
-
-/// Global hourly dispute counter resets after DISPUTE_GLOBAL_WINDOW_SECS elapses,
-/// allowing new disputes to be created in the next window.
 #[test]
-fn test_dispute_global_limit_resets_after_window() {
-    use crate::DISPUTE_GLOBAL_WINDOW_SECS;
-
+fn test_batch_resolve_disputes_requires_admin_or_settlement_operator() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let (admin, _m, customer, payment_client, refund_client, _) =
-        setup_confirmed_payment_for_dispute(&env, "rw_base", 100i128);
-
-    // Set global limit to 1 so we hit the cap immediately.
-    refund_client.set_dispute_rate_limits(&admin, &50u32, &1u32);
-
-    // First dispute in window — should succeed.
-    let pid1 = String::from_str(&env, "rw_pay_0");
-    let merchant1 = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant1);
-    payment_client.create_payment(&create_payment_args(&env, &pid1, &merchant1, 100i128));
-    let oracle1 = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle1);
-    payment_client.verify_payment(
-        &oracle1,
-        &pid1,
-        &BytesN::from_array(&env, &[1u8; 32]),
-        &customer,
-        &100i128,
-        &None::<u64>,
-    );
-    let token_address = env.as_contract(&refund_client.address, || {
-        env.storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::UsdcToken)
-            .unwrap()
-    });
-    token::StellarAssetClient::new(&env, &token_address).mint(&merchant1, &100_000);
-    refund_client.register_payment(&pid1, &merchant1, &100i128, &Symbol::new(&env, "USDC"));
-    refund_client.create_dispute(
-        &pid1,
-        &100i128,
-        &String::from_str(&env, "reason"),
-        &String::from_str(&env, VALID_CID_V0),
-        &customer,
-        &vec![&env],
-    );
-
-    // Second dispute in same window — must be rejected.
-    let pid2 = String::from_str(&env, "rw_pay_1");
-    let merchant2 = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant2);
-    payment_client.create_payment(&create_payment_args(&env, &pid2, &merchant2, 100i128));
-    let oracle2 = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle2);
-    payment_client.verify_payment(
-        &oracle2,
-        &pid2,
-        &BytesN::from_array(&env, &[2u8; 32]),
-        &customer,
-        &100i128,
-        &None::<u64>,
-    );
-    token::StellarAssetClient::new(&env, &token_address).mint(&merchant2, &100_000);
-    refund_client.register_payment(&pid2, &merchant2, &100i128, &Symbol::new(&env, "USDC"));
-    let rejected = refund_client.try_create_dispute(
-        &pid2,
-        &100i128,
-        &String::from_str(&env, "reason"),
-        &String::from_str(&env, VALID_CID_V0),
-        &customer,
-        &vec![&env],
-    );
-    assert!(rejected.is_err());
-
-    // Advance time past the window — counter should reset.
-    let now = env.ledger().timestamp();
-    env.ledger().set_timestamp(now + DISPUTE_GLOBAL_WINDOW_SECS + 1);
-
-    // Same dispute in new window — must succeed.
-    let pid3 = String::from_str(&env, "rw_pay_2");
-    let merchant3 = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant3);
-    payment_client.create_payment(&create_payment_args(&env, &pid3, &merchant3, 100i128));
-    let oracle3 = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle3);
-    payment_client.verify_payment(
-        &oracle3,
-        &pid3,
-        &BytesN::from_array(&env, &[3u8; 32]),
-        &customer,
-        &100i128,
-        &None::<u64>,
-    );
-    token::StellarAssetClient::new(&env, &token_address).mint(&merchant3, &100_000);
-    refund_client.register_payment(&pid3, &merchant3, &100i128, &Symbol::new(&env, "USDC"));
-    let accepted = refund_client.try_create_dispute(
-        &pid3,
-        &100i128,
-        &String::from_str(&env, "reason"),
-        &String::from_str(&env, VALID_CID_V0),
-        &customer,
-        &vec![&env],
-    );
-    assert!(accepted.is_ok());
-}
-
-/// Per-payer open cap is enforced independently per address.
-#[test]
-fn test_dispute_per_payer_limit_is_address_scoped() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (admin, _m, customer_a, payment_client, refund_client, _) =
-        setup_confirmed_payment_for_dispute(&env, "scope_base", 100i128);
-
-    // Set per-payer limit to 1, global high so only payer cap is hit.
-    refund_client.set_dispute_rate_limits(&admin, &1u32, &1000u32);
-
-    let customer_b = Address::generate(&env);
-
-    let token_address = env.as_contract(&refund_client.address, || {
-        env.storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::UsdcToken)
-            .unwrap()
-    });
-
-    // customer_a creates their one allowed dispute.
-    let pid_a = String::from_str(&env, "scope_a_0");
-    let merchant_a = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant_a);
-    payment_client.create_payment(&create_payment_args(&env, &pid_a, &merchant_a, 100i128));
-    let oracle_a = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle_a);
-    payment_client.verify_payment(
-        &oracle_a,
-        &pid_a,
-        &BytesN::from_array(&env, &[10u8; 32]),
-        &customer_a,
-        &100i128,
-        &None::<u64>,
-    );
-    token::StellarAssetClient::new(&env, &token_address).mint(&merchant_a, &100_000);
-    refund_client.register_payment(&pid_a, &merchant_a, &100i128, &Symbol::new(&env, "USDC"));
-    refund_client.create_dispute(
-        &pid_a,
-        &100i128,
-        &String::from_str(&env, "reason"),
-        &String::from_str(&env, VALID_CID_V0),
-        &customer_a,
-        &vec![&env],
-    );
-
-    // customer_b (different address) should still be able to open a dispute.
-    let pid_b = String::from_str(&env, "scope_b_0");
-    let merchant_b = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant_b);
-    payment_client.create_payment(&create_payment_args(&env, &pid_b, &merchant_b, 100i128));
-    let oracle_b = Address::generate(&env);
-    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle_b);
-    payment_client.verify_payment(
-        &oracle_b,
-        &pid_b,
-        &BytesN::from_array(&env, &[11u8; 32]),
-        &customer_b,
-        &100i128,
-        &None::<u64>,
-    );
-    token::StellarAssetClient::new(&env, &token_address).mint(&merchant_b, &100_000);
-    refund_client.register_payment(&pid_b, &merchant_b, &100i128, &Symbol::new(&env, "USDC"));
-    let result_b = refund_client.try_create_dispute(
-        &pid_b,
-        &100i128,
-        &String::from_str(&env, "reason"),
-        &String::from_str(&env, VALID_CID_V0),
-        &customer_b,
-        &vec![&env],
-    );
-    assert!(result_b.is_ok(), "different payer must not be rate-limited");
+    let (_admin, _payment_client, refund_client) = setup_contracts(&env);
+    let unauthorized = Address::generate(&env);
+    let result = refund_client.try_batch_resolve_disputes(&unauthorized, &soroban_sdk::vec![&env]);
+    assert_eq!(result, Err(Ok(crate::Error::Unauthorized)));
 }

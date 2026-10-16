@@ -48,6 +48,7 @@ export const payments = pgTable(
     amount: bigint("amount", { mode: "bigint" }).notNull(),
     currency: varchar("currency", { length: 50 }),
     status: varchar("status", { length: 50 }),
+    paymentLinkId: varchar("payment_link_id", { length: 255 }),
     createdAt: timestamp("created_at"),
     updatedAt: timestamp("updated_at").defaultNow(),
     // Issue #840: reconciliation export columns
@@ -61,6 +62,31 @@ export const payments = pgTable(
     paymentIdIdx: index("idx_payment_id").on(t.paymentId),
     merchantIdIdx: index("idx_merchant_id").on(t.merchantId),
     statusIdx: index("idx_status").on(t.status),
+    paymentLinkIdIdx: index("idx_payments_payment_link_id").on(t.paymentLinkId),
+  }),
+);
+
+export const paymentLinks = pgTable(
+  "payment_links",
+  {
+    linkId: varchar("link_id", { length: 255 }).primaryKey(),
+    merchantId: varchar("merchant_id", { length: 255 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    merchantCreatedIdx: index("idx_payment_links_merchant").on(t.merchantId, t.createdAt),
+  }),
+);
+
+export const paymentLinkViews = pgTable(
+  "payment_link_views",
+  {
+    id: serial("id").primaryKey(),
+    linkId: varchar("link_id", { length: 255 }).notNull(),
+    viewedAt: timestamp("viewed_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    linkViewedAtIdx: index("idx_payment_link_views_link_time").on(t.linkId, t.viewedAt),
   }),
 );
 
@@ -123,17 +149,56 @@ export const streamWithdrawals = pgTable("stream_withdrawals", {
   recipient: varchar("recipient", { length: 255 }),
   amount: bigint("amount", { mode: "bigint" }),
   remainingDeposit: bigint("remaining_deposit", { mode: "bigint" }),
+  memo: varchar("memo", { length: 255 }),
   createdAt: timestamp("created_at"),
 });
 
 export const subscriptions = pgTable("subscriptions", {
   id: serial("id").primaryKey(),
   subscriptionId: varchar("subscription_id", { length: 255 }).notNull().unique(),
+  merchantId: varchar("merchant_id", { length: 255 }),
+  planId: varchar("plan_id", { length: 255 }),
   payer: varchar("payer", { length: 255 }),
   status: varchar("status", { length: 50 }),
   createdAt: timestamp("created_at"),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
+
+export const subscriptionPlans = pgTable(
+  "subscription_plans",
+  {
+    planId: varchar("plan_id", { length: 255 }).primaryKey(),
+    merchantId: varchar("merchant_id", { length: 255 }).notNull(),
+    amount: bigint("amount", { mode: "bigint" }).notNull(),
+    intervalSecs: bigint("interval_secs", { mode: "bigint" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    merchantIdIdx: index("idx_subscription_plans_merchant").on(t.merchantId),
+  }),
+);
+
+export const subscriptionMetricEvents = pgTable(
+  "subscription_metric_events",
+  {
+    eventId: varchar("event_id", { length: 255 }).primaryKey(),
+    subscriptionId: varchar("subscription_id", { length: 255 }).notNull(),
+    merchantId: varchar("merchant_id", { length: 255 }).notNull(),
+    planId: varchar("plan_id", { length: 255 }),
+    eventType: varchar("event_type", { length: 50 }).notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    merchantTimeIdx: index("idx_subscription_metric_events_merchant_time").on(
+      t.merchantId,
+      t.occurredAt,
+    ),
+    subscriptionTimeIdx: index("idx_subscription_metric_events_subscription_time").on(
+      t.subscriptionId,
+      t.occurredAt,
+    ),
+  }),
+);
 
 export const invoices = pgTable("invoices", {
   id: serial("id").primaryKey(),

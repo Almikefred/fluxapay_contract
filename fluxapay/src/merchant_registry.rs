@@ -265,6 +265,8 @@ pub enum MerchantDataKey {
     ContractMetadata(Symbol),
     /// Issue #777: Monthly processing volume per merchant, keyed by (merchant_address, month_code)
     MerchantMonthlyVolume(Address, u32),
+    /// Stored semantic contract version. Appended to preserve existing key discriminants.
+    ContractVersion,
 }
 
 /// ~3 years at 5s/ledger — mirrors `LONG_LIVE_TTL` in lib.rs (issue #667).
@@ -325,6 +327,7 @@ pub enum MerchantError {
     /// Issue #777: Payment amount or monthly volume exceeds the merchant's KYC tier limit.
     KycLimitExceeded = 12,
     PageSizeTooLarge = 13,
+    InvalidVersion = 14,
 }
 
 #[cfg_attr(
@@ -333,8 +336,49 @@ pub enum MerchantError {
 )]
 #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl MerchantRegistry {
-    pub fn version() -> u32 {
-        1
+    /// Returns the current contract version string from persistent storage.
+    pub fn version(env: Env) -> String {
+        env.storage()
+            .persistent()
+            .get(&MerchantDataKey::ContractVersion)
+            .unwrap_or_else(|| String::from_str(&env, INITIAL_CONTRACT_VERSION))
+    }
+
+    /// Admin-only: update the stored contract version after a WASM upgrade.
+    pub fn set_version(env: Env, admin: Address, version: String) -> Result<(), MerchantError> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(MerchantError::Unauthorized);
+        }
+        if !crate::utils::is_valid_contract_version(&version) {
+            return Err(MerchantError::InvalidVersion);
+        }
+
+        let old_version = Self::version(env.clone());
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::ContractVersion, &version);
+        env.storage().instance().set(
+            &MerchantDataKey::ContractMetadata(Symbol::new(&env, "version")),
+            &version,
+        );
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage().persistent().extend_ttl(
+            &MerchantDataKey::ContractVersion,
+            threshold,
+            LONG_LIVE_TTL,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(threshold, LONG_LIVE_TTL);
+        env.events().publish(
+            (
+                Symbol::new(&env, "CONTRACT"),
+                Symbol::new(&env, "VERSION_UPDATED"),
+            ),
+            (old_version, version),
+        );
+        Ok(())
     }
 
     /// Initialize the contract with an admin address
@@ -345,6 +389,10 @@ impl MerchantRegistry {
         env.storage()
             .persistent()
             .set(&MerchantDataKey::Admin, &admin);
+        let initial_version = String::from_str(&env, INITIAL_CONTRACT_VERSION);
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::ContractVersion, &initial_version);
         AccessControl::initialize(&env, admin.clone());
 
         // Default limits for Unverified tier (max 100 USDC in stroops, assuming 7 decimals: 100 * 10^7)
@@ -364,7 +412,7 @@ impl MerchantRegistry {
         );
         env.storage().instance().set(
             &MerchantDataKey::ContractMetadata(Symbol::new(&env, "version")),
-            &String::from_str(&env, "1"),
+            &initial_version,
         );
         env.storage().instance().set(
             &MerchantDataKey::ContractMetadata(Symbol::new(&env, "deployed_at")),

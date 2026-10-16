@@ -22,6 +22,8 @@ export interface SEP10JWTClaims {
   iss: string;
   /** Subject — the authenticated Stellar account (merchant or admin). */
   sub: string;
+  /** Merchant identifier resolved during SEP-10 authentication, when available. */
+  merchant_id?: string;
   iat: number;
   exp: number;
   /** Optional scope claim, e.g. "merchant" or "admin". */

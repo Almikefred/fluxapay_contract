@@ -4136,6 +4136,79 @@ fn test_version_after_init() {
     assert_eq!(get_ver, String::from_str(&env, "1.0.0"));
 }
 
+#[test]
+fn test_payment_processor_set_version_validates_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    assert_eq!(client.version(), String::from_str(&env, "1.0.0"));
+    let new_version = String::from_str(&env, "2.3.1");
+    client.set_version(&admin, &new_version);
+    assert_eq!(client.version(), new_version);
+    let version_event_emitted = env.events().all().events().iter().any(|event| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1;
+        if topics.len() < 2 {
+            return false;
+        }
+        let topic0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let topic1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (topic0, topic1),
+            (Ok(namespace), Ok(name))
+                if namespace == Symbol::new(&env, "CONTRACT")
+                    && name == Symbol::new(&env, "VERSION_UPDATED")
+        )
+    });
+    assert!(version_event_emitted);
+
+    assert_eq!(
+        client.try_set_version(&admin, &String::from_str(&env, "")),
+        Err(Ok(Error::InvalidVersion))
+    );
+    assert_eq!(
+        client.try_set_version(
+            &admin,
+            &String::from_str(&env, "123456789012345678901234567890123")
+        ),
+        Err(Ok(Error::InvalidVersion))
+    );
+    assert_eq!(
+        client.try_set_version(&admin, &String::from_str(&env, "2.3")),
+        Err(Ok(Error::InvalidVersion))
+    );
+    assert_eq!(client.version(), new_version);
+
+    let non_admin = Address::generate(&env);
+    assert_eq!(
+        client.try_set_version(&non_admin, &String::from_str(&env, "3.0.0")),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_refund_manager_set_version() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    assert_eq!(client.version(), String::from_str(&env, "1.0.0"));
+    let new_version = String::from_str(&env, "1.4.0");
+    client.set_version(&admin, &new_version);
+    assert_eq!(client.version(), new_version);
+    assert_eq!(
+        client.try_set_version(&admin, &String::from_str(&env, "1..0")),
+        Err(Ok(Error::InvalidVersion))
+    );
+    assert_eq!(client.version(), new_version);
+
+    let non_admin = Address::generate(&env);
+    assert_eq!(
+        client.try_set_version(&non_admin, &String::from_str(&env, "2.0.0")),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
 // =============================================================================
 // Settlement fee rate (set_fee_rate / get_treasury_balance) tests
 // =============================================================================

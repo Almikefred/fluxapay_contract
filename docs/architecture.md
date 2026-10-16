@@ -73,6 +73,17 @@ PaymentLinkManager
   └─ stores links independently (no external calls)
 ```
 
+## Subscription Metrics (#1083)
+
+The indexer retains subscription plan ownership/pricing and lifecycle events
+from `SUBSCRIPTION` contract events. The merchant-scoped
+`GET /v1/subscriptions/metrics?merchant_id=...&period=YYYY-MM` endpoint uses
+that history to calculate active subscribers at the start of the month, churn,
+trial conversions, and dunning recoveries; current subscription state and plan
+amounts supply active subscriber count, past-due count, and MRR. API responses
+are cached for five minutes and require a merchant-bound API key with the
+`read:analytics` scope (admin keys may query any merchant).
+
 ### Key Call Flows
 
 **Payment Creation Flow:**
@@ -98,6 +109,21 @@ PaymentLinkManager
 4. Refund status updated to PROCESSED
 5. Refund event emitted
 6. Funds transferred to original payer
+
+**Swap and Pay Protection:**
+`PaymentProcessor::swap_and_pay()` applies a default 50 bps (0.5%) minimum
+output floor relative to the on-chain DEX quote, in addition to the caller's
+`amount_out_min`. If an FX oracle and pair are provided, the quoted output is
+also checked against that independent reference and rejected when adverse
+price impact exceeds 100 bps (1%). Swaps without an oracle still receive the
+minimum-output and volume protections, but cannot be checked against a
+reference-market price.
+
+The PaymentProcessor tracks successful `amount_in` swap volume for the current
+ledger sequence in instance storage. A swap that would exceed the default
+10,000,000,000,000-unit per-ledger cap is rejected before calling the DEX.
+Admin accounts can adjust all three defaults with `set_swap_limits`; the
+volume counter starts fresh when the ledger sequence changes.
 
 ---
 
@@ -421,6 +447,27 @@ pub fn execute_swap(
 - **Arbitration Voting**: Stake-locked voting with threshold ensures fair dispute resolution
 - **Two-Step Admin Transfer**: Prevents accidental admin loss via `pending_admin` + `claim_admin()`
 - **Metadata Validation**: Payment links enforce max key count (20) and value length (256 chars)
+
+## Indexer Event Replay
+
+The indexer can recover contract events missed during downtime through
+`POST /v1/admin/replay`, which accepts `from_ledger` and `to_ledger` in the
+JSON request body. The inclusive ledger range is limited to 10,000 ledgers and
+the caller must provide an API key with the `admin` scope. The legacy
+`POST /admin/replay` route remains available for existing operator clients.
+
+Replay reads contract events from the configured Soroban RPC endpoint, then
+passes each event through the normal persistence pipeline. `event_id` is
+unique in `contract_events`; an already-stored event is skipped without
+reapplying its payment, refund, or dispute update. Newly stored events update
+the typed index tables and dispatch matching enabled merchant webhooks. Replay
+webhook envelopes include `replayed: true` at the top level and in `data`, so
+consumers can distinguish recovery deliveries from live notifications.
+
+The endpoint streams progress and a final summary as Server-Sent Events. Each
+update reports processed events, newly stored events, and skipped duplicates.
+RPC or persistence errors are surfaced as an SSE error rather than reported as
+a successful replay.
 
 ## Error Codes
 
