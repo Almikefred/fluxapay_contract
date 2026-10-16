@@ -821,15 +821,18 @@ impl MerchantRegistry {
             return Err(MerchantError::Unauthorized);
         }
 
-        merchant.kyc_tier = new_tier;
+        // Issue #1015: capture the old tier so MERCHANT/TIER_UPGRADED can
+        // report both sides of the transition.
+        let old_tier = merchant.kyc_tier.clone();
+        merchant.kyc_tier = new_tier.clone();
 
         env.storage()
             .persistent()
             .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
 
         env.events().publish(
-            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "KYC_UPGRADED")),
-            merchant_id,
+            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "TIER_UPGRADED")),
+            (merchant_id, old_tier, new_tier),
         );
 
         Ok(())

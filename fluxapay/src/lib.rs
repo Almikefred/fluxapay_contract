@@ -1191,6 +1191,35 @@ impl RefundManager {
             .get(&DataKey::FeeSplitConfig)
     }
 
+    /// Issue #1016: Wire RefundManager to the MerchantRegistry contract so that
+    /// `process_refund` can look up a merchant's KYC tier and apply the
+    /// tier-specific refund fee (Basic/Unverified 100 bps, Full 80 bps,
+    /// Business 50 bps) instead of always falling back to the flat default.
+    /// Admin only.
+    pub fn set_merchant_registry_address(
+        env: Env,
+        admin: Address,
+        registry_address: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantRegistryAddress, &registry_address);
+        Ok(())
+    }
+
+    /// Get the MerchantRegistry contract address used for tiered refund fee lookups.
+    pub fn get_merchant_registry_address(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantRegistryAddress)
+    }
+
     /// Returns all addresses currently holding the given role (issue #37).
     pub fn get_role_members(env: Env, role: Symbol) -> Vec<Address> {
         AccessControl::get_role_members(&env, &role)
@@ -1727,9 +1756,12 @@ impl RefundManager {
             );
         }
         
+        // Issue #1016: include the applied tier-specific fee rate (in bps)
+        // in the event payload so off-chain indexers can reconcile exactly
+        // how much was withheld without re-deriving the merchant's tier.
         env.events().publish(
             (Symbol::new(env, "REFUND"), Symbol::new(env, "COMPLETED")),
-            (refund.payment_id, refund_id, refund.amount),
+            (refund.payment_id, refund_id, refund.amount, fee_bps),
         );
 
         Ok(())
@@ -1880,7 +1912,16 @@ impl RefundManager {
             .persistent()
             .get(&DataKey::CurrentFee)
             .unwrap_or(REFUND_FEE_BPS);
-        let fee = refund_amount * default_fee_bps / 10_000;
+
+        // Issue #1016: Apply the tiered refund fee for this merchant's KYC tier
+        // (we already fetched `merchant` above to gate high-trust eligibility).
+        let fee_bps = match merchant.kyc_tier {
+            crate::merchant_registry::KycTier::Business => REFUND_FEE_BPS_BUSINESS,
+            crate::merchant_registry::KycTier::Full => REFUND_FEE_BPS_FULL,
+            crate::merchant_registry::KycTier::Basic => REFUND_FEE_BPS_BASIC,
+            crate::merchant_registry::KycTier::Unverified => default_fee_bps,
+        };
+        let fee = refund_amount * fee_bps / 10_000;
         let net_amount = refund_amount - fee;
 
         let mut refund = Self::get_refund_internal(&env, &refund_id)?;
@@ -1906,7 +1947,7 @@ impl RefundManager {
 
         env.events().publish(
             (Symbol::new(&env, "REFUND"), Symbol::new(&env, "COMPLETED")),
-            (refund.payment_id, refund_id.clone(), refund_amount),
+            (refund.payment_id, refund_id.clone(), refund_amount, fee_bps),
         );
 
         Ok(refund_id)

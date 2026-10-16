@@ -340,6 +340,40 @@ Content-Type: application/json
 
 ---
 
+## Implementation Status
+
+The on-chain half of this design (`AnchorConfig` on `MerchantRecord`,
+`set_merchant_anchor`, and the `(PAYMENT, ANCHOR_WITHDRAW, merchant_id,
+anchor_domain)` event emitted from `settle_payment`) is implemented in
+`fluxapay/src/merchant_registry.rs` and `fluxapay/src/lib.rs`.
+
+The off-chain Settlement Service described above is implemented in
+`indexer/src/settlement.ts` (`SettlementService`), wired into the event
+subscription loop in `indexer/src/index.ts`:
+
+- `index.ts` decodes every `PAYMENT/ANCHOR_WITHDRAW` event with
+  `stellar-sdk`'s `scValToNative` and calls `SettlementService.settle(...)`.
+- `settle()` POSTs the SEP-6 `/transactions/withdrawal` request (falling
+  back to `sep24_endpoint` when a merchant has no `sep6_endpoint`
+  configured), then polls `/transaction?id=...` up to 10 times, 30 seconds
+  apart.
+- Progress is persisted in the `settlements` table
+  (`indexer/migrations/001_initial_schema.sql`) keyed by `payment_id`, so a
+  re-delivered event (e.g. after an RPC reorg) is a no-op once a terminal
+  status (`fiat_sent` / `failed`) has been reached.
+- `SETTLEMENT/FIAT_SENT` and `SETTLEMENT/FIAT_FAILED` are emitted to
+  listeners registered via `onSettlementEvent` (the indexer currently logs
+  them; a future callback-webhook notifier can subscribe the same way).
+
+This does not yet include the SEP-10 JWT auth step or the SEP-24 interactive
+fallback UI hand-off described above — those remain follow-up work. The
+dead-letter queue and ops dashboard described under "Security
+Considerations" and "Failure Handling" are also not yet implemented; today
+a failed settlement is simply recorded with `status = 'failed'` in the
+`settlements` table for manual follow-up.
+
+---
+
 ## Reference: Stellar Ecosystem Proposals
 
 - [SEP-1: Stellar Info File (TOML)](https://stellar.org/protocol/sep-1) — used to discover anchor transfer servers from `anchor_domain`.

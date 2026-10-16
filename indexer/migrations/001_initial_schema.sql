@@ -113,6 +113,24 @@ CREATE TABLE IF NOT EXISTS invoices (
   INDEX idx_status (status)
 );
 
+-- Settlements table: tracks the off-chain SEP-6/SEP-24 USDC-to-fiat offramp
+-- triggered by PAYMENT/ANCHOR_WITHDRAW events (see settlement.ts).
+CREATE TABLE IF NOT EXISTS settlements (
+  id SERIAL PRIMARY KEY,
+  payment_id VARCHAR(255) UNIQUE NOT NULL,
+  merchant_id VARCHAR(255) NOT NULL,
+  anchor_domain VARCHAR(255) NOT NULL,
+  anchor_txn_id VARCHAR(255),
+  amount BIGINT NOT NULL,
+  currency VARCHAR(50),
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_settlement_payment_id (payment_id),
+  INDEX idx_settlement_merchant_id (merchant_id),
+  INDEX idx_settlement_status (status)
+);
+
 -- Indexer checkpoint table (tracks sync progress)
 CREATE TABLE IF NOT EXISTS indexer_checkpoint (
   id SERIAL PRIMARY KEY,
