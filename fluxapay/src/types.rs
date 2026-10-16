@@ -533,6 +533,17 @@ pub struct SwapRoute {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseScope {
+    All,
+    CreatePayment,
+    VerifyPayment,
+    SettlePayment,
+    CreateRefund,
+    Swap,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseState {
     pub paused: bool,
     pub reason: String,

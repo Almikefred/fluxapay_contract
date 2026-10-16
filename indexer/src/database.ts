@@ -37,6 +37,7 @@ import {
   deadLetterEvents,
   settlements,
   feeCollectionHistory,
+  merchantInvoiceSequences,
   paymentLinks,
   subscriptionPlans,
   subscriptionMetricEvents,
@@ -323,6 +324,7 @@ export class Database {
               disputeId: String(value.dispute_id),
               paymentId: String(value.payment_id),
               amount: BigInt(String(value.amount ?? 0)),
+              disputer: value.disputer != null ? String(value.disputer) : null,
               status,
               createdAt: ts,
               escalated: false,
@@ -435,6 +437,72 @@ export class Database {
         break;
 
       case "subscriptions":
+        if (event.topic[1] === "CHARGED") {
+          const subscriptionId = String(value.subscription_id);
+          const merchantId = String(value.merchant_id);
+          const cycleNumber = Number(value.total_payments ?? 1);
+          const existingInvoice = await tx
+            .select({ invoiceId: invoices.invoiceId })
+            .from(invoices)
+            .where(
+              and(
+                eq(invoices.subscriptionId, subscriptionId),
+                eq(invoices.cycleNumber, cycleNumber),
+              ),
+            )
+            .limit(1);
+
+          if (existingInvoice.length === 0) {
+            const [sequence] = await tx
+              .insert(merchantInvoiceSequences)
+              .values({ merchantId, nextNumber: 1 })
+              .onConflictDoUpdate({
+                target: merchantInvoiceSequences.merchantId,
+                set: { nextNumber: sql`${merchantInvoiceSequences.nextNumber} + 1` },
+              })
+              .returning({ number: merchantInvoiceSequences.nextNumber });
+            const invoiceNumber = `INV-${String(sequence.number).padStart(5, "0")}`;
+            await tx.insert(invoices).values({
+              invoiceId: `${subscriptionId}-${cycleNumber}`,
+              invoiceNumber,
+              merchantId,
+              subscriptionId,
+              cycleNumber,
+              subscriber: value.payer != null ? String(value.payer) : null,
+              subscriberEmail: value.subscriber_email != null
+                ? String(value.subscriber_email)
+                : null,
+              totalAmount: BigInt(String(value.amount ?? 0)),
+              status: "Paid",
+              createdAt: ts,
+              paidAt: ts,
+              billingPeriodStart: ts,
+              billingPeriodEnd: ts,
+            });
+          }
+        }
+        await tx
+          .insert(subscriptions)
+          .values({
+            subscriptionId: String(value.subscription_id),
+            payer: value.payer != null ? String(value.payer) : null,
+            status: value.status != null
+              ? String(value.status)
+              : event.topic[1] === "CHARGED"
+                ? "Active"
+                : null,
+            createdAt: ts,
+          })
+          .onConflictDoUpdate({
+            target: subscriptions.subscriptionId,
+            set: {
+              status: value.status != null
+                ? String(value.status)
+                : event.topic[1] === "CHARGED"
+                  ? "Active"
+                  : null,
+            },
+          });
         if (event.topic[1] === "PLAN_CREATED") {
           await tx
             .insert(subscriptionPlans)
@@ -995,8 +1063,11 @@ export class Database {
       .select({
         dispute_id: disputes.disputeId,
         payment_id: disputes.paymentId,
+        disputer: disputes.disputer,
+        merchant_id: payments.merchantId,
         amount: disputes.amount,
         status: disputes.status,
+        evidence: disputes.evidence,
         escalated: disputes.escalated,
         resolved_at: disputes.resolvedAt,
         created_at: disputes.createdAt,
@@ -1005,6 +1076,58 @@ export class Database {
       .innerJoin(payments, eq(disputes.paymentId, payments.paymentId))
       .where(and(...conditions))
       .orderBy(desc(disputes.createdAt));
+  }
+
+  async appendDisputeEvidence(disputeId: string, item: Record<string, unknown>) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = await client.query(
+        "SELECT evidence FROM disputes WHERE dispute_id = $1 FOR UPDATE",
+        [disputeId],
+      );
+      if (current.rowCount !== 1) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      const updated = await client.query(
+        `UPDATE disputes
+         SET evidence = COALESCE(evidence, '[]'::jsonb) || $2::jsonb, updated_at = NOW()
+         WHERE dispute_id = $1
+         RETURNING evidence`,
+        [disputeId, JSON.stringify([item])],
+      );
+      await client.query("COMMIT");
+      return updated.rows[0].evidence as Array<Record<string, unknown>>;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getDisputeEvidence(disputeId: string) {
+    const rows = await this.db
+      .select({ evidence: disputes.evidence })
+      .from(disputes)
+      .where(eq(disputes.disputeId, disputeId))
+      .limit(1);
+    return rows[0]?.evidence ?? null;
+  }
+
+  async getDisputeEvidenceContext(disputeId: string) {
+    const rows = await this.db
+      .select({
+        disputer: disputes.disputer,
+        merchantId: payments.merchantId,
+        evidence: disputes.evidence,
+      })
+      .from(disputes)
+      .innerJoin(payments, eq(disputes.paymentId, payments.paymentId))
+      .where(eq(disputes.disputeId, disputeId))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async getRefundById(refundId: string): Promise<unknown | null> {
@@ -1283,6 +1406,14 @@ export class Database {
       .where(eq(invoices.invoiceId, invoiceId))
       .limit(1);
     return rows[0] ?? null;
+  }
+
+  async getInvoicesBySubscription(subscriptionId: string) {
+    return this.db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.subscriptionId, subscriptionId))
+      .orderBy(asc(invoices.cycleNumber));
   }
 
   /**

@@ -2317,6 +2317,7 @@ impl RefundManager {
         receipt_hash: Option<BytesN<32>>,
         idempotency_key: Option<String>,
     ) -> Result<String, Error> {
+        Self::require_scope_not_paused(env, PauseScope::CreateRefund)?;
         if refund_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -3506,7 +3507,13 @@ impl RefundManager {
         // Issue #27: emit DISPUTE_CREATED event
         env.events().publish(
             (Symbol::new(env, "DISPUTE"), Symbol::new(env, "CREATED")),
-            (dispute_id.clone(), payment_id),
+            (
+                dispute_id.clone(),
+                payment_id,
+                amount,
+                disputer.clone(),
+                payment.merchant_id,
+            ),
         );
 
         Ok(dispute_id)
@@ -4921,6 +4928,51 @@ impl RefundManager {
         let mut dispute = Self::get_dispute_internal(&env, &dispute_id)?;
         let _ = Self::maybe_escalate_dispute_due_to_deadline(&env, &dispute_id, &mut dispute)?;
         Ok(dispute)
+    }
+
+    /// Anchor the SHA-256 hash of uploaded evidence for a dispute.
+    /// An admin relayer may submit only on behalf of a recorded participant.
+    pub fn submit_evidence(
+        env: Env,
+        admin: Address,
+        dispute_id: String,
+        submitter: Address,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if submitter != dispute.disputer && submitter != dispute.merchant_id {
+            return Err(Error::Unauthorized);
+        }
+
+        let key = DataKey::DisputeEvidenceHashes(dispute_id.clone());
+        let mut hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !hashes.contains(&evidence_hash) {
+            hashes.push_back(evidence_hash.clone());
+            env.storage().persistent().set(&key, &hashes);
+            Self::bump_ttl(&env, &key, LONG_LIVE_TTL);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "EVIDENCE_SUBMITTED")),
+            (dispute_id, submitter, evidence_hash),
+        );
+        Ok(())
+    }
+
+    pub fn get_dispute_evidence(env: Env, dispute_id: String) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceHashes(dispute_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_payment_disputes(env: Env, payment_id: String) -> Result<Vec<Dispute>, Error> {
@@ -7313,20 +7365,7 @@ impl PaymentProcessor {
         paused: bool,
         reason: String,
     ) -> Result<(), Error> {
-        admin.require_auth();
-
-        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
-            return Err(Error::Unauthorized);
-        }
-
-        let state = PauseState {
-            paused,
-            reason: reason.clone(),
-            admin: Some(admin.clone()),
-            timestamp: env.ledger().timestamp(),
-        };
-
-        env.storage().persistent().set(&DataKey::Paused, &state);
+        Self::pause_scope(env.clone(), admin.clone(), PauseScope::All, reason.clone())?;
 
         let event_name = if paused {
             Symbol::new(&env, "GLOBAL_PAUSED")
@@ -7354,22 +7393,12 @@ impl PaymentProcessor {
         paused: bool,
         reason: String,
     ) -> Result<(), Error> {
-        admin.require_auth();
-
-        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
-            return Err(Error::Unauthorized);
-        }
-
-        let state = PauseState {
-            paused,
-            reason: reason.clone(),
-            admin: Some(admin.clone()),
-            timestamp: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::CreationPaused, &state);
+        Self::pause_scope(
+            env.clone(),
+            admin.clone(),
+            PauseScope::CreatePayment,
+            reason.clone(),
+        )?;
 
         let event_name = if paused {
             Symbol::new(&env, "CREATION_PAUSED")
@@ -7381,6 +7410,98 @@ impl PaymentProcessor {
             .publish((Symbol::new(&env, "CONTRACT"), event_name), (admin, reason));
 
         Ok(())
+    }
+
+    /// Pause one operation family (or the entire contract), admin only.
+    pub fn pause_scope(
+        env: Env,
+        admin: Address,
+        scope: PauseScope,
+        reason: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let state = PauseState {
+            paused: true,
+            reason: reason.clone(),
+            admin: Some(admin.clone()),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseScope(scope.clone()), &state);
+        match &scope {
+            PauseScope::All => env.storage().persistent().set(&DataKey::Paused, &state),
+            PauseScope::CreatePayment => env
+                .storage()
+                .persistent()
+                .set(&DataKey::CreationPaused, &state),
+            _ => {}
+        }
+        env.events().publish(
+            (Symbol::new(&env, "CONTRACT"), Symbol::new(&env, "SCOPE_PAUSED")),
+            (admin, scope, reason),
+        );
+        Ok(())
+    }
+
+    /// Resume one operation family (or the entire contract), admin only.
+    pub fn unpause_scope(
+        env: Env,
+        admin: Address,
+        scope: PauseScope,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let state = PauseState {
+            paused: false,
+            reason: String::from_str(&env, ""),
+            admin: Some(admin.clone()),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseScope(scope.clone()), &state);
+        match &scope {
+            PauseScope::All => env.storage().persistent().set(&DataKey::Paused, &state),
+            PauseScope::CreatePayment => env
+                .storage()
+                .persistent()
+                .set(&DataKey::CreationPaused, &state),
+            _ => {}
+        }
+        env.events().publish(
+            (Symbol::new(&env, "CONTRACT"), Symbol::new(&env, "SCOPE_UNPAUSED")),
+            (admin, scope),
+        );
+        Ok(())
+    }
+
+    /// Return all operation scopes currently paused.
+    pub fn get_paused_scopes(env: Env) -> Vec<PauseScope> {
+        let mut scopes = Vec::new(&env);
+        for scope in [
+            PauseScope::All,
+            PauseScope::CreatePayment,
+            PauseScope::VerifyPayment,
+            PauseScope::SettlePayment,
+            PauseScope::CreateRefund,
+            PauseScope::Swap,
+        ] {
+            if Self::get_pause_state(&env, &scope)
+                .map(|state| state.paused)
+                .unwrap_or(false)
+            {
+                scopes.push_back(scope);
+            }
+        }
+        scopes
     }
 
     /// Legacy wrapper for set_global_pause
@@ -7404,9 +7525,7 @@ impl PaymentProcessor {
     /// payments to be confirmed, settled, and refunded. Use `set_global_pause` instead when
     /// all operations need to be halted.
     pub fn get_creation_pause_info(env: Env) -> PauseState {
-        env.storage()
-            .persistent()
-            .get::<DataKey, PauseState>(&DataKey::CreationPaused)
+        Self::get_pause_state(&env, &PauseScope::CreatePayment)
             .unwrap_or(PauseState {
                 paused: false,
                 reason: String::from_str(&env, ""),
@@ -7425,16 +7544,10 @@ impl PaymentProcessor {
             timestamp: 0,
         };
 
-        let global = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PauseState>(&DataKey::Paused)
+        let global = Self::get_pause_state(&env, &PauseScope::All)
             .unwrap_or_else(|| default_state.clone());
 
-        let creation = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PauseState>(&DataKey::CreationPaused)
+        let creation = Self::get_pause_state(&env, &PauseScope::CreatePayment)
             .unwrap_or(default_state);
 
         PauseInfo { global, creation }
@@ -7442,36 +7555,53 @@ impl PaymentProcessor {
 
     /// Get the current global paused state.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .persistent()
-            .get::<DataKey, PauseState>(&DataKey::Paused)
+        Self::get_pause_state(&env, &PauseScope::All)
             .map(|s| s.paused)
             .unwrap_or(false)
     }
 
-    /// Check if contract is globally paused and return error if so.
-    fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::is_paused(env.clone()) {
+    fn get_pause_state(env: &Env, scope: &PauseScope) -> Option<PauseState> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::PauseScope(scope.clone()))
+            .or_else(|| match scope {
+                PauseScope::All => env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, PauseState>(&DataKey::Paused),
+                PauseScope::CreatePayment => env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, PauseState>(&DataKey::CreationPaused),
+                _ => None,
+            })
+    }
+
+    fn require_scope_not_paused(env: &Env, scope: PauseScope) -> Result<(), Error> {
+        if Self::get_pause_state(env, &scope)
+            .map(|state| state.paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::ContractPaused);
+        }
+        if scope != PauseScope::All
+            && Self::get_pause_state(env, &PauseScope::All)
+                .map(|state| state.paused)
+                .unwrap_or(false)
+        {
             return Err(Error::ContractPaused);
         }
         Ok(())
     }
 
+    /// Check if contract is globally paused and return error if so.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        Self::require_scope_not_paused(env, PauseScope::All)
+    }
+
     /// Check if payment creation is paused (either globally or specifically for creation).
     fn require_creation_not_paused(env: &Env) -> Result<(), Error> {
-        Self::require_not_paused(env)?;
-
-        let creation_paused: bool = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PauseState>(&DataKey::CreationPaused)
-            .map(|s| s.paused)
-            .unwrap_or(false);
-
-        if creation_paused {
-            return Err(Error::ContractPaused);
-        }
-        Ok(())
+        Self::require_scope_not_paused(env, PauseScope::CreatePayment)
     }
 
     /// Fixed-window rate limiter per merchant.
@@ -8858,7 +8988,7 @@ impl PaymentProcessor {
         amount_received: i128,
         payer_muxed_id: Option<u64>,
     ) -> Result<PaymentStatus, Error> {
-        Self::require_not_paused(&env)?;
+        Self::require_scope_not_paused(&env, PauseScope::VerifyPayment)?;
         oracle.require_auth();
         Self::require_not_blacklisted(&env, &oracle)?;
         Self::require_not_blacklisted(&env, &payer_address)?;
@@ -10115,7 +10245,7 @@ impl PaymentProcessor {
             return Err(Error::Unauthorized);
         }
 
-        Self::require_not_paused(&env)?;
+        Self::require_scope_not_paused(&env, PauseScope::SettlePayment)?;
 
         if env
             .storage()
@@ -11072,7 +11202,7 @@ impl PaymentProcessor {
     #[allow(clippy::too_many_arguments)]
     pub fn swap_and_pay(env: Env, args: SwapAndPayArgs) -> Result<PaymentCharge, Error> {
         args.payer.require_auth();
-        Self::require_creation_not_paused(&env)?;
+        Self::require_scope_not_paused(&env, PauseScope::Swap)?;
 
         if args.amount <= 0 || args.amount_in <= 0 {
             return Err(Error::InvalidAmount);
@@ -11252,7 +11382,7 @@ impl PaymentProcessor {
         min_output_amount: i128,
     ) -> Result<PaymentCharge, Error> {
         args.payer.require_auth();
-        Self::require_creation_not_paused(&env)?;
+        Self::require_scope_not_paused(&env, PauseScope::Swap)?;
 
         if args.amount <= 0 || routes.is_empty() {
             return Err(Error::InvalidAmount);

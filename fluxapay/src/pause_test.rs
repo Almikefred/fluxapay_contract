@@ -37,6 +37,37 @@ fn test_pause_initial_state() {
 }
 
 #[test]
+fn test_operation_scope_pause_is_independent_and_queryable() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let processor_id = env.register(crate::PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &processor_id);
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    client.initialize_payment_processor(&admin);
+
+    let reason = String::from_str(&env, "Oracle maintenance");
+    client.pause_scope(&admin, &crate::PauseScope::VerifyPayment, &reason);
+
+    let scopes = client.get_paused_scopes();
+    assert!(scopes.contains(crate::PauseScope::VerifyPayment));
+    assert!(!scopes.contains(crate::PauseScope::All));
+
+    let verify_result = client.try_verify_payment(
+        &oracle,
+        &String::from_str(&env, "missing"),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &100,
+    );
+    assert!(matches!(verify_result, Err(Ok(crate::Error::ContractPaused))));
+
+    client.unpause_scope(&admin, &crate::PauseScope::VerifyPayment);
+    assert!(client.get_paused_scopes().is_empty());
+}
+
+#[test]
 fn test_global_pause_blocks_creation() {
     let env = Env::default();
     env.mock_all_auths();

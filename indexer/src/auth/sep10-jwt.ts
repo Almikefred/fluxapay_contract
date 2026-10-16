@@ -9,7 +9,7 @@
  * `SEP10Authenticator.generateJWT` byte-for-byte so tokens minted by that
  * class validate here without a shared library: a compact
  * `header.payload.signature` string (base64url segments), HMAC-SHA256 signed
- * with the server's Stellar account key used as HMAC key material.
+ * with the configured SEP10_JWT_SECRET.
  *
  * Issue #802: the `iss` claim is validated against the expected SEP-10 home
  * domain (`SEP10_HOME_DOMAIN`) so tokens minted by any other issuer are
@@ -59,15 +59,14 @@ function base64urlDecode(segment: string): Buffer {
  * Verify a SEP-10 JWT's signature, expiry, and issuer.
  *
  * @param token - The compact JWT string from the `Authorization: Bearer <token>` header.
- * @param serverPublicKey - The Stellar account whose key material signed the token
- *   (must match `STELLAR_SERVER_PUBLIC_KEY`).
- * @param expectedIssuer - The expected `iss` claim (defaults to `SEP10_HOME_DOMAIN`).
+ * @param jwtSecret - Shared secret configured on both auth service and indexer.
+ * @param expectedIssuer - The expected `iss` home domain.
  * @throws {SEP10JWTError} if the token is malformed, the signature is invalid, it has
  *   expired, or it was issued by an unexpected issuer.
  */
 export function verifySEP10JWT(
   token: string,
-  serverPublicKey: string,
+  jwtSecret: string,
   expectedIssuer: string = getExpectedHomeDomain(),
 ): SEP10JWTClaims {
   const parts = token.split(".");
@@ -78,7 +77,7 @@ export function verifySEP10JWT(
 
   const message = `${headerB64}.${payloadB64}`;
   const expectedSignature = crypto
-    .createHmac("sha256", Buffer.from(serverPublicKey, "base64"))
+    .createHmac("sha256", jwtSecret)
     .update(message)
     .digest("base64url");
 
