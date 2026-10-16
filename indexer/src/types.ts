@@ -85,11 +85,31 @@ export interface StreamEvent extends ContractEvent {
 }
 
 export interface SubscriptionEvent extends ContractEvent {
-  topic: ["SUBSCRIPTION", "CREATED" | "ACTIVE" | "CANCELLED" | "PAUSED"];
+  topic: [
+    "SUBSCRIPTION",
+    | "PLAN_CREATED"
+    | "PLAN_DEACTIVATED"
+    | "CREATED"
+    | "ACTIVE"
+    | "CHARGED"
+    | "CHARGE_FAILED"
+    | "DUNNING_TRIGGERED"
+    | "CANCELLED"
+    | "EXPIRED"
+    | "COMPLETED"
+    | "PAUSED"
+    | "RESUMED"
+    | "TRIAL_STARTED"
+    | "TRIAL_ENDED"
+  ];
   value: {
-    subscription_id: string;
-    payer: string;
-    status: string;
+    subscription_id?: string;
+    payer?: string;
+    status?: string;
+    plan_id?: string;
+    merchant_id?: string;
+    amount?: number;
+    interval_secs?: number;
   };
 }
 
@@ -125,7 +145,7 @@ export interface LinkUsedEvent extends ContractEvent {
   value: {
     link_id: string;
     payer: string;
-    amount: number;
+    amount: bigint | number;
     payment_id: string;
     metadata?: Record<string, string>;
   };

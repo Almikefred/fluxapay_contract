@@ -6,6 +6,31 @@ pub const MAX_METADATA_KEYS: u32 = 20;
 pub const MAX_METADATA_KEY_LEN: u32 = 64;
 /// Maximum length of a metadata value (characters).
 pub const MAX_METADATA_VALUE_LEN: u32 = 256;
+pub const MAX_CONTRACT_VERSION_LEN: u32 = 32;
+
+/// Validate a numeric `x.y.z` contract version with non-empty components.
+pub fn is_valid_contract_version(version: &String) -> bool {
+    let bytes = version.to_bytes();
+    let len = bytes.len();
+    if len == 0 || len > MAX_CONTRACT_VERSION_LEN {
+        return false;
+    }
+
+    let mut component_len = 0u32;
+    let mut separators = 0u32;
+    for i in 0..len {
+        match bytes.get(i) {
+            Some(b'0'..=b'9') => component_len += 1,
+            Some(b'.') if component_len > 0 && separators < 2 => {
+                separators += 1;
+                component_len = 0;
+            }
+            _ => return false,
+        }
+    }
+
+    separators == 2 && component_len > 0
+}
 
 /// Validate metadata map size and key/value length limits.
 ///

@@ -8,6 +8,7 @@ The FluxaPay Indexer is a Node.js/TypeScript service that subscribes to Soroban 
 - **Dispute Lifecycle Persistence (#615)**: Persists dispute status transitions (`RESOLVED`, `REJECTED`, `ESCALATED`) with `resolved_at` timestamps, idempotency, and safe handling for unknown disputes.
 - **Dead-Letter Queue & Automatic Retry (#617)**: Prevents event loss by storing failed events in `dead_letter_events`, auto-retrying on a configurable interval, and supporting manual replay via `POST /admin/replay-dlq`.
 - **Read-Only REST API Server (#616)**: Exposes endpoints for querying payments, merchant payments (with pagination & status filtering), disputes, refunds, events, and health status.
+- **Payment Link Analytics (#1082)**: Tracks checkout views and indexed link-use payments, with owner-scoped analytics and a seven-day conversion sparkline.
 
 ---
 
@@ -96,6 +97,25 @@ Protected endpoints use an API key via `x-api-key` or a bearer token, except `GE
 | `GET` | `/events` | Yes | Query persisted events. Supports query parameters `type` (e.g. `PAYMENT/CONFIRMED`), `from` (ledger sequence), and `to` (ledger sequence). |
 | `POST` | `/admin/replay-dlq` | Yes | Manually trigger replay of failed events in the dead-letter queue. Returns `{ attempted, succeeded, failed }`. |
 | `POST` | `/admin/replay` | Yes (Admin) | Replay and backfill missed contract events from a ledger range (`from_ledger` to `to_ledger`). Progress streamed as SSE. |
+| `POST` | `/v1/payment-links/:id/view` | No | Record a checkout-page view for an indexed link. Returns 404 for unknown links. |
+| `GET` | `/v1/payment-links` | SEP-10 merchant | List the authenticated merchant's payment links and their seven-day conversion counts. |
+| `GET` | `/v1/payment-links/:id/analytics` | SEP-10 merchant | Return views, attempts, conversions, conversion rate, revenue, and last use; links owned by other merchants return 404. |
+| `GET` | `/v1/subscriptions/metrics?merchant_id=<id>&period=YYYY-MM` | Merchant API key (`read:analytics`) | Return monthly recurring revenue, subscriber activity, churn, trial conversions, past-due count, and dunning recovery rate. |
+
+The checkout page should call `POST /v1/payment-links/{id}/view` once when
+the link checkout loads. `LINK/USED` contract events associate the resulting
+payment with the link, while confirmed/settled payment events drive conversion
+and USDC revenue totals. The analytics/list endpoints use the authenticated
+SEP-10 subject to scope every query to its owner.
+
+Subscription metrics are available for a calendar month in UTC. The API key
+must be registered to the requested merchant (`merchantId` in `API_KEYS` or
+the key registry) and include `read:analytics`; admin-scoped keys may query
+any merchant. The dashboard reads the merchant-bound key and merchant ID from
+`localStorage` keys `fluxapay_api_key` and `fluxapay_merchant_id`. Results are
+cached for five minutes. Indexing subscription plans and lifecycle events
+requires applying
+`migrations/008_subscription_metrics.sql`.
 
 ---
 

@@ -46,6 +46,33 @@ fn test_merchant_registration() {
 }
 
 #[test]
+fn test_merchant_registry_set_version() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert_eq!(client.version(), String::from_str(&env, "1.0.0"));
+    let new_version = String::from_str(&env, "3.2.1");
+    client.set_version(&admin, &new_version);
+    assert_eq!(client.version(), new_version);
+    assert_eq!(
+        client.try_set_version(&admin, &String::from_str(&env, "v3.2.1")),
+        Err(Ok(MerchantError::InvalidVersion))
+    );
+    assert_eq!(client.version(), new_version);
+
+    let non_admin = Address::generate(&env);
+    assert_eq!(
+        client.try_set_version(&non_admin, &String::from_str(&env, "4.0.0")),
+        Err(Ok(MerchantError::Unauthorized))
+    );
+}
+
+#[test]
 fn test_merchant_update() {
     let env = Env::default();
     env.mock_all_auths();

@@ -29,6 +29,41 @@ impl PaymentProcessor {
             .unwrap_or_else(|| String::from_str(&env, INITIAL_CONTRACT_VERSION))
     }
 
+    /// Admin-only: update the stored contract version after a WASM upgrade.
+    pub fn set_version(env: Env, admin: Address, version: String) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if !utils::is_valid_contract_version(&version) {
+            return Err(Error::InvalidVersion);
+        }
+
+        let old_version = Self::version(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractVersion, &version);
+        env.storage().instance().set(
+            &DataKey::ContractMetadata(Symbol::new(&env, "version")),
+            &version,
+        );
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ContractVersion, threshold, LONG_LIVE_TTL);
+        env.storage()
+            .instance()
+            .extend_ttl(threshold, LONG_LIVE_TTL);
+        env.events().publish(
+            (
+                Symbol::new(&env, "CONTRACT"),
+                Symbol::new(&env, "VERSION_UPDATED"),
+            ),
+            (old_version, version),
+        );
+        Ok(())
+    }
+
     /// Alias for version() — returns the current contract version string.
     pub fn get_version(env: Env) -> String {
         Self::version(env)
@@ -5824,11 +5859,10 @@ impl PaymentProcessor {
         Ok(())
     }
 
-    /// Execute a pending upgrade after the timelock. Reverts with
-    /// `TimelockNotExpired` if called before `earliest_execute`. Verifies the
-    /// stored hash is applied via `update_current_contract_wasm`. Emits
-    /// `UPGRADE/EXECUTED`.
-    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), Error> {
+    /// Execute a pending upgrade after the timelock, applying `new_version` to
+    /// the stored contract version. Reverts with `TimelockNotExpired` if called
+    /// before `earliest_execute`.
+    pub fn execute_upgrade(env: Env, admin: Address, new_version: String) -> Result<(), Error> {
         admin.require_auth();
         if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
             return Err(Error::Unauthorized);
@@ -5846,23 +5880,16 @@ impl PaymentProcessor {
 
         let stored_hash = proposal.new_wasm_hash.clone();
         // Hash verification: apply exactly the hash stored at propose time.
-        let old_version: String = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ContractVersion)
-            .unwrap_or_else(|| String::from_str(&env, INITIAL_CONTRACT_VERSION));
-        let new_version_str = bump_version_string(&env, &old_version);
+        let old_version = Self::version(env.clone());
 
         env.storage()
             .persistent()
             .remove(&DataKey::PendingWasmUpgrade);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ContractVersion, &new_version_str);
+        Self::set_version(env.clone(), admin, new_version.clone())?;
 
         env.events().publish(
             (Symbol::new(&env, "UPGRADE"), Symbol::new(&env, "EXECUTED")),
-            (stored_hash.clone(), old_version, new_version_str),
+            (stored_hash.clone(), old_version, new_version),
         );
 
         env.deployer().update_current_contract_wasm(stored_hash);
@@ -5992,9 +6019,7 @@ impl PaymentProcessor {
 
                 let new_version_str = bump_version_string(&env, &old_version);
                 env.deployer().update_current_contract_wasm(new_wasm_hash);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ContractVersion, &new_version_str);
+                Self::set_version(env.clone(), admin.clone(), new_version_str.clone())?;
 
                 env.events().publish(
                     (Symbol::new(&env, "CONTRACT"), Symbol::new(&env, "UPGRADED")),

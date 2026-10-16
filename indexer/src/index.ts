@@ -4,10 +4,18 @@
  * persists events to PostgreSQL, exposes dead-letter queue retry, and starts the REST API.
  */
 
-import { rpc, scValToNative, xdr } from "stellar-sdk";
+import { SorobanRpc as rpc, scValToNative } from "stellar-sdk";
 import { Database } from "./database";
 import { ContractEvent, AnyEvent, StreamEvent } from "./types";
 import { startServer } from "./server";
+import {
+  buildEnvelope,
+  deliverOnce,
+  WebhookStore as PgWebhookStore,
+  type FetchLike,
+  type WebhookEventType,
+  type WebhookStore,
+} from "./webhooks";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -21,6 +29,73 @@ export interface EventSubscriptionConfig {
   dlqRetryIntervalMs: number;
   dlqMinAgeSeconds: number;
   apiPort: number;
+}
+
+export type ReplayWebhookDispatcher = (event: AnyEvent) => Promise<void>;
+
+export interface EventSubscriberDependencies {
+  eventSource?: Pick<rpc.Server, "getEvents">;
+  replayWebhookDispatcher?: ReplayWebhookDispatcher;
+  webhookFetch?: FetchLike;
+}
+
+function getWebhookEventType(event: AnyEvent): WebhookEventType | null {
+  const [type, subtype] = event.topic;
+  const eventTypes: Record<string, WebhookEventType> = {
+    "PAYMENT/CREATED": "payment.created",
+    "PAYMENT/PENDING": "payment.pending",
+    "PAYMENT/CONFIRMED": "payment.confirmed",
+    "PAYMENT/SETTLED": "payment.confirmed",
+    "PAYMENT/PARTIALLY_PAID": "payment.partially_paid",
+    "PAYMENT/OVERPAID": "payment.overpaid",
+    "PAYMENT/FAILED": "payment.failed",
+    "PAYMENT/CANCELLED": "payment.cancelled",
+    "REFUND/CREATED": "refund.created",
+    "REFUND/COMPLETED": "refund.completed",
+    "DISPUTE/CREATED": "dispute.opened",
+    "DISPUTE/RESOLVED": "dispute.resolved",
+  };
+  return eventTypes[`${type}/${subtype}`] ?? null;
+}
+
+export function createReplayWebhookDispatcher(
+  database: Database,
+  store: WebhookStore,
+  fetch: FetchLike = globalThis.fetch as unknown as FetchLike,
+): ReplayWebhookDispatcher {
+  return async (event) => {
+    const eventType = getWebhookEventType(event);
+    if (!eventType) return;
+
+    const value = event.value as Record<string, unknown>;
+    let merchantId =
+      typeof value.merchant_id === "string" ? value.merchant_id : null;
+    if (!merchantId && typeof value.payment_id === "string") {
+      const payment = (await database.getPaymentById(value.payment_id)) as
+        | { merchant_id?: unknown }
+        | null;
+      merchantId =
+        payment && typeof payment.merchant_id === "string" ? payment.merchant_id : null;
+    }
+    if (!merchantId) {
+      console.warn(`Cannot dispatch replay webhook for event ${event.id}: merchant not found`);
+      return;
+    }
+
+    const endpoints = await store.listEnabledEndpointsForEvent(merchantId, eventType);
+    const envelope = buildEnvelope(
+      eventType,
+      { ...value, replayed: true },
+      true,
+      Date.now,
+      { eventId: event.id, replayed: true },
+    );
+
+    for (const endpoint of endpoints) {
+      const { attempt } = await deliverOnce(endpoint, envelope, 1, { fetch });
+      await store.recordAttempt(attempt);
+    }
+  };
 }
 
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): EventSubscriptionConfig {
@@ -77,19 +152,33 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): EventSu
 }
 
 export class EventSubscriber {
-  private server: rpc.Server;
+  private server: Pick<rpc.Server, "getEvents">;
   private database: Database;
   private config: EventSubscriptionConfig;
   private currentLedger: number;
   private pollTimer: NodeJS.Timeout | null = null;
   private dlqRetryTimer: NodeJS.Timeout | null = null;
+  private replayWebhookDispatcher?: ReplayWebhookDispatcher;
 
-  constructor(config: EventSubscriptionConfig, database?: Database) {
+  constructor(
+    config: EventSubscriptionConfig,
+    database?: Database,
+    dependencies: EventSubscriberDependencies = {},
+  ) {
     this.config = config;
     const allowHttp = config.rpcUrl.startsWith("http://");
-    this.server = new rpc.Server(config.rpcUrl, { allowHttp });
+    this.server = dependencies.eventSource ?? new rpc.Server(config.rpcUrl, { allowHttp });
     this.database = database || new Database(config.dbConnectionString);
     this.currentLedger = config.startLedger;
+    if (dependencies.replayWebhookDispatcher) {
+      this.replayWebhookDispatcher = dependencies.replayWebhookDispatcher;
+    } else if (typeof this.database.getPool === "function") {
+      this.replayWebhookDispatcher = createReplayWebhookDispatcher(
+        this.database,
+        new PgWebhookStore(this.database.getPool()),
+        dependencies.webhookFetch,
+      );
+    }
   }
 
   async initialize(): Promise<void> {
@@ -196,20 +285,25 @@ export class EventSubscriber {
   parseEvent(event: any): AnyEvent | null {
     try {
       const eventId = `${event.ledger}-${event.txHash}-${event.id}`;
-      const timestamp = event.timestamp || Math.floor(Date.now() / 1000);
+      const parsedLedgerTimestamp = event.ledgerClosedAt
+        ? Math.floor(Date.parse(event.ledgerClosedAt) / 1000)
+        : 0;
+      const timestamp = event.timestamp || parsedLedgerTimestamp || Math.floor(Date.now() / 1000);
       const ledger = typeof event.ledger === "number" ? event.ledger : parseInt(event.ledger, 10);
       const txHash = event.txHash || "";
-      const contractId = event.contractId || event.contract_id || "";
+      const contractId = String(event.contractId || event.contract_id || "");
 
-      const topics = Array.isArray(event.topic)
-        ? event.topic.map((topic: unknown) => {
-            if (typeof topic === "string") return topic;
-            if (topic && typeof topic === "object" && "switch" in topic) {
-              return String(scValToNative(topic as xdr.ScVal));
-            }
-            return String(topic);
-          })
-        : [];
+      const rawTopics: unknown[] = Array.isArray(event.topic) ? event.topic : [];
+      const topics = rawTopics.map((topic: unknown) => {
+        const nativeTopic =
+          topic &&
+          typeof topic === "object" &&
+          "switch" in topic &&
+          typeof topic.switch === "function"
+            ? scValToNative(topic as Parameters<typeof scValToNative>[0])
+            : topic;
+        return String(nativeTopic);
+      });
       if (topics.length < 2) {
         console.warn("Invalid event topics:", topics);
         return null;
@@ -218,7 +312,7 @@ export class EventSubscriber {
       let value: Record<string, unknown> = {};
       if (event.value) {
         try {
-          value = this.scValToObject(event.value);
+          value = this.scValToObject(event.value, topics, rawTopics);
         } catch (e) {
           console.warn("Could not parse event value:", e);
         }
@@ -291,16 +385,136 @@ export class EventSubscriber {
     }
   }
 
-  scValToObject(scval: any): Record<string, unknown> {
-    if (typeof scval === "string" || typeof scval === "number") {
-      return { value: scval };
+  scValToObject(
+    scval: unknown,
+    topics: string[] = [],
+    rawTopics: unknown[] = [],
+  ): Record<string, unknown> {
+    const value =
+      scval &&
+      typeof scval === "object" &&
+      "switch" in scval &&
+      typeof scval.switch === "function"
+        ? scValToNative(scval as Parameters<typeof scValToNative>[0])
+        : scval;
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
     }
-    if (scval && typeof scval === "object") {
-      if (scval.constructor === Object) {
-        return scval;
-      }
+    if (!Array.isArray(value)) {
+      return value === undefined ? {} : { value };
     }
-    return { raw: scval };
+
+    const topic = `${topics[0]}/${topics[1]}`;
+    switch (topic) {
+      case "PAYMENT/CREATED":
+        return {
+          payment_id: value[0],
+          merchant_id: value[1],
+          amount: value[2],
+          metadata: value[3],
+        };
+      case "PAYMENT/FAILED":
+      case "PAYMENT/OVERPAID":
+        return {
+          payment_id: value[0],
+          merchant_id: value[1],
+          amount: value[2],
+          amount_received: value[3],
+        };
+      case "PAYMENT/SETTLED":
+        return {
+          payment_id: value[0],
+          amount: value[1],
+          merchant_id: topics[2],
+        };
+      case "PAYMENT/CANCELLED":
+        return {
+          payment_id: value[0],
+          authority: value[1],
+          merchant_id: topics[2],
+        };
+      case "REFUND/CREATED":
+      case "REFUND/COMPLETED":
+        return {
+          payment_id: value[0],
+          refund_id: value[1],
+          amount: value[2],
+        };
+      case "DISPUTE/CREATED":
+      case "DISPUTE/RESOLVED":
+      case "DISPUTE/REJECTED":
+        return { dispute_id: value[0], payment_id: value[1] };
+      case "DISPUTE/ESCALATED":
+        return {
+          payment_id: value[0],
+          dispute_id: value[1],
+          amount: value[2],
+        };
+      case "LINK/CREATED":
+        return { link_id: value[0], merchant_id: value[1] };
+      case "LINK/USED":
+        return {
+          link_id: value[0],
+          payer: value[1],
+          amount: value[2],
+          payment_id: value[3],
+          metadata: value[4],
+        };
+      case "SUBSCRIPTION/PLAN_CREATED":
+        return {
+          plan_id: value[0],
+          merchant_id: value[1],
+          amount: value[2],
+          interval_secs: value[3],
+        };
+      case "SUBSCRIPTION/PLAN_DEACTIVATED":
+        return { plan_id: value[0], merchant_id: value[1] };
+      case "SUBSCRIPTION/CREATED":
+        return { subscription_id: value[0], payer: value[1], plan_id: value[2] };
+      case "SUBSCRIPTION/TRIAL_STARTED":
+        return {
+          subscription_id: value[0],
+          payer: value[1],
+          plan_id: value[2],
+          trial_ends_at: value[3],
+        };
+      case "SUBSCRIPTION/TRIAL_ENDED":
+        return { subscription_id: value[0], payer: value[1], plan_id: value[2] };
+      case "SUBSCRIPTION/CHARGED":
+        return {
+          subscription_id: value[0],
+          payer: value[1],
+          amount: value[2],
+          cycle: value[3],
+        };
+      case "SUBSCRIPTION/DUNNING_TRIGGERED":
+        return {
+          subscription_id: value[0],
+          payer: value[1],
+          dunning_attempts: value[2],
+          next_retry_at: value[3],
+        };
+      case "SUBSCRIPTION/CHARGE_FAILED":
+        return {
+          subscription_id: value[0],
+          payer: value[1],
+          amount: value[2],
+          dunning_attempts: value[3],
+        };
+      case "SUBSCRIPTION/PAUSED":
+      case "SUBSCRIPTION/RESUMED":
+        return { subscription_id: value[0], payer: value[1] };
+      case "SUBSCRIPTION/CANCELLED":
+      case "SUBSCRIPTION/EXPIRED":
+        return { subscription_id: value[0], payer: value[1] };
+      case "SUBSCRIPTION/COMPLETED":
+        return { subscription_id: value[0], total_cycles: value[1] };
+      default:
+        return {
+          raw: value,
+          ...(rawTopics[2] === undefined ? {} : { topic_value: topics[2] }),
+        };
+    }
   }
 
   async retryDLQEvents(forceAll = false): Promise<{ attempted: number; succeeded: number; failed: number }> {
@@ -341,60 +555,90 @@ export class EventSubscriber {
   async replayLedgerRange(
     fromLedger: number,
     toLedger: number,
-    onProgress?: (progress: { processed: number; total: number; stored: number; currentLedger: number }) => void,
-  ): Promise<{ processed: number; stored: number; total: number }> {
+    onProgress?: (progress: {
+      processed: number;
+      total: number;
+      stored: number;
+      skipped_duplicates?: number;
+      currentLedger?: number;
+    }) => void,
+  ): Promise<{ processed: number; stored: number; skipped_duplicates: number; total: number }> {
     const totalLedgers = Math.max(1, toLedger - fromLedger + 1);
     let processed = 0;
     let stored = 0;
+    let skippedDuplicates = 0;
     let currentStart = fromLedger;
+    let cursor: string | undefined;
+    let cursorLedger: number | undefined;
 
     while (currentStart <= toLedger) {
-      try {
-        const request: Parameters<rpc.Server["getEvents"]>[0] = {
-          filters: [
-            {
-              type: "contract",
-              contractIds: this.config.contractIds,
-            },
-          ],
-          startLedger: currentStart,
-          limit: 100,
-        };
+      const request: Parameters<rpc.Server["getEvents"]>[0] = {
+        filters: [
+          {
+            type: "contract",
+            contractIds: this.config.contractIds,
+          },
+        ],
+        startLedger: currentStart,
+        cursor,
+        limit: 100,
+      };
 
-        const response = await this.server.getEvents(request);
-        if (!response.events || response.events.length === 0) {
-          if (response.latestLedger && response.latestLedger < toLedger) {
-            currentStart = response.latestLedger + 1;
-          } else {
-            break;
-          }
+      const response = await this.server.getEvents(request);
+      if (!response.events || response.events.length === 0) {
+        if (cursor && cursorLedger !== undefined) {
+          currentStart = cursorLedger + 1;
+          cursor = undefined;
+          cursorLedger = undefined;
+          continue;
+        }
+        if (response.latestLedger && response.latestLedger < toLedger) {
+          currentStart = response.latestLedger + 1;
         } else {
-          for (const event of response.events) {
-            const ledger = typeof event.ledger === "number" ? event.ledger : parseInt(event.ledger, 10);
-            if (ledger > toLedger) break;
+          break;
+        }
+      } else {
+        for (const event of response.events) {
+          const ledger = typeof event.ledger === "number" ? event.ledger : parseInt(event.ledger, 10);
+          if (!Number.isSafeInteger(ledger) || ledger < currentStart) {
+            throw new Error(`Soroban RPC returned invalid replay event ledger: ${event.ledger}`);
+          }
+          if (ledger > toLedger) break;
 
-            processed++;
-            const eventId = `${event.ledger}-${event.txHash}-${event.id || Date.now()}`;
-            try {
-              const parsedEvent = this.parseEvent(event);
-              if (parsedEvent) {
-                const wasStored = await this.database.storeEvent(parsedEvent);
-                if (wasStored) {
-                  stored++;
-                }
-              }
-            } catch (error: any) {
-              console.error(`Error processing replay event ${eventId}:`, error);
+          processed++;
+          const parsedEvent = this.parseEvent(event);
+          if (parsedEvent) {
+            const wasStored = await this.database.storeEvent(parsedEvent);
+            if (wasStored) {
+              stored++;
+              await this.replayWebhookDispatcher?.(parsedEvent);
+            } else {
+              skippedDuplicates++;
             }
           }
-
-          const lastLedger = response.events[response.events.length - 1].ledger;
-          const lastNum = typeof lastLedger === "number" ? lastLedger : parseInt(lastLedger, 10);
-          currentStart = Math.max(currentStart + 1, lastNum + 1);
         }
-      } catch (err: any) {
-        console.error(`Replay error at ledger ${currentStart}:`, err);
-        currentStart++;
+
+        const lastLedger = response.events[response.events.length - 1].ledger;
+        const lastNum = typeof lastLedger === "number" ? lastLedger : parseInt(lastLedger, 10);
+        if (!Number.isSafeInteger(lastNum) || lastNum < currentStart) {
+          throw new Error(`Soroban RPC returned invalid replay page ledger: ${lastLedger}`);
+        }
+        if (lastNum > toLedger) {
+          break;
+        }
+        if (response.events.length >= 100) {
+          const nextCursor = response.events[response.events.length - 1].pagingToken;
+          if (!nextCursor) {
+            throw new Error("Soroban RPC replay page is full but has no paging token");
+          }
+          cursor = nextCursor;
+          cursorLedger = lastNum;
+        } else {
+          currentStart = Math.max(currentStart + 1, lastNum + 1);
+          cursor = undefined;
+          cursorLedger = undefined;
+          if (lastNum >= toLedger) break;
+        }
       }
 
       if (onProgress) {
@@ -402,6 +646,7 @@ export class EventSubscriber {
           processed,
           total: totalLedgers,
           stored,
+          skipped_duplicates: skippedDuplicates,
           currentLedger: Math.min(toLedger, currentStart),
         });
       }
@@ -412,11 +657,17 @@ export class EventSubscriber {
         processed,
         total: totalLedgers,
         stored,
+        skipped_duplicates: skippedDuplicates,
         currentLedger: toLedger,
       });
     }
 
-    return { processed, stored, total: totalLedgers };
+    return {
+      processed,
+      stored,
+      skipped_duplicates: skippedDuplicates,
+      total: totalLedgers,
+    };
   }
 
   async shutdown(): Promise<void> {
