@@ -318,26 +318,54 @@ export class EventSubscriber {
         }
       }
 
-      // Issue #766: Guard against null memo in STREAM/WITHDRAWN event handler
-      // When a stream withdrawal is triggered programmatically (no memo provided),
-      // destructuring or reading memo must never throw TypeError: Cannot read properties of null.
-      if (topics[0] === "STREAM" && topics[1] === "WITHDRAWN") {
-        let memo: string | null = null;
-        if (event.transaction && event.transaction.memo) {
-          memo = event.transaction.memo.value != null
-            ? event.transaction.memo.value.toString()
-            : (event.transaction.memo.toString?.() ?? null);
-        } else if (event.memo) {
-          memo = typeof event.memo === "object" && event.memo?.value != null
-            ? event.memo.value.toString()
-            : (event.memo.toString?.() ?? null);
-        } else if (value && typeof value === "object" && (value as any).memo !== undefined) {
-          const m = (value as any).memo;
-          memo = m && typeof m === "object" && m.value != null
-            ? m.value.toString()
-            : (m != null ? String(m) : null);
+      const decodeNativeValue = (rawValue: unknown): unknown => {
+        if (typeof rawValue === "string") {
+          return scValToNative(xdr.ScVal.fromXDR(rawValue, "base64"));
         }
-        value.memo = memo;
+        if (rawValue && typeof rawValue === "object" && "switch" in rawValue) {
+          return scValToNative(rawValue as xdr.ScVal);
+        }
+        return rawValue;
+      };
+
+      if (topics[0] === "FX_RATE" && topics[1] === "UPDATED") {
+        const decoded = decodeNativeValue(event.value);
+
+        const fields = Array.isArray(decoded)
+          ? { pair: decoded[0], rate: decoded[1], decimals: decoded[2] }
+          : decoded;
+        if (!fields || typeof fields !== "object") {
+          throw new Error("FX_RATE/UPDATED event has an invalid payload");
+        }
+
+        const fx = fields as { pair?: unknown; rate?: unknown; decimals?: unknown };
+        const pair = String(fx.pair ?? "");
+        const rate = String(fx.rate ?? "");
+        const decimals = Number(fx.decimals);
+        if (!pair || !/^[A-Z0-9]+_[A-Z0-9]+$/.test(pair) ||
+            !/^[1-9]\d*$/.test(rate) || !Number.isInteger(decimals) ||
+            decimals < 0 || decimals > 38) {
+          throw new Error("FX_RATE/UPDATED event contains an invalid pair or rate");
+        }
+        value = { pair, rate, decimals };
+      } else if (topics[0] === "DISPUTE" && topics[1] === "ADJUSTMENT") {
+        const decoded = decodeNativeValue(event.value);
+        if (!Array.isArray(decoded) || decoded.length !== 4) {
+          throw new Error("DISPUTE/ADJUSTMENT event has an invalid payload");
+        }
+        value = {
+          dispute_id: String(decoded[0]),
+          payment_id: String(decoded[1]),
+          refund_id: decoded[2] == null ? null : String(decoded[2]),
+          amount: String(decoded[3]),
+        };
+      } else if (topics[0] === "PAYMENT" && topics[1] === "FEE_TOTAL") {
+        const paymentId = topics[2] || "";
+        const amount = String(decodeNativeValue(event.value));
+        if (!paymentId || !/^\d+$/.test(amount)) {
+          throw new Error("PAYMENT/FEE_TOTAL event has an invalid payment ID or amount");
+        }
+        value = { payment_id: paymentId, amount };
       }
 
       const baseEvent: ContractEvent = {

@@ -52,17 +52,17 @@ export interface DLQRecord {
   created_at: Date;
 }
 
-export interface ReconciliationRow {
-  payment_id: string;
-  type: "payment" | "refund" | "settlement";
-  amount_usdc: string;
-  fiat_amount: string;
-  fiat_currency: string;
-  status: string;
-  created_at: string;
-  settled_at: string;
-  customer_ref: string;
-  tags: string;
+export interface MerchantOnboardingState {
+  registeredAt: Date | string;
+  kycSubmittedAt: Date | string | null;
+}
+
+export interface ReconciliationData {
+  payments: Record<string, unknown>[];
+  settlements: Record<string, unknown>[];
+  refunds: Record<string, unknown>[];
+  disputeAdjustments: Record<string, unknown>[];
+  fxRates: Record<string, unknown>[];
 }
 
 export interface PaymentLinkAnalytics {
@@ -200,6 +200,7 @@ export class Database {
             },
           });
         break;
+      }
 
       case "payment_links": {
         const [eventType, eventSubtype] = event.topic;
@@ -269,19 +270,26 @@ export class Database {
 
       case "disputes": {
         const subtype = event.topic[1];
-        if (subtype === "RESOLVED") {
-          const res = await tx
-            .update(disputes)
-            .set({
-              status: "Resolved",
-              resolvedAt: ts,
-              updatedAt: new Date(),
-            })
-            .where(eq(disputes.disputeId, String(value.dispute_id)));
-          if ((res as any).rowCount === 0) {
-            console.warn(
-              `[DisputeUpdate] Dispute ID ${value.dispute_id} not found for RESOLVED event`,
-            );
+        if (subtype === "ADJUSTMENT") {
+          await client.query(
+            `INSERT INTO dispute_adjustments (dispute_id, payment_id, refund_id, amount, created_at)
+             VALUES ($1, $2, $3, $4, to_timestamp($5))
+             ON CONFLICT (dispute_id) DO UPDATE SET
+               payment_id = EXCLUDED.payment_id,
+               refund_id = EXCLUDED.refund_id,
+               amount = EXCLUDED.amount,
+               created_at = EXCLUDED.created_at`,
+            [value.dispute_id, value.payment_id, value.refund_id, value.amount, event.timestamp]
+          );
+        } else if (subtype === "RESOLVED") {
+          const res = await client.query(
+            `UPDATE disputes
+             SET status = 'Resolved', resolved_at = to_timestamp($2), updated_at = CURRENT_TIMESTAMP
+             WHERE dispute_id = $1`,
+            [value.dispute_id, event.timestamp]
+          );
+          if (res.rowCount === 0) {
+            console.warn(`[DisputeUpdate] Dispute ID ${value.dispute_id} not found for RESOLVED event`);
           }
         } else if (subtype === "REJECTED") {
           const res = await tx
@@ -326,6 +334,18 @@ export class Database {
         }
         break;
       }
+
+      case "fx_rate":
+        await client.query(
+          `INSERT INTO fx_rate_cache (pair, rate, decimals, updated_at)
+           VALUES ($1, $2, $3, to_timestamp($4))
+           ON CONFLICT (pair) DO UPDATE SET
+             rate = EXCLUDED.rate,
+             decimals = EXCLUDED.decimals,
+             updated_at = EXCLUDED.updated_at`,
+          [value.pair, value.rate, value.decimals, event.timestamp]
+        );
+        break;
 
       case "merchants":
         await tx
@@ -578,10 +598,13 @@ export class Database {
   }
 
   private getTableName(eventType: string, eventSubtype?: string): string {
-    if (
-      eventType === "DISPUTE" &&
-      (eventSubtype === "BOND_RETURNED" || eventSubtype === "BOND_FORFEITED")
-    ) {
+    if (eventType === "PAYMENT" && eventSubtype === "FEE_TOTAL") {
+      return "payment_fee";
+    }
+    if (eventType === "FX_RATE" && eventSubtype === "UPDATED") {
+      return "fx_rate";
+    }
+    if (eventType === "DISPUTE" && (eventSubtype === "BOND_RETURNED" || eventSubtype === "BOND_FORFEITED")) {
       return "dispute_bonds";
     }
     if (eventType === "SETTLEMENT" || eventSubtype === "SETTLED") {

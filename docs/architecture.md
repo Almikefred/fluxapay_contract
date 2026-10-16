@@ -110,6 +110,21 @@ are cached for five minutes and require a merchant-bound API key with the
 5. Refund event emitted
 6. Funds transferred to original payer
 
+**Swap and Pay Protection:**
+`PaymentProcessor::swap_and_pay()` applies a default 50 bps (0.5%) minimum
+output floor relative to the on-chain DEX quote, in addition to the caller's
+`amount_out_min`. If an FX oracle and pair are provided, the quoted output is
+also checked against that independent reference and rejected when adverse
+price impact exceeds 100 bps (1%). Swaps without an oracle still receive the
+minimum-output and volume protections, but cannot be checked against a
+reference-market price.
+
+The PaymentProcessor tracks successful `amount_in` swap volume for the current
+ledger sequence in instance storage. A swap that would exceed the default
+10,000,000,000,000-unit per-ledger cap is rejected before calling the DEX.
+Admin accounts can adjust all three defaults with `set_swap_limits`; the
+volume counter starts fresh when the ledger sequence changes.
+
 ---
 
 ## Role Model

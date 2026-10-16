@@ -23,6 +23,14 @@ export interface PaymentEvent extends ContractEvent {
   };
 }
 
+export interface PaymentFeeEvent extends ContractEvent {
+  topic: ["PAYMENT", "FEE_TOTAL"];
+  value: {
+    payment_id: string;
+    amount: string | number | bigint;
+  };
+}
+
 export interface RefundEvent extends ContractEvent {
   topic: ["REFUND", "CREATED" | "PROCESSED" | "REJECTED"];
   value: {
@@ -33,7 +41,7 @@ export interface RefundEvent extends ContractEvent {
 }
 
 export interface DisputeEvent extends ContractEvent {
-  topic: ["DISPUTE", "CREATED" | "RESOLVED" | "REJECTED" | "ESCALATED"];
+  topic: ["DISPUTE", "CREATED" | "RESOLVED" | "REJECTED" | "ESCALATED" | "ADJUSTMENT"];
   value: {
     dispute_id: string;
     payment_id: string;
@@ -115,10 +123,12 @@ export interface InvoiceEvent extends ContractEvent {
 }
 
 export interface FXOracleEvent extends ContractEvent {
-  topic: ["FX_ORACLE" | "ORACLE", "UPDATED" | "SET" | "REMOVED"];
+  topic: ["FX_ORACLE" | "ORACLE" | "FX_RATE", "UPDATED" | "SET" | "REMOVED"];
   value: {
-    asset: string;
-    rate: number;
+    pair?: string;
+    asset?: string;
+    rate: string | number | bigint;
+    decimals?: number;
   };
 }
 
@@ -171,6 +181,7 @@ export type PaymentLinkEvent =
 
 export type AnyEvent =
   | PaymentEvent
+  | PaymentFeeEvent
   | RefundEvent
   | DisputeEvent
   | DisputeBondEvent

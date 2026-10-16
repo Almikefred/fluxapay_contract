@@ -11,15 +11,6 @@ import {
   requireScope,
 } from "./auth/api-key";
 import { requireSEP10Auth } from "./auth/middleware";
-import { loadSEP10AuthConfig } from "./auth/config";
-import { sseManager } from "./sse";
-import {
-  getPlatformEd25519PublicKey,
-  registerWebhookRoutes,
-  WebhookStore,
-} from "./webhooks";
-import { getCachedRate, listCachedRates } from "./fx-rate-cache";
-import { createRateLimitMiddleware } from "./rate-limit";
 
 dotenv.config();
 
@@ -39,43 +30,87 @@ export type EventReplayHandler = (
   onProgress?: (progress: ReplayProgressUpdate) => void,
 ) => Promise<{ processed: number; stored: number; skipped_duplicates?: number; total: number }>;
 
-export const MAX_REPLAY_LEDGER_RANGE = 10000;
-
-/** Issue #839: stroops use 7 decimal places for USDC amounts. */
-const USDC_DECIMALS = 7;
-/** Issue #839: default staleness threshold (seconds) for convert preview. */
-const DEFAULT_FX_STALENESS_SECS = Number(process.env.FX_STALENESS_SECS || 300);
-
-/** Issue #839: simple per-IP sliding window rate limiter (60 req/min). */
-const FX_CONVERT_LIMIT = 60;
-const FX_CONVERT_WINDOW_MS = 60_000;
-const fxConvertHits = new Map<string, number[]>();
-
-function fxConvertRateLimit(req: Request, res: Response, next: NextFunction): void {
-  const ip = (req.ip || req.socket.remoteAddress || "unknown").toString();
-  fxRateLimit(`ip:${ip}`, res, next);
+  return { start, endExclusive: new Date(end.getTime() + 86_400_000) };
 }
 
-/** Issue #957: /v1/fx/rates shares the 60 req/min budget, keyed per API key. */
-function fxRatesRateLimit(req: Request, res: Response, next: NextFunction): void {
-  fxRateLimit(`key:${extractApiKey(req) ?? "unknown"}`, res, next);
+function asInteger(value: unknown): bigint {
+  const parsed = BigInt(String(value ?? 0));
+  return parsed;
 }
 
-function fxRateLimit(bucket: string, res: Response, next: NextFunction): void {
-  const now = Date.now();
-  const windowStart = now - FX_CONVERT_WINDOW_MS;
-  const recent = (fxConvertHits.get(bucket) || []).filter((t) => t > windowStart);
-  if (recent.length >= FX_CONVERT_LIMIT) {
-    res.status(429).json({ error: "Rate limit exceeded: 60 requests per minute" });
-    return;
+function formatMinorUnits(value: bigint, decimalPlaces = 2): string {
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  const divisor = 10n ** BigInt(decimalPlaces);
+  const whole = absolute / divisor;
+  const fraction = String(absolute % divisor).padStart(decimalPlaces, "0");
+  return `${negative ? "-" : ""}${whole}.${fraction}`;
+}
+
+function formatTokenAmount(value: bigint): string {
+  const scale = 10n ** BigInt(PAYMENT_AMOUNT_DECIMALS - 2);
+  const cents = (value + (value >= 0n ? scale / 2n : -(scale / 2n))) / scale;
+  return formatMinorUnits(cents);
+}
+
+function convertAmount(
+  amount: bigint,
+  rate: bigint,
+  rateDecimals: number,
+  invert = false
+): string {
+  const amountScale = 10n ** BigInt(PAYMENT_AMOUNT_DECIMALS);
+  const rateScale = 10n ** BigInt(rateDecimals);
+  const numerator = invert ? amount * rateScale : amount * rate;
+  const denominator = invert ? amountScale * rate : amountScale * rateScale;
+  const centsNumerator = numerator * 100n;
+  const cents = (
+    centsNumerator + (centsNumerator >= 0n ? denominator / 2n : -(denominator / 2n))
+  ) / denominator;
+  return formatMinorUnits(cents);
+}
+
+function csvCell(value: unknown): string {
+  const text = value == null ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function buildReconciliationCsv(report: Record<string, any>): string {
+  const header = [
+    "record_type", "id", "payment_id", "amount", "currency", "status",
+    "created_at", "settled_at", "fee_amount", "net_amount", "fiat_amount", "fiat_currency",
+    "fiat_equivalent", "customer_ref", "tags",
+  ];
+  const lines = [header.map(csvCell).join(",")];
+  for (const payment of report.payments) {
+    lines.push([
+      "payment", payment.payment_id, payment.payment_id, payment.amount,
+      payment.currency, payment.status, payment.created_at, payment.settled_at,
+      payment.fee_amount, "", payment.fiat_amount, payment.fiat_currency,
+      payment.fiat_equivalent, payment.customer_ref, payment.tags,
+    ].map(csvCell).join(","));
   }
-  recent.push(now);
-  fxConvertHits.set(bucket, recent);
-  next();
-}
-
-function formatFixed(n: number, decimals: number): string {
-  return n.toFixed(decimals);
+  for (const settlement of report.settlements) {
+    lines.push([
+      "settlement", settlement.payment_id, settlement.payment_id,
+      settlement.amount, settlement.currency, "SETTLED", "", settlement.settled_at,
+      settlement.fee_amount, settlement.net_amount,
+    ].map(csvCell).join(","));
+  }
+  for (const refund of report.refunds) {
+    lines.push([
+      "refund", refund.refund_id, refund.payment_id, refund.amount,
+      refund.currency, refund.status, refund.created_at,
+    ].map(csvCell).join(","));
+  }
+  for (const adjustment of report.dispute_adjustments) {
+    lines.push([
+      "dispute_adjustment", adjustment.dispute_id, adjustment.payment_id,
+      adjustment.amount, adjustment.currency, "LOST_DISPUTE_REFUND",
+      adjustment.created_at,
+    ].map(csvCell).join(","));
+  }
+  return `${lines.join("\r\n")}\r\n`;
 }
 
 // Issue #785: query schema for the filtered payments endpoint.
@@ -129,10 +164,115 @@ function decodePaymentsCursor(cursor: string): { createdAt: string; id: string }
   } catch {
     return null;
   }
+
+  const missingFxPayments: string[] = [];
+  const payments = data.payments.map((payment) => {
+    const currency = String(payment.currency || "").toUpperCase();
+    const amount = asInteger(payment.amount);
+    const equivalents: Record<string, string> = {};
+    let foundRate = false;
+
+    for (const [pair, rate] of rates) {
+      const [base, quote] = pair.split("_");
+      if (base === currency && quote) {
+        equivalents[quote] = convertAmount(amount, rate.rate, rate.decimals);
+        foundRate = true;
+      } else if (quote === currency && base) {
+        equivalents[base] = convertAmount(amount, rate.rate, rate.decimals, true);
+        foundRate = true;
+      }
+    }
+
+    const requestedFiat = String(payment.fiat_currency || "").toUpperCase();
+    if (!foundRate || (requestedFiat && equivalents[requestedFiat] === undefined)) {
+      missingFxPayments.push(String(payment.payment_id));
+    }
+
+    return {
+      ...payment,
+      amount: formatTokenAmount(amount),
+      fee_amount: formatTokenAmount(asInteger(payment.fee_amount)),
+      fiat_amount: payment.fiat_amount == null ? null : String(payment.fiat_amount),
+      fiat_equivalent: equivalents,
+    };
+  });
+
+  const settledUsdc = data.settlements.filter(
+    (settlement) => String(settlement.currency || "").toUpperCase() === "USDC"
+  );
+  const usdcRefunds = data.refunds.filter(
+    (refund) => String(refund.currency || "").toUpperCase() === "USDC"
+  );
+  const usdcDisputeAdjustments = data.disputeAdjustments.filter(
+    (adjustment) => String(adjustment.currency || "").toUpperCase() === "USDC"
+  );
+  const gross = settledUsdc.reduce((sum, item) => sum + asInteger(item.amount), 0n);
+  const fees = settledUsdc.reduce((sum, item) => sum + asInteger(item.fee_amount), 0n);
+  const refunds = usdcRefunds.reduce((sum, item) => sum + asInteger(item.amount), 0n);
+  const net = gross - fees - refunds;
+  const disputeAdjustments = usdcDisputeAdjustments.reduce(
+    (sum, item) => sum + asInteger(item.amount),
+    0n
+  );
+  const netFiatEquivalent: Record<string, string> = {};
+  for (const [pair, rate] of rates) {
+    const [base, quote] = pair.split("_");
+    if (base === "USDC" && quote) {
+      netFiatEquivalent[quote] = convertAmount(net, rate.rate, rate.decimals);
+    }
+  }
+  for (const [pair, rate] of rates) {
+    const [base, quote] = pair.split("_");
+    if (quote === "USDC" && base && netFiatEquivalent[base] === undefined) {
+      netFiatEquivalent[base] = convertAmount(net, rate.rate, rate.decimals, true);
+    }
+  }
+
+  const report = {
+    period: { from, to },
+    summary: {
+      total_gross_usdc: formatTokenAmount(gross),
+      total_fees_usdc: formatTokenAmount(fees),
+      total_refunds_usdc: formatTokenAmount(refunds),
+      total_net_settled_usdc: formatTokenAmount(net),
+      fiat_equivalent: netFiatEquivalent,
+      dispute_adjustments: formatTokenAmount(disputeAdjustments),
+      fx_conversion_unavailable_payment_ids: missingFxPayments,
+    },
+    payments,
+    settlements: data.settlements.map((settlement) => {
+      const amount = asInteger(settlement.amount);
+      const fee = asInteger(settlement.fee_amount);
+      return {
+        ...settlement,
+        amount: formatTokenAmount(amount),
+        fee_amount: formatTokenAmount(fee),
+        net_amount: formatTokenAmount(amount - fee),
+      };
+    }),
+    refunds: data.refunds.map((refund) => ({
+      ...refund,
+      amount: formatTokenAmount(asInteger(refund.amount)),
+    })),
+    dispute_adjustments: data.disputeAdjustments.map((adjustment) => ({
+      ...adjustment,
+      amount: formatTokenAmount(asInteger(adjustment.amount)),
+    })),
+  };
+
+  return report;
 }
 
-function encodePaymentsCursor(createdAt: string, id: string): string {
-  return Buffer.from(`${createdAt}|${id}`, "utf8").toString("base64url");
+function makeOnboardingStep(
+  key: string,
+  completedAt: Date | string | null,
+  actionUrl: string
+): { key: string; completed: boolean; completed_at?: string; action_url?: string } {
+  if (completedAt !== null) {
+    const timestamp = completedAt instanceof Date ? completedAt : new Date(completedAt);
+    return { key, completed: true, completed_at: timestamp.toISOString() };
+  }
+  return { key, completed: false, action_url: actionUrl };
 }
 
 function formatUsdc(stroops: string | number | bigint): string {
@@ -144,7 +284,7 @@ function formatUsdc(stroops: string | number | bigint): string {
 export function createServer(
   database: Database,
   replayDlqHandler?: ReplayDLQHandler,
-  eventReplayHandler?: EventReplayHandler,
+  sep10AuthConfig: SEP10AuthConfig = loadSEP10AuthConfig()
 ) {
   const app = express();
   app.use(express.json());
@@ -166,35 +306,38 @@ export function createServer(
     }
   });
 
-  // Issue #839: public currency conversion preview (cached oracle rate, no auth).
-  // Rate-limited to 60 req/min per IP. Must stay before the API-key gate.
-  app.get("/v1/fx/convert", fxConvertRateLimit, (req: Request, res: Response) => {
-    const from = typeof req.query.from === "string" ? req.query.from.toUpperCase() : "";
-    const to = typeof req.query.to === "string" ? req.query.to.toUpperCase() : "";
-    const amountRaw = typeof req.query.amount === "string" ? req.query.amount : "";
+  // Merchant onboarding is scoped to the merchant in the authenticated SEP-10 token.
+  app.get(
+    "/v1/merchants/me/onboarding",
+    requireSEP10Auth(sep10AuthConfig),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        if (!req.auth) {
+          res.status(401).json({ error: "Authentication required" });
+          return;
+        }
 
-    if (!from || !to || !amountRaw) {
-      res.status(400).json({ error: "Query params from, to, and amount are required" });
-      return;
-    }
+        const merchantId = req.auth.merchant_id || req.auth.sub;
+        const state = await database.getMerchantOnboardingState(merchantId);
+        const steps = [
+          makeOnboardingStep("merchant_registered", state?.registeredAt ?? null, "/onboarding/register"),
+          makeOnboardingStep("kyc_submitted", state?.kycSubmittedAt ?? null, "/settings/kyc"),
+          makeOnboardingStep("webhook_configured", null, "/settings/webhooks"),
+          makeOnboardingStep("payout_channel_added", null, "/settings/payout-channels"),
+          makeOnboardingStep("test_payment_created", null, "/payments/new?network=testnet"),
+          makeOnboardingStep("first_live_payment", null, "/payments/new?network=mainnet"),
+        ];
+        const completedSteps = steps.filter((step) => step.completed).length;
 
-    let amountStroops: bigint;
-    try {
-      amountStroops = BigInt(amountRaw);
-    } catch {
-      res.status(400).json({ error: "amount must be an integer stroop count" });
-      return;
+        res.status(200).json({
+          completion_pct: Math.round((completedSteps / steps.length) * 100),
+          steps,
+        });
+      } catch (error) {
+        next(error);
+      }
     }
-    if (amountStroops < 0n) {
-      res.status(400).json({ error: "amount must be non-negative" });
-      return;
-    }
-
-    const cached = getCachedRate(from, to);
-    if (!cached) {
-      res.status(404).json({ error: `No cached rate for ${from}/${to}` });
-      return;
-    }
+  );
 
     const nowSecs = Math.floor(Date.now() / 1000);
     const rateAgeSecs = Math.max(0, nowSecs - cached.updatedAt);
@@ -230,20 +373,11 @@ export function createServer(
     });
   });
 
-  app.post("/v1/auth/refresh", (req: Request, res: Response) => {
-    const refreshToken =
-      (typeof req.body?.refresh_token === "string" && req.body.refresh_token) ||
-      (typeof req.body?.token === "string" && req.body.token);
-    if (!refreshToken) {
-      res.status(400).json({ error: "refresh_token is required" });
-      return;
-    }
-    res.status(200).json({
-      token: refreshToken,
-      token_type: "api_key",
-      expires_in: 3600,
-    });
-  });
+        const merchantId = req.merchantId;
+        if (!merchantId) {
+          res.status(401).json({ error: "Merchant API key authentication required" });
+          return;
+        }
 
   const sep10Config = loadSEP10AuthConfig();
 
@@ -255,18 +389,28 @@ export function createServer(
       return;
     }
 
-    if (req.auth && req.auth.sub !== merchantId && !sep10Config.adminAccounts.has(req.auth.sub)) {
-      res.status(403).json({ error: "Token is not authorized for this merchant" });
-      return;
-    }
+        const data = await database.getReconciliationData(
+          merchantId,
+          range.start,
+          range.endExclusive
+        );
+        const report = buildReconciliationReport(
+          data,
+          req.query.from as string,
+          req.query.to as string
+        );
 
-    if (!sseManager.canConnect(merchantId)) {
-      res.status(429).json({
-        error: "Rate limit exceeded: maximum 5 concurrent SSE connections per merchant",
-        limit: 5,
-      });
-      return;
+        if (req.headers.accept?.includes("text/csv")) {
+          res.status(200).type("text/csv").send(buildReconciliationCsv(report as Record<string, any>));
+          return;
+        }
+
+        res.status(200).json(report);
+      } catch (error) {
+        next(error);
+      }
     }
+  );
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
