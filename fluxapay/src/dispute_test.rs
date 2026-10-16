@@ -1798,3 +1798,186 @@ fn test_get_all_disputes_pagination() {
     let all = refund_client.get_all_disputes(&0u32, &10u32);
     assert_eq!(all.len(), 5);
 }
+
+// ── Issue #1056: Dispute rate limiting ───────────────────────────────────────
+
+/// Global hourly dispute counter resets after DISPUTE_GLOBAL_WINDOW_SECS elapses,
+/// allowing new disputes to be created in the next window.
+#[test]
+fn test_dispute_global_limit_resets_after_window() {
+    use crate::DISPUTE_GLOBAL_WINDOW_SECS;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _m, customer, payment_client, refund_client, _) =
+        setup_confirmed_payment_for_dispute(&env, "rw_base", 100i128);
+
+    // Set global limit to 1 so we hit the cap immediately.
+    refund_client.set_dispute_rate_limits(&admin, &50u32, &1u32);
+
+    // First dispute in window — should succeed.
+    let pid1 = String::from_str(&env, "rw_pay_0");
+    let merchant1 = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant1);
+    payment_client.create_payment(&create_payment_args(&env, &pid1, &merchant1, 100i128));
+    let oracle1 = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle1);
+    payment_client.verify_payment(
+        &oracle1,
+        &pid1,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &customer,
+        &100i128,
+        &None::<u64>,
+    );
+    let token_address = env.as_contract(&refund_client.address, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .unwrap()
+    });
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant1, &100_000);
+    refund_client.register_payment(&pid1, &merchant1, &100i128, &Symbol::new(&env, "USDC"));
+    refund_client.create_dispute(
+        &pid1,
+        &100i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer,
+        &vec![&env],
+    );
+
+    // Second dispute in same window — must be rejected.
+    let pid2 = String::from_str(&env, "rw_pay_1");
+    let merchant2 = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant2);
+    payment_client.create_payment(&create_payment_args(&env, &pid2, &merchant2, 100i128));
+    let oracle2 = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle2);
+    payment_client.verify_payment(
+        &oracle2,
+        &pid2,
+        &BytesN::from_array(&env, &[2u8; 32]),
+        &customer,
+        &100i128,
+        &None::<u64>,
+    );
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant2, &100_000);
+    refund_client.register_payment(&pid2, &merchant2, &100i128, &Symbol::new(&env, "USDC"));
+    let rejected = refund_client.try_create_dispute(
+        &pid2,
+        &100i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer,
+        &vec![&env],
+    );
+    assert!(rejected.is_err());
+
+    // Advance time past the window — counter should reset.
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + DISPUTE_GLOBAL_WINDOW_SECS + 1);
+
+    // Same dispute in new window — must succeed.
+    let pid3 = String::from_str(&env, "rw_pay_2");
+    let merchant3 = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant3);
+    payment_client.create_payment(&create_payment_args(&env, &pid3, &merchant3, 100i128));
+    let oracle3 = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle3);
+    payment_client.verify_payment(
+        &oracle3,
+        &pid3,
+        &BytesN::from_array(&env, &[3u8; 32]),
+        &customer,
+        &100i128,
+        &None::<u64>,
+    );
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant3, &100_000);
+    refund_client.register_payment(&pid3, &merchant3, &100i128, &Symbol::new(&env, "USDC"));
+    let accepted = refund_client.try_create_dispute(
+        &pid3,
+        &100i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer,
+        &vec![&env],
+    );
+    assert!(accepted.is_ok());
+}
+
+/// Per-payer open cap is enforced independently per address.
+#[test]
+fn test_dispute_per_payer_limit_is_address_scoped() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _m, customer_a, payment_client, refund_client, _) =
+        setup_confirmed_payment_for_dispute(&env, "scope_base", 100i128);
+
+    // Set per-payer limit to 1, global high so only payer cap is hit.
+    refund_client.set_dispute_rate_limits(&admin, &1u32, &1000u32);
+
+    let customer_b = Address::generate(&env);
+
+    let token_address = env.as_contract(&refund_client.address, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .unwrap()
+    });
+
+    // customer_a creates their one allowed dispute.
+    let pid_a = String::from_str(&env, "scope_a_0");
+    let merchant_a = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant_a);
+    payment_client.create_payment(&create_payment_args(&env, &pid_a, &merchant_a, 100i128));
+    let oracle_a = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle_a);
+    payment_client.verify_payment(
+        &oracle_a,
+        &pid_a,
+        &BytesN::from_array(&env, &[10u8; 32]),
+        &customer_a,
+        &100i128,
+        &None::<u64>,
+    );
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant_a, &100_000);
+    refund_client.register_payment(&pid_a, &merchant_a, &100i128, &Symbol::new(&env, "USDC"));
+    refund_client.create_dispute(
+        &pid_a,
+        &100i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer_a,
+        &vec![&env],
+    );
+
+    // customer_b (different address) should still be able to open a dispute.
+    let pid_b = String::from_str(&env, "scope_b_0");
+    let merchant_b = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant_b);
+    payment_client.create_payment(&create_payment_args(&env, &pid_b, &merchant_b, 100i128));
+    let oracle_b = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle_b);
+    payment_client.verify_payment(
+        &oracle_b,
+        &pid_b,
+        &BytesN::from_array(&env, &[11u8; 32]),
+        &customer_b,
+        &100i128,
+        &None::<u64>,
+    );
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant_b, &100_000);
+    refund_client.register_payment(&pid_b, &merchant_b, &100i128, &Symbol::new(&env, "USDC"));
+    let result_b = refund_client.try_create_dispute(
+        &pid_b,
+        &100i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer_b,
+        &vec![&env],
+    );
+    assert!(result_b.is_ok(), "different payer must not be rate-limited");
+}

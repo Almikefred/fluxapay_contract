@@ -185,6 +185,7 @@ pub enum InvoiceStatus {
     Created,
     Paid,
     Overdue,
+    Voided,
 }
 
 #[contracttype]
@@ -208,6 +209,8 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     pub payment_link_id: Option<String>,
     pub created_at: u64,
+    pub paid_at: Option<u64>,
+    pub voided_at: Option<u64>,
 }
 
 #[contracttype]
@@ -1136,4 +1139,37 @@ pub struct MerchantReserveState {
     pub total_slashed: i128,
     /// Policy snapshot applied to this merchant's most recent settlement.
     pub policy: RollingReservePolicy,
+}
+
+/// Issue #1066: A single platform-fee collection record appended to
+/// `DataKey::FeeCollectionHistory` during `settle_payment` and
+/// `process_refund`. Paginated by `get_fee_collection_history`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRecord {
+    /// Payment or refund ID that generated this fee event.
+    pub payment_id: String,
+    /// Fee amount charged (in the token's smallest unit).
+    pub fee_amount: i128,
+    /// Token contract address the fee was collected in.
+    pub token: Address,
+    /// Ledger timestamp when the fee was collected.
+    pub collected_at: u64,
+}
+
+/// Issue #1064: A single merchant's leaderboard entry returned by
+/// `get_top_merchants`, enriched with score, KYC tier, and volume metrics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRankEntry {
+    /// Merchant contract address.
+    pub merchant_id: Address,
+    /// Composite score used for leaderboard ranking (same as cumulative gross volume).
+    pub score: i128,
+    /// KYC verification tier of the merchant.
+    pub kyc_tier: crate::merchant_registry::KycTier,
+    /// Total number of confirmed payments for this merchant.
+    pub confirmed_payment_count: u64,
+    /// Cumulative gross payment volume across all payments.
+    pub cumulative_volume: i128,
 }

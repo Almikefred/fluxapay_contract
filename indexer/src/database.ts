@@ -36,6 +36,7 @@ import {
   disputeBonds,
   deadLetterEvents,
   settlements,
+  feeCollectionHistory,
 } from "./schema";
 import { setCachedRate } from "./fx-rate-cache";
 
@@ -867,6 +868,123 @@ export class Database {
     } finally {
       client.release();
     }
+  }
+
+  // ------------------------------------------------------------------ Issue #1067: Invoice helpers
+
+  async getInvoices(params: {
+    merchantId?: string;
+    status?: string;
+    limit: number;
+    offset: number;
+  }) {
+    const conditions = [];
+    if (params.merchantId) {
+      conditions.push(eq(invoices.merchantId, params.merchantId));
+    }
+    if (params.status) {
+      conditions.push(eq(invoices.status, params.status));
+    }
+
+    const rows = await this.db
+      .select()
+      .from(invoices)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(invoices.createdAt))
+      .limit(params.limit)
+      .offset(params.offset);
+
+    return { invoices: rows, limit: params.limit, offset: params.offset };
+  }
+
+  async getInvoiceById(invoiceId: string) {
+    const rows = await this.db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.invoiceId, invoiceId))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Soft-delete: transitions a Pending or Overdue invoice to Voided.
+   * Returns the updated row, or null if not found / already Paid / already Voided.
+   */
+  async voidInvoice(invoiceId: string, merchantId: string) {
+    const existing = await this.getInvoiceById(invoiceId);
+    if (!existing) return null;
+    if (existing.merchantId !== merchantId) return null;
+    if (existing.status === "Voided" || existing.status === "Paid") return null;
+
+    const now = new Date();
+    const updated = await this.db
+      .update(invoices)
+      .set({ status: "Voided", voidedAt: now, updatedAt: now })
+      .where(eq(invoices.invoiceId, invoiceId))
+      .returning();
+    return updated[0] ?? null;
+  }
+
+  // ------------------------------------------------------------------ Issue #1066: Fee collection history
+
+  async getFeeCollectionHistory(params: {
+    offset: number;
+    limit: number;
+    token?: string;
+  }) {
+    const conditions = [];
+    if (params.token) {
+      conditions.push(eq(feeCollectionHistory.token, params.token));
+    }
+
+    const rows = await this.db
+      .select()
+      .from(feeCollectionHistory)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(feeCollectionHistory.collectedAt))
+      .limit(params.limit)
+      .offset(params.offset);
+
+    return { fees: rows, limit: params.limit, offset: params.offset };
+  }
+
+  // ------------------------------------------------------------------ Issue #1064: Merchant leaderboard
+
+  async getTopMerchants(limit: number) {
+    const rows = await this.db
+      .select({
+        merchantId: merchants.merchantId,
+        status: merchants.status,
+        lastUpdate: merchants.lastUpdate,
+      })
+      .from(merchants)
+      .where(eq(merchants.status, "active"))
+      .limit(limit);
+
+    // Enrich with payment volume from the payments table.
+    const enriched = await Promise.all(
+      rows.map(async (m) => {
+        const volRows = await this.db
+          .select({ total: sql<string>`COALESCE(SUM(amount::numeric), 0)`, cnt: sql<string>`COUNT(*)` })
+          .from(payments)
+          .where(eq(payments.merchantId, m.merchantId));
+        const vol = volRows[0];
+        return {
+          merchant_id: m.merchantId,
+          score: vol?.total ?? "0",
+          confirmed_payment_count: Number(vol?.cnt ?? 0),
+          cumulative_volume: vol?.total ?? "0",
+        };
+      }),
+    );
+
+    // Sort by score descending.
+    enriched.sort((a, b) => {
+      const diff = BigInt(b.score) - BigInt(a.score);
+      return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+    });
+
+    return enriched.slice(0, limit);
   }
 
   async close(): Promise<void> {
