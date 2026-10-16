@@ -2,7 +2,14 @@ import express, { type Request, type Response, type NextFunction } from "express
 import * as dotenv from "dotenv";
 import { z } from "zod";
 import { Database } from "./database";
-import { requireApiKey, requireAdminApiKey, requireScope } from "./auth/api-key";
+import {
+  extractApiKey,
+  getKeyMerchantId,
+  getKeyScopes,
+  requireApiKey,
+  requireAdminApiKey,
+  requireScope,
+} from "./auth/api-key";
 import { requireSEP10Auth } from "./auth/middleware";
 import { loadSEP10AuthConfig } from "./auth/config";
 import { sseManager } from "./sse";
@@ -22,6 +29,7 @@ export interface ReplayProgressUpdate {
   processed: number;
   total: number;
   stored?: number;
+  skipped_duplicates?: number;
   currentLedger?: number;
 }
 
@@ -29,7 +37,7 @@ export type EventReplayHandler = (
   fromLedger: number,
   toLedger: number,
   onProgress?: (progress: ReplayProgressUpdate) => void,
-) => Promise<{ processed: number; stored: number; total: number }>;
+) => Promise<{ processed: number; stored: number; skipped_duplicates?: number; total: number }>;
 
 export const MAX_REPLAY_LEDGER_RANGE = 10000;
 
@@ -85,6 +93,17 @@ const paymentsQuerySchema = z.object({
   cursor: z.string().max(512).optional(),
 });
 
+const subscriptionMetricsQuerySchema = z.object({
+  merchant_id: z.string().min(1).max(128),
+  period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "Expected period in YYYY-MM format"),
+});
+
+const SUBSCRIPTION_METRICS_CACHE_TTL_MS = 5 * 60 * 1000;
+const subscriptionMetricsCache = new Map<
+  string,
+  { expiresAt: number; response: Record<string, unknown> }
+>();
+
 /**
  * Decode an opaque pagination cursor of the form base64url(created_at|id).
  * Returns null when the cursor is malformed so the caller can reject it.
@@ -105,6 +124,12 @@ function decodePaymentsCursor(cursor: string): { createdAt: string; id: string }
 
 function encodePaymentsCursor(createdAt: string, id: string): string {
   return Buffer.from(`${createdAt}|${id}`, "utf8").toString("base64url");
+}
+
+function formatUsdc(stroops: string | number | bigint): string {
+  const amount = BigInt(stroops);
+  const cents = (amount + 50_000n) / 100_000n;
+  return `${cents / 100n}.${(cents % 100n).toString().padStart(2, "0")}`;
 }
 
 export function createServer(
@@ -177,6 +202,9 @@ export function createServer(
       rate: formatFixed(cached.rate, 2),
       rate_age_secs: rateAgeSecs,
       stale,
+    });
+  });
+
   // Issue #817: auth endpoints (stricter 10 req/min per-IP via rate limiter above)
   app.post("/v1/auth/login", (req: Request, res: Response) => {
     const apiKey =
@@ -208,8 +236,9 @@ export function createServer(
     });
   });
 
-  // Issue #855: Real-time event streaming via Server-Sent Events (SSE)
   const sep10Config = loadSEP10AuthConfig();
+
+  // Issue #855: Real-time event streaming via Server-Sent Events (SSE)
   const sseHandler = async (req: Request, res: Response): Promise<void> => {
     const merchantId = (req.query.merchant_id as string) || req.auth?.sub;
     if (!merchantId) {
@@ -265,8 +294,140 @@ export function createServer(
   app.get("/webhooks/public-key", publicKeyHandler);
   app.get("/v1/webhooks/public-key", publicKeyHandler);
 
+  app.post("/v1/payment-links/:id/view", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const recorded = await database.recordPaymentLinkView(req.params.id);
+      if (!recorded) {
+        res.status(404).json({ error: "Payment link not found" });
+        return;
+      }
+      res.status(202).json({ recorded: true });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get(
+    "/v1/payment-links",
+    requireSEP10Auth(sep10Config),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const links = await database.getPaymentLinksForMerchant(req.auth!.sub);
+        res.status(200).json({
+          payment_links: links.map((link) => ({
+            link_id: link.link_id,
+            views: Number(link.views),
+            attempts: Number(link.attempts),
+            conversions: Number(link.conversions),
+            conversion_rate:
+              Number(link.attempts) === 0
+                ? null
+                : Number(link.conversions) / Number(link.attempts),
+            total_revenue_usdc: formatUsdc(link.total_revenue_stroops),
+            last_used_at: link.last_used_at?.toISOString() ?? null,
+            daily_conversions: link.daily_conversions,
+          })),
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  app.get(
+    "/v1/payment-links/:id/analytics",
+    requireSEP10Auth(sep10Config),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const analytics = await database.getPaymentLinkAnalytics(req.params.id, req.auth!.sub);
+        if (!analytics) {
+          res.status(404).json({ error: "Payment link not found" });
+          return;
+        }
+        res.status(200).json({
+          link_id: analytics.link_id,
+          views: Number(analytics.views),
+          attempts: Number(analytics.attempts),
+          conversions: Number(analytics.conversions),
+          conversion_rate:
+            Number(analytics.attempts) === 0
+              ? null
+              : Number(analytics.conversions) / Number(analytics.attempts),
+          total_revenue_usdc: formatUsdc(analytics.total_revenue_stroops),
+          last_used_at: analytics.last_used_at?.toISOString() ?? null,
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
   // All subsequent routes require API-key authentication
   app.use(requireApiKey);
+
+  app.get(
+    "/v1/subscriptions/metrics",
+    requireScope("read:analytics"),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const parsed = subscriptionMetricsQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+          res.status(400).json({
+            error: "Invalid query parameters",
+            details: parsed.error.flatten(),
+          });
+          return;
+        }
+
+        const apiKey = extractApiKey(req);
+        const scopes = apiKey ? getKeyScopes(apiKey) : null;
+        const merchantId = apiKey ? getKeyMerchantId(apiKey) : null;
+        if (!scopes?.includes("admin") && merchantId !== parsed.data.merchant_id) {
+          res.status(403).json({ error: "API key is not authorized for this merchant" });
+          return;
+        }
+
+        const [year, month] = parsed.data.period.split("-").map(Number);
+        const periodStart = new Date(Date.UTC(year, month - 1, 1));
+        const periodEnd = new Date(Date.UTC(year, month, 1));
+        const cacheKey = `${parsed.data.merchant_id}:${parsed.data.period}`;
+        const now = Date.now();
+        for (const [key, value] of subscriptionMetricsCache) {
+          if (value.expiresAt <= now) subscriptionMetricsCache.delete(key);
+        }
+
+        let response = subscriptionMetricsCache.get(cacheKey)?.response;
+        if (!response) {
+          const metrics = await database.getSubscriptionMetrics(
+            parsed.data.merchant_id,
+            periodStart,
+            periodEnd,
+          );
+          response = {
+            period: parsed.data.period,
+            mrr_usdc: formatUsdc(metrics.mrr_stroops),
+            active_subscribers: metrics.active_subscribers,
+            new_subscribers: metrics.new_subscribers,
+            churned_subscribers: metrics.churned_subscribers,
+            churn_rate: metrics.churn_rate,
+            trial_conversions: metrics.trial_conversions,
+            trial_conversion_rate: metrics.trial_conversion_rate,
+            past_due_subscribers: metrics.past_due_subscribers,
+            dunning_recovery_rate: metrics.dunning_recovery_rate,
+          };
+          if (subscriptionMetricsCache.size >= 1000) subscriptionMetricsCache.clear();
+          subscriptionMetricsCache.set(cacheKey, {
+            expiresAt: now + SUBSCRIPTION_METRICS_CACHE_TTL_MS,
+            response,
+          });
+        }
+
+        res.status(200).json(response);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   // Webhook test delivery and delivery history (Issues #808, #810, #854).
   app.use("/webhooks", requireScope("manage:webhooks"));
@@ -604,24 +765,33 @@ export function createServer(
     }
   });
 
-  app.post("/admin/replay", requireAdminApiKey, async (req: Request, res: Response, next: NextFunction) => {
+  const replayHandler = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const fromParam = req.query.from_ledger ?? req.query.from ?? req.body?.from_ledger ?? req.body?.from;
       const toParam = req.query.to_ledger ?? req.query.to ?? req.body?.to_ledger ?? req.body?.to;
 
-      const fromLedger = parseInt(fromParam as string, 10);
-      const toLedger = parseInt(toParam as string, 10);
+      const parseLedger = (value: unknown): number | null => {
+        if (typeof value === "number") {
+          return Number.isSafeInteger(value) && value > 0 ? value : null;
+        }
+        if (typeof value !== "string" || !/^[1-9]\d*$/.test(value)) return null;
+        const parsed = Number(value);
+        return Number.isSafeInteger(parsed) ? parsed : null;
+      };
+      const fromLedger = parseLedger(fromParam);
+      const toLedger = parseLedger(toParam);
 
-      if (isNaN(fromLedger) || isNaN(toLedger) || fromLedger < 1 || toLedger < fromLedger) {
+      if (fromLedger === null || toLedger === null || toLedger < fromLedger) {
         res.status(400).json({
           error: "Invalid ledger parameters: 'from_ledger' and 'to_ledger' must be positive integers with from_ledger <= to_ledger",
         });
         return;
       }
 
-      if (toLedger - fromLedger > MAX_REPLAY_LEDGER_RANGE) {
+      const rangeSize = toLedger - fromLedger + 1;
+      if (rangeSize > MAX_REPLAY_LEDGER_RANGE) {
         res.status(400).json({
-          error: `Requested ledger range (${toLedger - fromLedger + 1}) exceeds maximum allowed limit of ${MAX_REPLAY_LEDGER_RANGE} ledgers`,
+          error: `Requested ledger range (${rangeSize}) exceeds maximum allowed limit of ${MAX_REPLAY_LEDGER_RANGE} ledgers`,
         });
         return;
       }
@@ -637,18 +807,29 @@ export function createServer(
       res.flushHeaders?.();
 
       let isClientConnected = true;
-      req.on("close", () => {
+      res.on("close", () => {
         isClientConnected = false;
       });
 
       const onProgress = (progress: ReplayProgressUpdate) => {
         if (!isClientConnected) return;
-        res.write(`data: ${JSON.stringify({ processed: progress.processed, total: progress.total, stored: progress.stored })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          processed: progress.processed,
+          total: progress.total,
+          stored: progress.stored,
+          skipped_duplicates: progress.skipped_duplicates ?? 0,
+        })}\n\n`);
       };
 
       const result = await eventReplayHandler(fromLedger, toLedger, onProgress);
       if (isClientConnected) {
-        res.write(`data: ${JSON.stringify({ type: "complete", processed: result.processed, total: result.total, stored: result.stored })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          type: "complete",
+          processed: result.processed,
+          total: result.total,
+          stored: result.stored,
+          skipped_duplicates: result.skipped_duplicates ?? 0,
+        })}\n\n`);
         res.end();
       }
     } catch (error: any) {
@@ -659,7 +840,10 @@ export function createServer(
         next(error);
       }
     }
-  });
+  };
+
+  app.post("/admin/replay", requireAdminApiKey, replayHandler);
+  app.post("/v1/admin/replay", requireScope("admin"), replayHandler);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     console.error("API Request Error:", err);

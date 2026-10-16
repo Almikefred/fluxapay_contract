@@ -556,6 +556,8 @@ pub enum Error {
     KycLimitExceeded = 85,
     /// Issue #1061: A single-use payment link has already been redeemed and cannot be used again.
     LinkAlreadyUsed = 86,
+    /// Contract version must be a numeric x.y.z string of at most 32 characters.
+    InvalidVersion = 87,
 }
 
 #[contracttype]
@@ -1216,8 +1218,47 @@ pub struct ContractHealth {
 )]
 #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl RefundManager {
-    pub fn version() -> u32 {
-        1
+    /// Returns the current contract version string from persistent storage.
+    pub fn version(env: Env) -> String {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or_else(|| String::from_str(&env, INITIAL_CONTRACT_VERSION))
+    }
+
+    /// Admin-only: update the stored contract version after a WASM upgrade.
+    pub fn set_version(env: Env, admin: Address, version: String) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if !utils::is_valid_contract_version(&version) {
+            return Err(Error::InvalidVersion);
+        }
+
+        let old_version = Self::version(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractVersion, &version);
+        env.storage().instance().set(
+            &DataKey::ContractMetadata(Symbol::new(&env, "version")),
+            &version,
+        );
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ContractVersion, threshold, LONG_LIVE_TTL);
+        env.storage()
+            .instance()
+            .extend_ttl(threshold, LONG_LIVE_TTL);
+        env.events().publish(
+            (
+                Symbol::new(&env, "CONTRACT"),
+                Symbol::new(&env, "VERSION_UPDATED"),
+            ),
+            (old_version, version),
+        );
+        Ok(())
     }
     fn require_not_paused(env: &Env) -> Result<(), Error> {
         let pause_state: PauseState =
@@ -1279,6 +1320,9 @@ impl RefundManager {
 
         let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
         env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ContractVersion, threshold, LONG_LIVE_TTL);
+        env.storage()
             .instance()
             .extend_ttl(threshold, LONG_LIVE_TTL);
 
@@ -1338,6 +1382,10 @@ impl RefundManager {
     ) -> Result<(), Error> {
         Self::validate_admin_and_token(&env, admin.clone(), usdc_token_address.clone())?;
         AccessControl::initialize(&env, admin);
+        env.storage().persistent().set(
+            &DataKey::ContractVersion,
+            &String::from_str(&env, INITIAL_CONTRACT_VERSION),
+        );
         env.storage()
             .persistent()
             .set(&DataKey::UsdcToken, &usdc_token_address);
@@ -1353,7 +1401,7 @@ impl RefundManager {
         );
         env.storage().instance().set(
             &DataKey::ContractMetadata(Symbol::new(&env, "version")),
-            &String::from_str(&env, "1"),
+            &String::from_str(&env, INITIAL_CONTRACT_VERSION),
         );
         env.storage().instance().set(
             &DataKey::ContractMetadata(Symbol::new(&env, "deployed_at")),
@@ -6193,6 +6241,38 @@ impl PaymentProcessor {
             .persistent()
             .get(&DataKey::ContractVersion)
             .unwrap_or_else(|| String::from_str(&env, INITIAL_CONTRACT_VERSION))
+    }
+
+    /// Admin-only: update the stored contract version after a WASM upgrade.
+    pub fn set_version(env: Env, admin: Address, version: String) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if !utils::is_valid_contract_version(&version) {
+            return Err(Error::InvalidVersion);
+        }
+
+        let old_version = Self::version(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractVersion, &version);
+        env.storage().instance().set(
+            &DataKey::ContractMetadata(Symbol::new(&env, "version")),
+            &version,
+        );
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage()
+            .instance()
+            .extend_ttl(threshold, LONG_LIVE_TTL);
+        env.events().publish(
+            (
+                Symbol::new(&env, "CONTRACT"),
+                Symbol::new(&env, "VERSION_UPDATED"),
+            ),
+            (old_version, version),
+        );
+        Ok(())
     }
 
     /// Alias for version() — returns the current contract version string.
@@ -11745,9 +11825,7 @@ impl PaymentProcessor {
 
                 let new_version_str = bump_version_string(&env, &old_version);
                 env.deployer().update_current_contract_wasm(new_wasm_hash);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ContractVersion, &new_version_str);
+                Self::set_version(env.clone(), admin.clone(), new_version_str.clone())?;
 
                 env.events().publish(
                     (Symbol::new(&env, "CONTRACT"), Symbol::new(&env, "UPGRADED")),

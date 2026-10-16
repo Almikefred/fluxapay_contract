@@ -37,6 +37,9 @@ import {
   deadLetterEvents,
   settlements,
   feeCollectionHistory,
+  paymentLinks,
+  subscriptionPlans,
+  subscriptionMetricEvents,
 } from "./schema";
 import { setCachedRate } from "./fx-rate-cache";
 
@@ -60,6 +63,28 @@ export interface ReconciliationRow {
   settled_at: string;
   customer_ref: string;
   tags: string;
+}
+
+export interface PaymentLinkAnalytics {
+  link_id: string;
+  views: number;
+  attempts: number;
+  conversions: number;
+  total_revenue_stroops: string;
+  last_used_at: Date | null;
+}
+
+export interface SubscriptionMetrics {
+  mrr_stroops: string;
+  active_subscribers: number;
+  new_subscribers: number;
+  churned_subscribers: number;
+  churn_rate: number | null;
+  trial_conversions: number;
+  trial_conversion_rate: number | null;
+  past_due_subscribers: number;
+  dunning_recoveries: number;
+  dunning_recovery_rate: number | null;
 }
 
 export class Database {
@@ -103,21 +128,9 @@ export class Database {
     if (!this.initialized) throw new Error("Database not initialized");
 
     return this.db.transaction(async (tx) => {
-      const existing = await tx
-        .select({ id: contractEvents.id })
-        .from(contractEvents)
-        .where(eq(contractEvents.eventId, event.id))
-        .limit(1);
-
-      if (existing.length > 0) {
-        console.log(`Event ${event.id} already processed, skipping...`);
-        return false;
-      }
-
       const [eventType, eventSubtype] = event.topic;
       const table = this.getTableName(eventType, eventSubtype);
-
-      await tx
+      const inserted = await tx
         .insert(contractEvents)
         .values({
           eventId: event.id,
@@ -128,24 +141,19 @@ export class Database {
           data: event.value as any,
           contractId: event.contractId || null,
         })
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning({ id: contractEvents.id });
+
+      if (inserted.length === 0) {
+        console.log(`Event ${event.id} already processed, skipping...`);
+        return false;
+      }
 
       await this.storeTypedEventDrizzle(table, event, tx);
-          event.ledger,
-          event.txHash,
-          event.timestamp,
-          JSON.stringify(event.value),
-          event.contractId || null,
-        ]
-      );
-
-      // Store in type-specific table
-      await this.storeTypedEvent(table, event, client);
 
       // Issue #839: keep an in-memory FX rate cache for /v1/fx/convert.
       this.updateFxRateCache(event);
 
-      await client.query("COMMIT");
       return true;
     });
   }
@@ -168,28 +176,80 @@ export class Database {
             amount: BigInt(String(value.amount ?? 0)),
             currency: value.currency != null ? String(value.currency) : null,
             status: event.topic[1],
+            paymentLinkId:
+              value.payment_link_id != null ? String(value.payment_link_id) : null,
             createdAt: ts,
             fiatAmount: value.fiat_amount != null ? String(value.fiat_amount) : null,
             fiatCurrency: value.fiat_currency != null ? String(value.fiat_currency) : null,
             customerRef: value.customer_ref != null ? String(value.customer_ref) : null,
             tags: value.tags != null ? String(value.tags) : null,
             settledAt:
-              event.topic[1] === "SETTLED" || event.topic[1] === "Settled"
-                ? ts
-                : null,
+              event.topic[1] === "SETTLED" ? ts : null,
           })
           .onConflictDoUpdate({
             target: payments.paymentId,
             set: {
               status: event.topic[1],
+              paymentLinkId:
+                value.payment_link_id != null
+                  ? String(value.payment_link_id)
+                  : undefined,
               updatedAt: new Date(),
               settledAt:
-                event.topic[1] === "SETTLED" || event.topic[1] === "Settled"
-                  ? ts
-                  : undefined,
+                event.topic[1] === "SETTLED" ? ts : undefined,
             },
           });
         break;
+
+      case "payment_links": {
+        const [eventType, eventSubtype] = event.topic;
+        if (eventType === "LINK" && eventSubtype === "CREATED") {
+          await tx
+            .insert(paymentLinks)
+            .values({
+              linkId: String(value.link_id),
+              merchantId: String(value.merchant_id),
+              createdAt: ts,
+            })
+            .onConflictDoUpdate({
+              target: paymentLinks.linkId,
+              set: {
+                merchantId: String(value.merchant_id),
+              },
+            });
+          break;
+        }
+
+        if (eventType === "LINK" && eventSubtype === "USED") {
+          const linkId = String(value.link_id);
+          const paymentId = String(value.payment_id);
+          const [link] = await tx
+            .select({ merchantId: paymentLinks.merchantId })
+            .from(paymentLinks)
+            .where(eq(paymentLinks.linkId, linkId))
+            .limit(1);
+          if (!link) {
+            throw new Error(`Payment link ${linkId} has no indexed owner`);
+          }
+
+          await tx
+            .insert(payments)
+            .values({
+              paymentId,
+              merchantId: link.merchantId,
+              amount: BigInt(String(value.amount ?? 0)),
+              currency: "USDC",
+              status: "PENDING",
+              paymentLinkId: linkId,
+              createdAt: ts,
+            })
+            .onConflictDoUpdate({
+              target: payments.paymentId,
+              set: { paymentLinkId: linkId },
+            });
+        }
+        break;
+      }
 
       case "refunds":
         await tx
@@ -350,36 +410,123 @@ export class Database {
                 ? BigInt(String(value[4]))
                 : null,
           createdAt: ts,
+          memo: value.memo != null ? String(value.memo) : null,
         });
-        await client.query(
-          `INSERT INTO stream_withdrawals (stream_id, recipient, amount, remaining_deposit, memo, created_at)
-           VALUES ($1, $2, $3, $4, $5, to_timestamp($6))`,
-          [
-            value.stream_id || (Array.isArray(value) ? value[0] : null),
-            value.recipient || value.destination || value.receiver || (Array.isArray(value) ? value[2] || value[1] : null),
-            value.amount || value.withdrawable || (Array.isArray(value) ? value[3] : null),
-            value.remaining_deposit || (Array.isArray(value) ? value[4] : null),
-            value.memo !== undefined ? value.memo : null,
-            event.timestamp,
-          ]
-        );
         break;
 
       case "subscriptions":
-        await tx
-          .insert(subscriptions)
-          .values({
-            subscriptionId: String(value.subscription_id),
-            payer: value.payer != null ? String(value.payer) : null,
-            status: value.status != null ? String(value.status) : null,
-            createdAt: ts,
-          })
-          .onConflictDoUpdate({
-            target: subscriptions.subscriptionId,
-            set: {
-              status: value.status != null ? String(value.status) : null,
-            },
-          });
+        if (event.topic[1] === "PLAN_CREATED") {
+          await tx
+            .insert(subscriptionPlans)
+            .values({
+              planId: String(value.plan_id),
+              merchantId: String(value.merchant_id),
+              amount: BigInt(String(value.amount)),
+              intervalSecs: BigInt(String(value.interval_secs)),
+              createdAt: ts,
+            })
+            .onConflictDoUpdate({
+              target: subscriptionPlans.planId,
+              set: {
+                merchantId: String(value.merchant_id),
+                amount: BigInt(String(value.amount)),
+                intervalSecs: BigInt(String(value.interval_secs)),
+              },
+            });
+          break;
+        }
+
+        if (event.topic[1] === "PLAN_DEACTIVATED") break;
+
+        const subscriptionId = String(value.subscription_id);
+        const subscriptionEvent = event.topic[1];
+        const statusByEvent: Record<string, string> = {
+          CREATED: "ACTIVE",
+          ACTIVE: "ACTIVE",
+          CHARGED: "ACTIVE",
+          RESUMED: "ACTIVE",
+          CANCELLED: "CANCELLED",
+          EXPIRED: "EXPIRED",
+          COMPLETED: "COMPLETED",
+          CHARGE_FAILED: "PAST_DUE",
+          DUNNING_TRIGGERED: "PAST_DUE",
+          PAUSED: "PAUSED",
+        };
+        const trackedEvents = new Set([
+          "CREATED",
+          ...Object.keys(statusByEvent),
+          "TRIAL_STARTED",
+          "TRIAL_ENDED",
+        ]);
+        if (!trackedEvents.has(subscriptionEvent)) break;
+
+        let merchantId: string | null | undefined;
+        let planId: string | null | undefined;
+        if (subscriptionEvent === "CREATED") {
+          planId = String(value.plan_id);
+          const [plan] = await tx
+            .select({
+              merchantId: subscriptionPlans.merchantId,
+            })
+            .from(subscriptionPlans)
+            .where(eq(subscriptionPlans.planId, planId))
+            .limit(1);
+          if (!plan) {
+            throw new Error(`Subscription plan ${planId} has no indexed owner`);
+          }
+          merchantId = plan.merchantId;
+
+          await tx
+            .insert(subscriptions)
+            .values({
+              subscriptionId,
+              merchantId,
+              planId,
+              payer: value.payer != null ? String(value.payer) : null,
+              status: "ACTIVE",
+              createdAt: ts,
+            })
+            .onConflictDoUpdate({
+              target: subscriptions.subscriptionId,
+              set: {
+                merchantId,
+                planId,
+                status: "ACTIVE",
+              },
+            });
+        } else {
+          const [subscription] = await tx
+            .select({ merchantId: subscriptions.merchantId, planId: subscriptions.planId })
+            .from(subscriptions)
+            .where(eq(subscriptions.subscriptionId, subscriptionId))
+            .limit(1);
+
+          if (!subscription?.merchantId) {
+            throw new Error(`Subscription ${subscriptionId} has no indexed merchant`);
+          }
+          merchantId = subscription.merchantId;
+          planId = subscription.planId;
+
+          const state = statusByEvent[subscriptionEvent];
+          if (state) {
+            await tx
+              .update(subscriptions)
+              .set({ status: state, updatedAt: ts })
+              .where(eq(subscriptions.subscriptionId, subscriptionId));
+          }
+        }
+
+        if (!merchantId) {
+          throw new Error(`Subscription ${subscriptionId} has no indexed merchant`);
+        }
+        await tx.insert(subscriptionMetricEvents).values({
+          eventId: event.id,
+          subscriptionId,
+          merchantId,
+          planId: planId ?? null,
+          eventType: subscriptionEvent,
+          occurredAt: ts,
+        });
         break;
 
       case "dispute_bonds":
@@ -443,6 +590,7 @@ export class Database {
 
     const tableMap: Record<string, string> = {
       PAYMENT: "payments",
+      LINK: "payment_links",
       REFUND: "refunds",
       DISPUTE: "disputes",
       MERCHANT: "merchants",
@@ -548,6 +696,214 @@ export class Database {
       .where(eq(payments.merchantId, merchantId))
       .orderBy(desc(payments.createdAt))
       .limit(limit);
+  }
+
+  async recordPaymentLinkView(linkId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `INSERT INTO payment_link_views (link_id)
+       SELECT link_id FROM payment_links WHERE link_id = $1
+       RETURNING id`,
+      [linkId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async getPaymentLinkAnalytics(
+    linkId: string,
+    merchantId: string,
+  ): Promise<PaymentLinkAnalytics | null> {
+    const { rows } = await this.pool.query(
+      `SELECT l.link_id,
+              (SELECT COUNT(*) FROM payment_link_views v
+                WHERE v.link_id = l.link_id)::int AS views,
+              COUNT(p.payment_id)::int AS attempts,
+              COUNT(p.payment_id) FILTER (
+                WHERE UPPER(p.status) IN ('CONFIRMED', 'SETTLED')
+              )::int AS conversions,
+              COALESCE(SUM(p.amount) FILTER (
+                WHERE UPPER(p.status) IN ('CONFIRMED', 'SETTLED')
+              ), 0)::text AS total_revenue_stroops,
+              MAX(p.created_at) AT TIME ZONE 'UTC' AS last_used_at
+         FROM payment_links l
+         LEFT JOIN payments p ON p.payment_link_id = l.link_id
+        WHERE l.link_id = $1 AND l.merchant_id = $2
+        GROUP BY l.link_id`,
+      [linkId, merchantId],
+    );
+    return (rows[0] as PaymentLinkAnalytics | undefined) ?? null;
+  }
+
+  async getPaymentLinksForMerchant(merchantId: string): Promise<
+    Array<PaymentLinkAnalytics & { daily_conversions: number[] }>
+  > {
+    const { rows } = await this.pool.query(
+      `SELECT l.link_id,
+              (SELECT COUNT(*) FROM payment_link_views v
+                WHERE v.link_id = l.link_id)::int AS views,
+              COUNT(p.payment_id)::int AS attempts,
+              COUNT(p.payment_id) FILTER (
+                WHERE UPPER(p.status) IN ('CONFIRMED', 'SETTLED')
+              )::int AS conversions,
+              COALESCE(SUM(p.amount) FILTER (
+                WHERE UPPER(p.status) IN ('CONFIRMED', 'SETTLED')
+              ), 0)::text AS total_revenue_stroops,
+              MAX(p.created_at) AT TIME ZONE 'UTC' AS last_used_at
+         FROM payment_links l
+         LEFT JOIN payments p ON p.payment_link_id = l.link_id
+        WHERE l.merchant_id = $1
+        GROUP BY l.link_id
+        ORDER BY l.created_at DESC`,
+      [merchantId],
+    );
+    if (rows.length === 0) return [];
+
+    const { rows: dailyRows } = await this.pool.query(
+      `SELECT p.payment_link_id AS link_id,
+              p.created_at::date::text AS day,
+              COUNT(*)::int AS conversions
+         FROM payments p
+         JOIN payment_links l ON l.link_id = p.payment_link_id
+        WHERE l.merchant_id = $1
+          AND p.created_at >= ((NOW() AT TIME ZONE 'UTC')::date - 6)
+          AND UPPER(p.status) IN ('CONFIRMED', 'SETTLED')
+        GROUP BY p.payment_link_id, p.created_at::date`,
+      [merchantId],
+    );
+
+    const dailyByLink = new Map<string, Map<string, number>>();
+    for (const row of dailyRows as Array<{ link_id: string; day: string; conversions: number }>) {
+      const byDay = dailyByLink.get(row.link_id) ?? new Map<string, number>();
+      byDay.set(row.day, Number(row.conversions));
+      dailyByLink.set(row.link_id, byDay);
+    }
+    const days = Array.from({ length: 7 }, (_, index) => {
+      const day = new Date();
+      day.setUTCHours(0, 0, 0, 0);
+      day.setUTCDate(day.getUTCDate() - (6 - index));
+      return day.toISOString().slice(0, 10);
+    });
+
+    return (rows as PaymentLinkAnalytics[]).map((row) => ({
+      ...row,
+      views: Number(row.views),
+      attempts: Number(row.attempts),
+      conversions: Number(row.conversions),
+      total_revenue_stroops: String(row.total_revenue_stroops),
+      daily_conversions: days.map((day) => dailyByLink.get(row.link_id)?.get(day) ?? 0),
+    }));
+  }
+
+  async getSubscriptionMetrics(
+    merchantId: string,
+    periodStart: Date,
+    periodEnd: Date,
+  ): Promise<SubscriptionMetrics> {
+    const { rows } = await this.pool.query(
+      `WITH period_events AS (
+         SELECT subscription_id, event_type, occurred_at
+           FROM subscription_metric_events
+          WHERE merchant_id = $1
+            AND occurred_at >= $2
+            AND occurred_at < $3
+       ),
+       latest_state_at_start AS (
+         SELECT DISTINCT ON (subscription_id) subscription_id, event_type
+           FROM subscription_metric_events
+          WHERE merchant_id = $1
+            AND occurred_at < $2
+            AND event_type IN (
+              'CREATED', 'CHARGED', 'RESUMED', 'CANCELLED', 'EXPIRED',
+              'COMPLETED', 'CHARGE_FAILED', 'DUNNING_TRIGGERED', 'PAUSED'
+            )
+          ORDER BY subscription_id, occurred_at DESC, event_id DESC
+       ),
+       active_at_start AS (
+         SELECT COUNT(*)::int AS count
+           FROM latest_state_at_start
+          WHERE event_type IN ('CREATED', 'CHARGED', 'RESUMED')
+       ),
+       current_metrics AS (
+         SELECT
+           COALESCE(SUM(p.amount) FILTER (WHERE UPPER(s.status) = 'ACTIVE'), 0)::text AS mrr_stroops,
+           COUNT(*) FILTER (WHERE UPPER(s.status) = 'ACTIVE')::int AS active_subscribers,
+           COUNT(*) FILTER (WHERE UPPER(s.status) IN ('PAST_DUE', 'PASTDUE'))::int AS past_due_subscribers
+           FROM subscriptions s
+           JOIN subscription_plans p ON p.plan_id = s.plan_id
+          WHERE s.merchant_id = $1
+       ),
+       period_counts AS (
+         SELECT
+           COUNT(DISTINCT subscription_id) FILTER (WHERE event_type = 'CREATED')::int AS new_subscribers,
+           COUNT(DISTINCT subscription_id) FILTER (
+             WHERE event_type IN ('CANCELLED', 'EXPIRED', 'COMPLETED')
+           )::int AS churned_subscribers,
+           COUNT(DISTINCT subscription_id) FILTER (WHERE event_type = 'TRIAL_ENDED')::int AS trial_ends,
+           COUNT(DISTINCT subscription_id) FILTER (WHERE event_type = 'DUNNING_TRIGGERED')::int AS dunning_triggers
+           FROM period_events
+       ),
+       trial_conversions AS (
+         SELECT COUNT(DISTINCT t.subscription_id)::int AS count
+           FROM period_events t
+          WHERE t.event_type = 'TRIAL_ENDED'
+            AND EXISTS (
+              SELECT 1 FROM period_events c
+               WHERE c.subscription_id = t.subscription_id
+                 AND c.event_type = 'CHARGED'
+                 AND c.occurred_at >= t.occurred_at
+            )
+       ),
+       dunning_recoveries AS (
+         SELECT COUNT(DISTINCT d.subscription_id)::int AS count
+           FROM period_events d
+          WHERE d.event_type = 'DUNNING_TRIGGERED'
+            AND EXISTS (
+              SELECT 1 FROM period_events c
+               WHERE c.subscription_id = d.subscription_id
+                 AND c.event_type = 'CHARGED'
+                 AND c.occurred_at >= d.occurred_at
+            )
+       )
+       SELECT current_metrics.mrr_stroops,
+              current_metrics.active_subscribers,
+              current_metrics.past_due_subscribers,
+              period_counts.new_subscribers,
+              period_counts.churned_subscribers,
+              CASE WHEN active_at_start.count = 0 THEN NULL
+                   ELSE period_counts.churned_subscribers::decimal / active_at_start.count
+              END AS churn_rate,
+              trial_conversions.count AS trial_conversions,
+              CASE WHEN period_counts.trial_ends = 0 THEN NULL
+                   ELSE trial_conversions.count::decimal / period_counts.trial_ends
+              END AS trial_conversion_rate,
+              dunning_recoveries.count AS dunning_recoveries,
+              CASE WHEN period_counts.dunning_triggers = 0 THEN NULL
+                   ELSE dunning_recoveries.count::decimal / period_counts.dunning_triggers
+              END AS dunning_recovery_rate
+         FROM current_metrics
+         CROSS JOIN active_at_start
+         CROSS JOIN period_counts
+         CROSS JOIN trial_conversions
+         CROSS JOIN dunning_recoveries`,
+      [merchantId, periodStart, periodEnd],
+    );
+    const row = rows[0];
+    if (!row) {
+      throw new Error("Subscription metrics query returned no result");
+    }
+    return {
+      mrr_stroops: String(row.mrr_stroops),
+      active_subscribers: Number(row.active_subscribers),
+      new_subscribers: Number(row.new_subscribers),
+      churned_subscribers: Number(row.churned_subscribers),
+      churn_rate: row.churn_rate == null ? null : Number(row.churn_rate),
+      trial_conversions: Number(row.trial_conversions),
+      trial_conversion_rate:
+        row.trial_conversion_rate == null ? null : Number(row.trial_conversion_rate),
+      past_due_subscribers: Number(row.past_due_subscribers),
+      dunning_recoveries: Number(row.dunning_recoveries),
+      dunning_recovery_rate:
+        row.dunning_recovery_rate == null ? null : Number(row.dunning_recovery_rate),
+    };
   }
 
   /**

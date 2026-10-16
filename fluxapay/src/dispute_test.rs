@@ -1703,7 +1703,7 @@ fn test_propose_upgrade_timelock_and_cancel() {
     );
 
     // Too early
-    let early = payment_client.try_execute_upgrade(&admin);
+    let early = payment_client.try_execute_upgrade(&admin, &String::from_str(&env, "2.0.0"));
     assert_eq!(early, Err(Ok(Error::TimelockNotExpired)));
 
     // Cancel clears

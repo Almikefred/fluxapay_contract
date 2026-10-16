@@ -158,13 +158,21 @@ export default function InvoicesPage() {
         {/* Header */}
         <div className="mb-6 flex items-center justify-between">
           <h1 className="text-2xl font-bold text-gray-900">Invoices</h1>
-          <button
-            onClick={() => void fetchInvoices()}
-            disabled={loading}
-            className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
-          >
-            {loading ? "Loading…" : "Refresh"}
-          </button>
+          <div className="flex items-center gap-3">
+            <a href="/payment-links" className="text-sm font-medium text-indigo-700 hover:text-indigo-900">
+              Payment links
+            </a>
+            <a href="/subscriptions" className="text-sm font-medium text-indigo-700 hover:text-indigo-900">
+              Subscriptions
+            </a>
+            <button
+              onClick={() => void fetchInvoices()}
+              disabled={loading}
+              className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {loading ? "Loading…" : "Refresh"}
+            </button>
+          </div>
         </div>
 
         {/* Status filter tabs */}

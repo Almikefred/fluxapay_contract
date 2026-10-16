@@ -65,6 +65,28 @@ export function getKeyScopes(key: string): string[] | null {
   return null;
 }
 
+export function getKeyMerchantId(key: string): string | null {
+  const registered = apiKeyRegistry.get(key);
+  if (registered?.merchantId) {
+    return registered.merchantId;
+  }
+
+  if (process.env.API_KEYS) {
+    try {
+      const parsed = JSON.parse(process.env.API_KEYS);
+      if (Array.isArray(parsed)) {
+        const match = parsed.find((item: any) => item.key === key);
+        if (typeof match?.merchantId === "string") return match.merchantId;
+        if (typeof match?.merchant_id === "string") return match.merchant_id;
+      }
+    } catch {
+      // Match getKeyScopes behavior for malformed API_KEYS configuration.
+    }
+  }
+
+  return null;
+}
+
 export function extractApiKey(req: Request): string | null {
   const headerKey = req.headers["x-api-key"];
   if (typeof headerKey === "string" && headerKey.trim()) {
