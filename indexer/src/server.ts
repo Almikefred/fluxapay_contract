@@ -358,6 +358,22 @@ export function createServer(
 
   app.use(requireApiKey);
 
+  // Issue #957: every cached FX pair in one response, with per-pair staleness.
+  app.get("/v1/fx/rates", fxRatesRateLimit, (_req: Request, res: Response) => {
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const rates = listCachedRates().map((cached) => {
+      const [from, to] = cached.pair.split("_");
+      return {
+        from,
+        to,
+        rate: String(cached.rate),
+        updated_at: new Date(cached.updatedAt * 1000).toISOString(),
+        stale: nowSecs - cached.updatedAt > DEFAULT_FX_STALENESS_SECS,
+      };
+    });
+    res.status(200).json({ rates, staleness_threshold_secs: DEFAULT_FX_STALENESS_SECS });
+  });
+
   // Webhook test delivery and delivery history (Issues #808, #810, #854).
   app.use("/webhooks", requireScope("manage:webhooks"));
   registerWebhookRoutes(app, {
