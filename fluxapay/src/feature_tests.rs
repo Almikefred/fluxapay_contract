@@ -174,6 +174,8 @@ fn batch_create_links_creates_all_and_they_are_retrievable() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let merchant = Address::generate(&env);
+    client.initialize(&merchant).unwrap();
+    client.grant_merchant_role(&merchant, &merchant);
 
     let batch = vec![
         &env,
@@ -200,6 +202,8 @@ fn batch_create_links_rejects_more_than_50() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let merchant = Address::generate(&env);
+    client.initialize(&merchant).unwrap();
+    client.grant_merchant_role(&merchant, &merchant);
 
     let mut batch: Vec<CreateLinkArgs> = vec![&env];
     for i in 0..51u32 {
@@ -221,6 +225,8 @@ fn batch_create_links_rejects_duplicate_id_atomically() {
     let contract_id = env.register(PaymentLinkManager, ());
     let client = PaymentLinkManagerClient::new(&env, &contract_id);
     let merchant = Address::generate(&env);
+    client.initialize(&merchant).unwrap();
+    client.grant_merchant_role(&merchant, &merchant);
 
     let batch = vec![
         &env,
@@ -289,6 +295,9 @@ fn create_payment_link_invoice_links_both_records() {
     let plm = PaymentLinkManagerClient::new(&env, &plm_id);
 
     let merchant = Address::generate(&env);
+    plm.initialize(&admin).unwrap();
+    plm.grant_merchant_role(&admin, &merchant);
+    pp.grant_merchant_role(&admin, &merchant);
     let line_items = vec![
         &env,
         LineItem {
@@ -347,8 +356,12 @@ fn create_payment_link_invoice_rejects_bad_link_atomically() {
     let admin = Address::generate(&env);
     pp.initialize_payment_processor(&admin);
     let plm_id = env.register(PaymentLinkManager, ());
+    let plm = PaymentLinkManagerClient::new(&env, &plm_id);
 
     let merchant = Address::generate(&env);
+    plm.initialize(&admin).unwrap();
+    plm.grant_merchant_role(&admin, &merchant);
+    pp.grant_merchant_role(&admin, &merchant);
     let res = pp.try_create_payment_link_invoice(
         &merchant,
         &plm_id,

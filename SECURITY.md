@@ -5,6 +5,12 @@ FluxaPay takes the security of our Soroban smart contracts and user funds (USDC)
 > [!IMPORTANT]
 > This project is in **active development** and has not yet completed an external security audit. Do not deploy to mainnet until the external audit is complete. See [Audit Status](#-audit-status) below.
 
+## Threat Model
+
+See the [FluxaPay threat model](docs/threat-model.md) for assets at risk, attack
+surfaces, implemented mitigations, and residual risks. This document is not an
+independent audit and should be reviewed alongside the current contract source.
+
 ---
 
 ## 📬 Reporting a Vulnerability

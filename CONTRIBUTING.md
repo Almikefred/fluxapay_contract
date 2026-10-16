@@ -31,7 +31,7 @@ For security vulnerabilities, see [SECURITY.md](SECURITY.md) instead of opening 
 | wasm32 target | — | Automatically installed via `rust-toolchain.toml` |
 | Stellar CLI | 21.x | [stellar.org/docs](https://developers.stellar.org/docs/tools/developer-tools/stellar-cli) |
 | cargo-audit | latest | `cargo install cargo-audit` |
-| cargo-deny | latest | `cargo install cargo-deny` |
+| cargo-deny | 0.20.2 | `cargo install --locked cargo-deny --version 0.20.2` |
 
 ### Environment Variables
 
@@ -124,7 +124,18 @@ Or via Makefile:
 cd fluxapay && make fmt && cargo clippy --all-targets --all-features
 ```
 
-CI runs `cargo deny check bans licenses advisories` automatically in the `Security Scan` job (see `.github/workflows/ci.yml`), gated by `deny.toml`, and it must pass before the build job runs.
+CI runs `cargo deny check bans licenses advisories --warn unsound --warn unmaintained` automatically in the `Security Scan` job (see `.github/workflows/ci.yml`), gated by `deny.toml`; the final CI success check requires it to pass. Unsound and unmaintained advisories remain visible as warnings, matching the repository's existing non-blocking policy; vulnerabilities remain errors.
+
+The duplicate-version check excludes dev-dependency edges
+(`multiple-versions-include-dev = false` in `deny.toml`), so test-only crates do
+not add noise to production dependency version checks. Explicit crate bans still
+apply to the dependency graph cargo-deny evaluates. If a production dependency
+must be exempted from a future ban or duplicate-version rule, add a narrowly
+scoped entry to `[bans].skip` with the exact crate name and version plus a
+`reason` describing why it is necessary and how it is limited. Do not exempt a
+crate merely because it appears in tests if it is also reachable through a
+production dependency. Review the dependency tree (`cargo tree -e normal`) and
+remove obsolete exceptions when upgrading dependencies.
 
 ### Linting GitHub Actions Workflows (actionlint)
 

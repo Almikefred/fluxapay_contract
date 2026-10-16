@@ -15,7 +15,12 @@ pub fn compute_total_accrued(
     now: u64,
     rate_per_second: i128,
     remaining_deposit: i128,
+    cliff_at: Option<u64>,
 ) -> i128 {
+    if cliff_at.map_or(false, |cliff| now < cliff) {
+        return 0;
+    }
+
     let rate = rate_per_second.max(0);
     let deposit = remaining_deposit.max(0);
     let elapsed = now.saturating_sub(last_checkpoint_at);
@@ -83,6 +88,10 @@ pub struct PaymentStream {
     pub accrued_at_pause: i128,
     /// Stream lifecycle state.
     pub status: StreamStatus,
+    /// Optional timestamp before which accrued tokens cannot be withdrawn.
+    pub cliff_at: Option<u64>,
+    /// Whether the first post-cliff withdrawal has emitted `STREAM/CLIFF_REACHED`.
+    pub cliff_reached: bool,
     /// When false, distributions (withdrawals) are locked until the sender
     /// explicitly approves milestones for this stream.
     pub milestones_approved: bool,
@@ -173,21 +182,8 @@ pub enum StreamError {
     InvalidReceiver = 14,
     /// Issue #627: A bulk operation was passed more stream IDs than the per-call cap.
     BatchTooLarge = 15,
-    /// Issue #831: Multi-payee stream has zero payees.
-    EmptyPayees = 16,
-    /// Issue #831: Multi-payee stream exceeds [`MAX_MULTI_PAYEES`].
-    TooManyPayees = 17,
-    /// Issue #831: Payee `share_bps` values must sum to exactly 10_000.
-    InvalidPayeeShares = 18,
-    /// Issue #831: Requested stream is not a multi-payee stream.
-    NotMultiStream = 19,
-    /// Cliff period has not been reached yet.
-    CliffNotReached = 20,
-    /// Issue #1070: Deposit amount for top_up_stream must be positive.
-    InvalidAmount = 21,
-    /// Issue #1070: Stream is in a terminal state (Cancelled or Exhausted) and
-    /// cannot receive additional deposits.
-    InvalidState = 22,
+    /// Stream accrual is locked until its cliff timestamp.
+    CliffNotReached = 16,
 }
 
 /// Issue #627: Maximum number of stream IDs accepted by `bulk_bump_stream_ttls`
@@ -428,6 +424,55 @@ impl PaymentStreaming {
         stream_id: String,
         min_rate: Option<i128>,
     ) -> Result<PaymentStream, StreamError> {
+        Self::create_stream_internal(
+            env,
+            sender,
+            receiver,
+            token,
+            rate_per_second,
+            deposit,
+            stream_id,
+            min_rate,
+            None,
+        )
+    }
+
+    /// Create a payment stream whose accrued tokens stay locked until `cliff_at`.
+    pub fn create_stream_with_cliff(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        token: Address,
+        rate_per_second: i128,
+        deposit: i128,
+        stream_id: String,
+        min_rate: Option<i128>,
+        cliff_at: u64,
+    ) -> Result<PaymentStream, StreamError> {
+        Self::create_stream_internal(
+            env,
+            sender,
+            receiver,
+            token,
+            rate_per_second,
+            deposit,
+            stream_id,
+            min_rate,
+            Some(cliff_at),
+        )
+    }
+
+    fn create_stream_internal(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        token: Address,
+        rate_per_second: i128,
+        deposit: i128,
+        stream_id: String,
+        min_rate: Option<i128>,
+        cliff_at: Option<u64>,
+    ) -> Result<PaymentStream, StreamError> {
         sender.require_auth();
         if sender == receiver {
             return Err(StreamError::InvalidReceiver);
@@ -462,6 +507,8 @@ impl PaymentStreaming {
             accrued_at_checkpoint: 0,
             accrued_at_pause: 0,
             status: StreamStatus::Active,
+            cliff_at,
+            cliff_reached: false,
             milestones_approved: false,
         };
 
@@ -780,6 +827,12 @@ impl PaymentStreaming {
             .ok_or(StreamError::StreamNotFound)?;
 
         if stream.status != StreamStatus::Active {
+            if stream
+                .cliff_at
+                .map_or(false, |cliff| env.ledger().timestamp() < cliff)
+            {
+                return Ok(0);
+            }
             return Ok(stream.accrued_at_checkpoint);
         }
 
@@ -790,6 +843,7 @@ impl PaymentStreaming {
             now,
             stream.rate_per_second,
             stream.remaining_deposit,
+            stream.cliff_at,
         ))
     }
 
@@ -860,13 +914,15 @@ impl PaymentStreaming {
                 }
 
                 let now = env.ledger().timestamp();
-                stream.accrued_at_checkpoint = compute_total_accrued(
-                    stream.accrued_at_checkpoint,
-                    stream.last_checkpoint_at,
-                    now,
-                    stream.rate_per_second,
-                    stream.remaining_deposit,
-                );
+                if stream.cliff_at.map_or(false, |cliff| now < cliff) {
+                    continue;
+                }
+                let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+                let newly_accrued = (elapsed as i128)
+                    .saturating_mul(stream.rate_per_second)
+                    .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+                stream.accrued_at_checkpoint =
+                    stream.accrued_at_checkpoint.saturating_add(newly_accrued);
                 stream.last_checkpoint_at = now;
 
                 let withdrawable = stream
@@ -877,6 +933,10 @@ impl PaymentStreaming {
                     continue;
                 }
 
+                let reached_cliff_now = stream.cliff_at.is_some() && !stream.cliff_reached;
+                if reached_cliff_now {
+                    stream.cliff_reached = true;
+                }
                 stream.accrued_at_checkpoint =
                     stream.accrued_at_checkpoint.saturating_sub(withdrawable);
                 stream.remaining_deposit = stream.remaining_deposit.saturating_sub(withdrawable);
@@ -903,6 +963,15 @@ impl PaymentStreaming {
                 token_client.transfer(&env.current_contract_address(), &recipient, &net);
                 release_lock(&env, &stream_id);
 
+                if reached_cliff_now {
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "STREAM"),
+                            Symbol::new(&env, "CLIFF_REACHED"),
+                        ),
+                        (stream_id.clone(), now),
+                    );
+                }
                 env.events().publish(
                     (Symbol::new(&env, "STREAM"), Symbol::new(&env, "WITHDRAWN")),
                     (
@@ -948,17 +1017,20 @@ impl PaymentStreaming {
             .clone()
             .ok_or(StreamError::DestinationNotSet)?;
 
+        let now = env.ledger().timestamp();
+        if stream.cliff_at.map_or(false, |cliff| now < cliff) {
+            return Err(StreamError::CliffNotReached);
+        }
+
         // Reentrancy guard: acquire lock before any state mutation or transfer
         acquire_lock(&env, &stream_id)?;
 
-        let now = env.ledger().timestamp();
-        stream.accrued_at_checkpoint = compute_total_accrued(
-            stream.accrued_at_checkpoint,
-            stream.last_checkpoint_at,
-            now,
-            stream.rate_per_second,
-            stream.remaining_deposit,
-        );
+        let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+        let newly_accrued = (elapsed as i128)
+            .saturating_mul(stream.rate_per_second)
+            .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+
+        stream.accrued_at_checkpoint = stream.accrued_at_checkpoint.saturating_add(newly_accrued);
         stream.last_checkpoint_at = now;
 
         let withdrawable = stream
@@ -972,6 +1044,10 @@ impl PaymentStreaming {
             return Ok(stream_id);
         }
 
+        let reached_cliff_now = stream.cliff_at.is_some() && !stream.cliff_reached;
+        if reached_cliff_now {
+            stream.cliff_reached = true;
+        }
         stream.accrued_at_checkpoint = stream.accrued_at_checkpoint.saturating_sub(withdrawable);
         stream.remaining_deposit = stream.remaining_deposit.saturating_sub(withdrawable);
         if stream.remaining_deposit == 0 {
@@ -994,6 +1070,15 @@ impl PaymentStreaming {
 
         release_lock(&env, &stream_id);
 
+        if reached_cliff_now {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "STREAM"),
+                    Symbol::new(&env, "CLIFF_REACHED"),
+                ),
+                (stream_id.clone(), now),
+            );
+        }
         env.events().publish(
             (Symbol::new(&env, "STREAM"), Symbol::new(&env, "WITHDRAWN")),
             (
@@ -1117,7 +1202,14 @@ impl PaymentStreaming {
         );
         stream.last_checkpoint_at = now;
 
-        let accrued = stream.accrued_at_checkpoint;
+        let accrued = if stream.cliff_at.map_or(false, |cliff| now < cliff) {
+            0
+        } else {
+            stream.accrued_at_checkpoint
+        };
+        let reached_cliff_now = accrued > 0 && stream.cliff_at.is_some() && !stream.cliff_reached;
+        stream.cliff_reached |= reached_cliff_now;
+        stream.accrued_at_checkpoint = accrued;
         let refund = stream.remaining_deposit.saturating_sub(accrued);
 
         // Effects: mark cancelled
@@ -1138,6 +1230,15 @@ impl PaymentStreaming {
             token_client.transfer(&env.current_contract_address(), &stream.sender, &refund);
         }
 
+        if reached_cliff_now {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "STREAM"),
+                    Symbol::new(&env, "CLIFF_REACHED"),
+                ),
+                (stream_id.clone(), now),
+            );
+        }
         env.events().publish(
             (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CANCELLED")),
             (stream_id, sender, accrued, refund),
@@ -1277,7 +1378,15 @@ impl PaymentStreaming {
             );
             stream.last_checkpoint_at = now;
 
-            let accrued = stream.accrued_at_checkpoint;
+            let accrued = if stream.cliff_at.map_or(false, |cliff| now < cliff) {
+                0
+            } else {
+                stream.accrued_at_checkpoint
+            };
+            let reached_cliff_now =
+                accrued > 0 && stream.cliff_at.is_some() && !stream.cliff_reached;
+            stream.cliff_reached |= reached_cliff_now;
+            stream.accrued_at_checkpoint = accrued;
             let refund = stream.remaining_deposit.saturating_sub(accrued);
 
             // Effects
@@ -1296,6 +1405,15 @@ impl PaymentStreaming {
                 token_client.transfer(&env.current_contract_address(), &stream.sender, &refund);
             }
 
+            if reached_cliff_now {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "STREAM"),
+                        Symbol::new(&env, "CLIFF_REACHED"),
+                    ),
+                    (stream_id.clone(), now),
+                );
+            }
             env.events().publish(
                 (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CANCELLED")),
                 (stream_id.clone(), sender.clone(), accrued, refund),
@@ -1490,7 +1608,15 @@ impl PaymentStreaming {
             );
             stream.last_checkpoint_at = now;
 
-            let accrued = stream.accrued_at_checkpoint;
+            let accrued = if stream.cliff_at.map_or(false, |cliff| now < cliff) {
+                0
+            } else {
+                stream.accrued_at_checkpoint
+            };
+            let reached_cliff_now =
+                accrued > 0 && stream.cliff_at.is_some() && !stream.cliff_reached;
+            stream.cliff_reached |= reached_cliff_now;
+            stream.accrued_at_checkpoint = accrued;
             let refund = stream.remaining_deposit.saturating_sub(accrued);
 
             stream.status = StreamStatus::Cancelled;
@@ -1507,6 +1633,15 @@ impl PaymentStreaming {
                 token_client.transfer(&env.current_contract_address(), &stream.sender, &refund);
             }
 
+            if reached_cliff_now {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "STREAM"),
+                        Symbol::new(&env, "CLIFF_REACHED"),
+                    ),
+                    (stream_id.clone(), now),
+                );
+            }
             env.events().publish(
                 (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CANCELLED")),
                 (stream_id.clone(), sender.clone(), accrued, refund),
@@ -1558,13 +1693,15 @@ impl PaymentStreaming {
 
             // Recompute accrued up to now
             let now = env.ledger().timestamp();
-            stream.accrued_at_checkpoint = compute_total_accrued(
-                stream.accrued_at_checkpoint,
-                stream.last_checkpoint_at,
-                now,
-                stream.rate_per_second,
-                stream.remaining_deposit,
-            );
+            if stream.cliff_at.map_or(false, |cliff| now < cliff) {
+                return Err(StreamError::CliffNotReached);
+            }
+            let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+            let newly_accrued = (elapsed as i128)
+                .saturating_mul(stream.rate_per_second)
+                .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+            stream.accrued_at_checkpoint =
+                stream.accrued_at_checkpoint.saturating_add(newly_accrued);
             stream.last_checkpoint_at = now;
 
             let withdrawable = stream.accrued_at_checkpoint.min(w.amount).max(0);
@@ -1572,6 +1709,10 @@ impl PaymentStreaming {
                 continue;
             }
 
+            let reached_cliff_now = stream.cliff_at.is_some() && !stream.cliff_reached;
+            if reached_cliff_now {
+                stream.cliff_reached = true;
+            }
             // Effects
             stream.accrued_at_checkpoint =
                 stream.accrued_at_checkpoint.saturating_sub(withdrawable);
@@ -1598,6 +1739,15 @@ impl PaymentStreaming {
             }
             token_client.transfer(&env.current_contract_address(), &w.destination, &net);
 
+            if reached_cliff_now {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "STREAM"),
+                        Symbol::new(&env, "CLIFF_REACHED"),
+                    ),
+                    (w.stream_id.clone(), now),
+                );
+            }
             env.events().publish(
                 (Symbol::new(&env, "STREAM"), Symbol::new(&env, "WITHDRAWN")),
                 (

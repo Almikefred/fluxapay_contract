@@ -136,13 +136,12 @@ source of truth.
 ### Merchant Role
 
 **Permissions:**
-- Create payment links via PaymentLinkManager
-- Register in MerchantRegistry
-- Set merchant-specific rate limits
+- Create payments, payment links, and payment-link invoices as the address holding the role
+- Request refunds for its own payments
 - View their own payments and refunds
 - Receive payment settlements
 
-**How Granted:** Admin grants via `grant_role()` after merchant verification
+**How Granted:** Admin grants or revokes the role via `grant_merchant_role()` / `revoke_merchant_role()` on the relevant contract. Payment creation and invoice-linked payment links also validate the merchant's configured registry record when a MerchantRegistry is configured. PaymentLinkManager maintains its own role state, administered by its initialized contract admin. A role never authorizes acting for another merchant address.
 
 ### Oracle Role
 
@@ -412,6 +411,8 @@ pub fn execute_swap(
 
 ## Security Considerations
 
+- **Threat Model**: See the [FluxaPay threat model](threat-model.md) for assets,
+  attack surfaces, mitigations, and residual risks.
 - **Reentrancy Protection**: `ReentrancyLock` guards concurrent settle/refund operations
 - **Rate Limiting**: Per-merchant, per-payer, and global limits prevent spam
 - **Idempotency**: Duplicate payment requests detected via idempotency keys

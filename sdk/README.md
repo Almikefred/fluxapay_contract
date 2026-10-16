@@ -65,6 +65,14 @@ and prerequisites.
 
 ## Quick Start
 
+Merchant operations require an administrator to grant the `MERCHANT` role to
+the merchant address before the call. Grant it on `PaymentProcessor` before
+creating payments, on `PaymentLinkManager` before creating links, and on
+`RefundManager` only when the merchant will initiate refunds. These are
+contract-level admin calls (`grant_merchant_role` / `revoke_merchant_role`);
+the merchant still signs its own operations, and the role does not authorize
+acting as another merchant.
+
 ```typescript
 import { FluxapayClient } from "@fluxapay/sdk";
 
@@ -751,7 +759,11 @@ const rate = await oracle.getRate("USDCNGN");
 
 ## Payment Links (FluxapayClient)
 
-Payment links let merchants share a reusable URL that payers can settle against. Pass `paymentLinkContractId` in config to enable these methods.
+Payment links let merchants share a reusable URL that payers can settle against.
+Pass `paymentLinkContractId` in config to enable these methods.
+The `PaymentLinkManager` must be initialized by its admin, who must grant the
+merchant role on that contract before `createLink`, `createPaymentLink`, or
+`batchCreateLinks` is called.
 
 ### Create a payment link
 

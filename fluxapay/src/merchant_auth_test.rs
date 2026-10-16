@@ -1,261 +1,132 @@
-//! Integration-style tests for the MerchantPreAuth pull-payment lifecycle:
-//! pre-authorize → pull_payment → remaining_limit decrease → revoke.
-//!
-//! All tests run against the Soroban test environment (`Env::default()`); no
-//! network calls are made.
+#![cfg(test)]
 
-use crate::{MerchantAuthError, PaymentProcessor, PaymentProcessorClient};
+use crate::{
+    CreatePaymentArgs, Error, PaymentCharge, PaymentProcessor, PaymentProcessorClient,
+    PaymentStatus, RefundManager, RefundManagerClient,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, Address, Env,
+    Address, Env, String, Symbol,
 };
 
-/// Register a fresh PaymentProcessor with an admin.
-fn setup(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
-    let contract_id = env.register(PaymentProcessor, ());
-    let client = PaymentProcessorClient::new(env, &contract_id);
-    let admin = Address::generate(env);
-    client.initialize_payment_processor(&admin);
-    (admin, client)
+fn create_payment_args(env: &Env, merchant_id: &Address, payment_id: &str) -> CreatePaymentArgs {
+    CreatePaymentArgs {
+        payment_id: String::from_str(env, payment_id),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: 10_000,
+        currency: Symbol::new(env, "USDC"),
+        deposit_address: Address::generate(env),
+        expires_at: Some(env.ledger().timestamp() + 3_600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+        retry_of_payment_id: None,
+        payer_muxed_id: None,
+    }
 }
 
-/// Mint funds to a customer and grant `merchant` a pull authorization whose
-/// period budget is `limit_per_period` every `period_secs` seconds.
-fn setup_authorization(
-    env: &Env,
-    client: &PaymentProcessorClient<'_>,
-    limit_per_period: i128,
-    period_secs: u64,
-) -> (Address, Address, Address) {
-    let customer = Address::generate(env);
-    let merchant = Address::generate(env);
-    let token_admin = Address::generate(env);
-    let token = env
+#[test]
+fn merchant_role_grants_and_revokes_payment_creation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize_payment_processor(&admin);
+
+    let merchant = Address::generate(&env);
+    client.grant_merchant_role(&admin, &merchant);
+
+    let mut args = create_payment_args(&env, &merchant, "auth_payment");
+    args.client_token = Some(String::from_str(&env, "merchant_create_key"));
+    let payment = client.create_payment(&args);
+    assert_eq!(payment.merchant_id, merchant);
+
+    let other_merchant = Address::generate(&env);
+    let other_result = client.try_create_payment(&create_payment_args(
+        &env,
+        &other_merchant,
+        "other_merchant_payment",
+    ));
+    assert_eq!(other_result, Err(Ok(Error::Unauthorized)));
+
+    client.revoke_merchant_role(&admin, &merchant);
+    let replay_result = client.try_create_payment(&args);
+    assert_eq!(replay_result, Err(Ok(Error::Unauthorized)));
+    let revoked_result =
+        client.try_create_payment(&create_payment_args(&env, &merchant, "revoked_payment"));
+    assert_eq!(revoked_result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn merchant_role_is_required_for_merchant_requested_refunds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|ledger| ledger.timestamp = 10_000);
+
+    let contract_id = env.register(RefundManager, ());
+    let client = RefundManagerClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
         .register_stellar_asset_contract_v2(token_admin)
         .address();
+    client.initialize_refund_manager(&admin, &token_address);
 
-    token::StellarAssetClient::new(env, &token).mint(&customer, &1_000_000_000i128);
+    let merchant = Address::generate(&env);
+    let payment_id = String::from_str(&env, "merchant_refund_payment");
+    let payment = PaymentCharge {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        amount: 1_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        status: PaymentStatus::Confirmed,
+        payer_address: None,
+        transaction_hash: None,
+        created_at: 1,
+        confirmed_at: Some(1),
+        expires_at: 0,
+        amount_received: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        metadata_hash: None,
+        fx_rate: None,
+        fx_rate_at: None,
+        original_token: None,
+        swap_path: None,
+        metadata: None,
+        fee_waiver_code: None,
+        retry_of_payment_id: None,
+        payer_muxed_id: None,
+        payment_link_id: None,
+    };
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::Payment(payment_id.clone()), &payment);
+    });
 
-    client.pre_authorize_merchant(
-        &customer,
+    client.grant_merchant_role(&admin, &merchant);
+    let reason = String::from_str(&env, "merchant refund");
+    let idempotency_key = Some(String::from_str(&env, "merchant_refund_key"));
+    client.create_refund_idempotent(&payment_id, &400, &reason, &merchant, &idempotency_key);
+
+    client.revoke_merchant_role(&admin, &merchant);
+    let result = client.try_create_refund_idempotent(
+        &payment_id,
+        &400,
+        &reason,
         &merchant,
-        &token,
-        &limit_per_period,
-        &period_secs,
+        &idempotency_key,
     );
-
-    (customer, merchant, token)
-}
-
-#[test]
-fn test_pre_authorize_and_pull_payment_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let (customer, merchant, token) = setup_authorization(&env, &client, 1_000i128, 100u64);
-
-    let pulled = client.pull_payment(&merchant, &customer, &400i128);
-    assert_eq!(pulled, 400i128);
-
-    let auth = client.get_merchant_authorization(&customer, &merchant);
-    assert!(auth.active);
-    assert_eq!(auth.pulled_this_period, 400i128);
-
-    // Funds moved customer -> merchant.
-    let token_client = token::TokenClient::new(&env, &token);
-    assert_eq!(token_client.balance(&customer), 1_000_000_000i128 - 400i128);
-    assert_eq!(token_client.balance(&merchant), 400i128);
-}
-
-#[test]
-fn test_pull_payment_exceeds_authorization_limit() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
-
-    let result = client.try_pull_payment(&merchant, &customer, &1_001i128);
-    assert_eq!(result, Err(Ok(MerchantAuthError::LimitExceeded)));
-
-    // The full authorized amount is still pullable in the same period.
-    let pulled = client.pull_payment(&merchant, &customer, &1_000i128);
-    assert_eq!(pulled, 1_000i128);
-}
-
-#[test]
-fn test_revoke_authorization_blocks_future_pulls() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
-
-    client.revoke_merchant_authorization(&customer, &merchant);
-
-    let auth = client.get_merchant_authorization(&customer, &merchant);
-    assert!(!auth.active);
-
-    let result = client.try_pull_payment(&merchant, &customer, &100i128);
-    assert_eq!(result, Err(Ok(MerchantAuthError::AuthorizationInactive)));
-
-    // A revoked authorization has no remaining budget.
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        0i128
-    );
-}
-
-#[test]
-fn test_remaining_limit_decreases_after_each_pull() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
-
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        1_000i128
-    );
-
-    client.pull_payment(&merchant, &customer, &300i128);
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        700i128
-    );
-
-    client.pull_payment(&merchant, &customer, &200i128);
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        500i128
-    );
-
-    // Exhausting the limit reports zero remaining.
-    client.pull_payment(&merchant, &customer, &500i128);
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        0i128
-    );
-}
-
-#[test]
-fn test_pre_auth_period_reset() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
-
-    // Exhaust the current period budget.
-    client.pull_payment(&merchant, &customer, &1_000i128);
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        0i128
-    );
-    assert!(client.try_pull_payment(&merchant, &customer, &1i128).is_err());
-
-    // After the period rolls over the authorization renews.
-    env.ledger().with_mut(|ledger| ledger.timestamp += 101);
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        1_000i128
-    );
-
-    let pulled = client.pull_payment(&merchant, &customer, &800i128);
-    assert_eq!(pulled, 800i128);
-
-    let auth = client.get_merchant_authorization(&customer, &merchant);
-    assert_eq!(auth.pulled_this_period, 800i128);
-}
-
-#[test]
-fn test_pre_authorize_same_merchant_twice_replaces() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let (customer, merchant, token) = setup_authorization(&env, &client, 1_000i128, 100u64);
-
-    // Consume part of the first authorization's budget.
-    client.pull_payment(&merchant, &customer, &400i128);
-
-    // A second pre-authorization replaces the first grant in place: the
-    // pulled-budget counter resets and the new terms take effect.
-    client.pre_authorize_merchant(&customer, &merchant, &token, &2_000i128, &200u64);
-
-    let auth = client.get_merchant_authorization(&customer, &merchant);
-    assert!(auth.active);
-    assert_eq!(auth.limit_per_period, 2_000i128);
-    assert_eq!(auth.period_secs, 200u64);
-    assert_eq!(auth.pulled_this_period, 0i128);
-
-    // The replacement allowance is fully available under the new limit.
-    assert_eq!(
-        client.merchant_authorization_remaining(&customer, &merchant),
-        2_000i128
-    );
-    let pulled = client.pull_payment(&merchant, &customer, &2_000i128);
-    assert_eq!(pulled, 2_000i128);
-}
-
-#[test]
-fn test_create_api_key_within_expiry_is_valid() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let merchant = Address::generate(&env);
-
-    let now = env.ledger().timestamp();
-    let key = client.create_api_key(&merchant, &Some(now + 1_000u64));
-
-    // A key whose expiry is still in the future verifies successfully.
-    assert!(client.verify_api_key(&merchant, &key));
-}
-
-#[test]
-fn test_verify_api_key_rejects_expired_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, client) = setup(&env);
-    let merchant = Address::generate(&env);
-
-    let now = env.ledger().timestamp();
-    let key = client.create_api_key(&merchant, &Some(now + 100u64));
-
-    // Advance the ledger past the key's expiry.
-    env.ledger().with_mut(|ledger| ledger.timestamp += 101);
-
-    let result = client.try_verify_api_key(&merchant, &key);
-    assert_eq!(result, Err(Ok(MerchantAuthError::ApiKeyExpired)));
-}
-
-#[test]
-fn test_admin_max_lifetime_rejects_longer_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client) = setup(&env);
-    let merchant = Address::generate(&env);
-
-    // Admin enforces a maximum key lifetime of 1 hour.
-    client.set_max_key_lifetime_secs(&admin, &3_600u64);
-
-    let now = env.ledger().timestamp();
-    let result = client.try_create_api_key(&merchant, &Some(now + 7_200u64));
-    assert_eq!(result, Err(Ok(MerchantAuthError::KeyLifetimeExceedsMax)));
-}
-
-#[test]
-fn test_no_expiry_key_rejected_when_past_admin_max() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client) = setup(&env);
-    let merchant = Address::generate(&env);
-
-    // Admin enforces a maximum key lifetime of 1 hour.
-    client.set_max_key_lifetime_secs(&admin, &3_600u64);
-
-    // A key created without an explicit expiry inherits the admin max.
-    let key = client.create_api_key(&merchant, &None);
-
-    // Advance the ledger past the admin-configured maximum lifetime.
-    env.ledger().with_mut(|ledger| ledger.timestamp += 3_601);
-
-    let result = client.try_verify_api_key(&merchant, &key);
-    assert_eq!(result, Err(Ok(MerchantAuthError::ApiKeyExpired)));
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
