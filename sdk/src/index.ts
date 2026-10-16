@@ -24,6 +24,9 @@ import {
   buildPullAuthorizationPayload,
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
+  OfflineSigner,
+  OfflineTransactionBuilder,
+  type OfflineBuilderConfig,
 } from "./offline-signer.js";
 import {
   NetworkProfileSwitcher,
@@ -3506,6 +3509,9 @@ export {
   buildPullAuthorizationPayload,
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
+  OfflineSigner,
+  OfflineTransactionBuilder,
+  type OfflineBuilderConfig,
   NetworkProfileSwitcher,
   type NetworkEnvironment,
   NetworkProfiles,

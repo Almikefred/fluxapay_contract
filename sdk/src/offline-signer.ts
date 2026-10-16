@@ -159,6 +159,99 @@ export class FluxapayOfflineSigner {
     private readonly networkPassphrase: string,
   ) {}
 
+  /**
+   * Build an unsigned transaction for a contract method call (Issue #1059).
+   * 
+   * Returns the unsigned XDR and transaction hash that can be transferred to
+   * an air-gapped signer for signature.
+   * 
+   * @param method - Contract method name (e.g., 'create_payment')
+   * @param args - Method arguments matching the contract method signature
+   * @returns Object with `xdr` (base64 unsigned transaction) and `txHash` (hex transaction hash)
+   */
+  async buildUnsignedTransaction(
+    method: string,
+    args: Record<string, unknown>,
+  ): Promise<{ xdr: string; txHash: string }> {
+    // Dynamically invoke the method on the client
+    const clientMethod = (this.client as any)[method];
+    if (!clientMethod) {
+      throw new Error(`Unknown contract method: ${method}`);
+    }
+
+    const tx = await clientMethod.call(this.client, args);
+    const payload = await buildOfflinePayload(
+      method,
+      this.contractId,
+      this.networkPassphrase,
+      tx,
+    );
+
+    return {
+      xdr: payload.unsignedXdr,
+      txHash: payload.hash,
+    };
+  }
+
+  /**
+   * Sign an unsigned transaction XDR with a Stellar keypair (Issue #1059).
+   * 
+   * This is a static method that can be used in air-gapped environments with
+   * zero network dependencies.
+   * 
+   * @param xdr - Base64-encoded unsigned transaction envelope
+   * @param signerKeypair - Stellar keypair to sign with
+   * @returns Base64-encoded signed transaction envelope
+   */
+  static async sign(params: {
+    xdr: string;
+    signerKeypair: { publicKey(): string; sign(data: Buffer): Buffer };
+  }): Promise<string> {
+    const { Transaction, Keypair } = await import("@stellar/stellar-sdk");
+    
+    // Parse the unsigned transaction
+    const tx = new Transaction(params.xdr, undefined as any);
+    
+    // Sign with the provided keypair
+    tx.sign(params.signerKeypair as any);
+    
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  /**
+   * Submit a pre-signed transaction to the Stellar network (Issue #1059).
+   * 
+   * @param signedXdr - Base64-encoded signed transaction envelope
+   * @returns Transaction result from the contract
+   */
+  async submitSignedTransaction(signedXdr: string): Promise<unknown> {
+    const { SorobanRpc } = await import("@stellar/stellar-sdk");
+    
+    // Get the RPC server from the client's options
+    const rpcUrl = (this.client as any).options?.rpcUrl;
+    if (!rpcUrl) {
+      throw new Error("No RPC URL configured in client");
+    }
+    
+    const server = new SorobanRpc.Server(rpcUrl);
+    const response = await server.sendTransaction(signedXdr as any);
+    
+    // Wait for confirmation and return result
+    if (response.status === "PENDING") {
+      let attempt = 0;
+      while (attempt < 10) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const txResponse = await server.getTransaction(response.hash);
+        if (txResponse.status !== SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+          return txResponse;
+        }
+        attempt++;
+      }
+    }
+    
+    return response;
+  }
+
   buildCreatePayment(
     args: Parameters<ContractClient["create_payment"]>[0],
   ): Promise<OfflineTransactionPayload> {
@@ -309,3 +402,23 @@ export class OfflineTransactionBuilder {
     return tx.toEnvelope().toXDR("base64");
   }
 }
+
+/**
+ * `OfflineSigner` — lightweight alias for `FluxapayOfflineSigner` that
+ * exposes the air-gapped signing workflow proposed in Issue #1059.
+ *
+ * Usage:
+ * ```ts
+ * // Online: build unsigned XDR
+ * const signer = new OfflineSigner(client, contractId, networkPassphrase);
+ * const { xdr, txHash } = await signer.buildUnsignedTransaction('create_payment', args);
+ *
+ * // Air-gapped: sign with no network calls
+ * const signedXdr = await OfflineSigner.sign({ xdr, signerKeypair });
+ *
+ * // Online: broadcast
+ * const result = await signer.submitSignedTransaction(signedXdr);
+ * ```
+ */
+export const OfflineSigner = FluxapayOfflineSigner;
+export type OfflineSigner = FluxapayOfflineSigner;

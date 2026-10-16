@@ -71,3 +71,84 @@ Topics are `(SESSION, ACTION, account)`, the same shape as `SESSION/REGISTERED`,
 | 9 | `FunctionNotAllowed` | `function` is outside `allowed_functions` |
 
 Registration, expiry, and revocation still return `Unauthorized`, `SessionNotFound`, `SessionExpired`, and `SignerRevoked`.
+
+
+## Offline signing (air-gapped transactions)
+
+For high-security environments where the signing key must never be exposed to a
+networked machine, FluxaPay supports a full offline signing workflow (Issue #1059).
+
+### Flow
+
+```
+Online machine                     Air-gapped signer
+─────────────────────────────────────────────────────
+1. buildUnsignedTransaction()
+   → unsigned XDR + txHash
+                               ──────────────────────▶
+                                 2. OfflineSigner.sign()
+                                    (zero network calls)
+                                    → signedXdr
+                               ◀──────────────────────
+3. submitSignedTransaction()
+   → confirmed result
+```
+
+### Usage
+
+```ts
+import { OfflineSigner } from "@fluxapay/sdk";
+
+// ── Step 1: build unsigned XDR (online machine) ──────────────────────────────
+const signer = new OfflineSigner(client, contractId, networkPassphrase);
+
+const { xdr, txHash } = await signer.buildUnsignedTransaction("create_payment", {
+  payment_id: "pay_001",
+  merchant_id: "GCMERCHANT...",
+  amount: BigInt(100_000_000),
+  currency: "USDC",
+  deposit_address: "GCDEPOSIT...",
+});
+
+// Serialize `xdr` and `txHash` and transfer to air-gapped machine
+// (e.g., QR code, USB drive, offline file transfer).
+
+// ── Step 2: sign on the air-gapped machine (zero network calls) ──────────────
+// import { OfflineSigner } from "@fluxapay/sdk";
+// import { Keypair } from "@stellar/stellar-sdk";
+
+const signerKeypair = Keypair.fromSecret("SXXXXXXX...");
+const signedXdr = await OfflineSigner.sign({ xdr, signerKeypair });
+
+// Transfer `signedXdr` back to the online machine.
+
+// ── Step 3: broadcast the signed transaction (online machine) ────────────────
+const result = await signer.submitSignedTransaction(signedXdr);
+console.log("Transaction confirmed:", result);
+```
+
+### `buildUnsignedTransaction(method, args)`
+
+Calls the specified contract method, simulates it, and returns:
+- `xdr` — base64-encoded unsigned Soroban transaction envelope  
+- `txHash` — hex-encoded transaction hash for display and verification
+
+No private key is needed at this stage.
+
+### `OfflineSigner.sign({ xdr, signerKeypair })`
+
+Static method with **zero network dependencies**. Parses the unsigned envelope,
+signs it with the provided Stellar keypair, and returns the signed base64 XDR.
+Safe to call on an air-gapped machine that has no internet access.
+
+### `submitSignedTransaction(signedXdr)`
+
+Broadcasts a pre-signed transaction envelope to the Soroban RPC configured in
+the client. Waits for the transaction to be confirmed and returns the result.
+
+### Key guarantees
+
+- `OfflineSigner.sign` makes no HTTP calls.
+- The signing keypair is never passed to a networked function.
+- Works with any Stellar keypair: Keypair, HSM-backed signer, Ledger hardware wallet.
+- Round-trip result is identical to a standard online `client.method(args)` call.

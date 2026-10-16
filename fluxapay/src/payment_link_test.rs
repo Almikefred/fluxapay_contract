@@ -1941,3 +1941,107 @@ fn test_update_link_max_uses() {
     assert!(res_after.is_ok());
 }
 
+
+// ── Issue #1061: single-use link enforcement ──────────────────────────────────
+
+#[test]
+fn test_single_use_link_used_once_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "single_use_ok");
+
+    client.create_single_use_link(
+        &merchant,
+        &link_id,
+        &Some(100i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Single use link"),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // Verify the flag is set
+    let link = client.get_link(&link_id);
+    assert!(link.single_use);
+    assert!(link.used_at.is_none());
+
+    // First use must succeed
+    let result = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert!(result.is_ok(), "First use of single-use link should succeed");
+
+    // used_at is now populated
+    let link_after = client.get_link(&link_id);
+    assert!(link_after.used_at.is_some());
+}
+
+#[test]
+fn test_single_use_link_rejected_on_second_use() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "single_use_reject");
+
+    client.create_single_use_link(
+        &merchant,
+        &link_id,
+        &Some(100i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Single use – reject on retry"),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // First use succeeds
+    client.use_link(&payer, &link_id, &100i128, &None);
+
+    // Second use must be rejected with LinkAlreadyUsed
+    let res = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert_eq!(
+        res,
+        Err(Ok(crate::Error::LinkAlreadyUsed)),
+        "Second use of single-use link must return LinkAlreadyUsed"
+    );
+}
+
+#[test]
+fn test_multi_use_link_allows_multiple_uses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "multi_use_link");
+
+    // Regular create_link — single_use defaults to false
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(100i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Multi-use link"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // Both uses must succeed
+    let r1 = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert!(r1.is_ok(), "First use of multi-use link should succeed");
+
+    let r2 = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert!(r2.is_ok(), "Second use of multi-use link should succeed");
+}

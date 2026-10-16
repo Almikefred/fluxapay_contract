@@ -164,6 +164,7 @@ fn link_args(env: &Env, id: &str) -> CreateLinkArgs {
         metadata: None,
         fiat: MaybeFiatConfig::None,
         base_url: None,
+        single_use: false,
     }
 }
 
@@ -326,6 +327,7 @@ fn create_payment_link_invoice_links_both_records() {
             metadata: None,
             fiat: MaybeFiatConfig::None,
             base_url: None,
+            single_use: false,
         },
     );
 
@@ -382,6 +384,7 @@ fn create_payment_link_invoice_rejects_bad_link_atomically() {
             metadata: None,
             fiat: MaybeFiatConfig::None,
             base_url: None,
+            single_use: false,
         },
     );
     assert!(res.is_err());
