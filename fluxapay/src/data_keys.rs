@@ -166,7 +166,7 @@ pub enum DataKey {
     /// Maximum payment duration in seconds (default: 30 days).
     MaxPaymentDurationSecs,
     /// Issue #489: Reverse index from metadata_hash to payment_id for order reconciliation.
-    MetadataHashPayment(BytesN32>),
+    MetadataHashPayment(BytesN<32>),
     /// Issue #492: Customer profile keyed by (merchant_id, customer_id) for CRM features.
     CustomerProfile(Address, Address),
     /// Issue #437: Allowlisted DEX router address

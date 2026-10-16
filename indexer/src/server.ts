@@ -497,6 +497,100 @@ export function createServer(
     }
   });
 
+  // ------------------------------------------------------------------ Issue #1067: Invoice lifecycle routes
+
+  /** GET /v1/invoices?status=Pending|Paid|Overdue|Voided&merchant_id=... */
+  app.get("/v1/invoices", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const merchantId = typeof req.query.merchant_id === "string" ? req.query.merchant_id : undefined;
+      const status = typeof req.query.status === "string" ? req.query.status : undefined;
+      const limit = req.query.limit ? Math.min(parseInt(req.query.limit as string, 10), 100) : 50;
+      const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
+
+      const result = await database.getInvoices({ merchantId, status, limit, offset });
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** GET /v1/invoices/:id */
+  app.get("/v1/invoices/:id", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const invoice = await database.getInvoiceById(req.params.id);
+      if (!invoice) {
+        res.status(404).json({ error: "Invoice not found" });
+        return;
+      }
+      res.status(200).json(invoice);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * DELETE /v1/invoices/:id — soft-delete (Voided transition).
+   * Requires SEP-10 merchant auth; only the owning merchant may void.
+   */
+  app.delete(
+    "/v1/invoices/:id",
+    requireSEP10Auth(sep10Config),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const invoiceId = req.params.id;
+        const merchantId = req.auth?.sub;
+        if (!merchantId) {
+          res.status(401).json({ error: "Missing authenticated merchant subject" });
+          return;
+        }
+        const updated = await database.voidInvoice(invoiceId, merchantId);
+        if (!updated) {
+          res.status(404).json({ error: "Invoice not found or already paid/voided" });
+          return;
+        }
+        res.status(200).json({ invoiceId, status: "Voided" });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // ------------------------------------------------------------------ Issue #1066: Fee collection history
+
+  /** GET /v1/treasury/fees?offset=0&limit=100 — paginated fee collection history */
+  app.get("/v1/treasury/fees", requireScope("admin"), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const limit = req.query.limit ? Math.min(parseInt(req.query.limit as string, 10), 200) : 100;
+      const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
+      const token = typeof req.query.token === "string" ? req.query.token : undefined;
+
+      const result = await database.getFeeCollectionHistory({ offset, limit, token });
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // ------------------------------------------------------------------ Issue #1064: Merchant leaderboard
+
+  /**
+   * GET /v1/merchants/leaderboard?limit=20
+   * Public — no auth required. Returns top merchants sorted by score descending.
+   */
+  app.get("/v1/merchants/leaderboard", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const limit = req.query.limit ? Math.min(parseInt(req.query.limit as string, 10), 100) : 20;
+      if (isNaN(limit) || limit < 1) {
+        res.status(400).json({ error: "limit must be a positive integer ≤ 100" });
+        return;
+      }
+      const result = await database.getTopMerchants(limit);
+      res.status(200).json({ merchants: result });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/admin/replay-dlq", requireScope("admin"), async (_req: Request, res: Response, next: NextFunction) => {
     try {
       if (!replayDlqHandler) {

@@ -611,6 +611,33 @@ export interface MerchantRanking {
 }
 
 /**
+ * Issue #1064: Enriched merchant leaderboard entry returned by
+ * `getTopMerchants`, mirroring `MerchantRankEntry` in `fluxapay/src/types.rs`.
+ */
+export interface MerchantRankEntry {
+  merchantId: string;
+  /** Composite score used for ranking (cumulative gross volume). */
+  score: bigint;
+  /** KYC verification tier of the merchant. */
+  kycTier: string;
+  /** Total confirmed payments for this merchant. */
+  confirmedPaymentCount: bigint;
+  /** Cumulative gross payment volume. */
+  cumulativeVolume: bigint;
+}
+
+/**
+ * Issue #1066: A single fee collection record returned by
+ * `getFeeCollectionHistory`, mirroring `FeeRecord` in `fluxapay/src/types.rs`.
+ */
+export interface FeeRecord {
+  paymentId: string;
+  feeAmount: bigint;
+  token: string;
+  collectedAt: bigint;
+}
+
+/**
  * Issue #629: Aggregate analytics for a single merchant over a time window,
  * mirroring the `MerchantAnalytics` contracttype in `fluxapay/src/lib.rs`
  * (`PaymentProcessor.get_merchant_analytics`).
@@ -3476,6 +3503,142 @@ export class FluxapayClient {
       this.contract.options.contractId,
       this.contract.options.networkPassphrase,
     );
+  }
+
+  // ------------------------------------------------------------------ #1065: metadata hash helpers
+
+  /**
+   * Issue #1065: Generate a deterministic SHA-256 hash from a JSON-serialised
+   * object, suitable for passing as `metadataHash` in `createPayment`.
+   *
+   * The object is serialised with keys sorted alphabetically so that the same
+   * logical content always produces the same hash regardless of JS key order.
+   *
+   * @example
+   * const hash = FluxapayClient.hashMetadata({ orderId: '42', customerId: 'C99' });
+   * // pass `hash` as `metadataHash` when calling createPayment
+   */
+  static hashMetadata(obj: Record<string, unknown>): Uint8Array {
+    const { createHash } = require("crypto") as typeof import("crypto");
+    const sorted = JSON.stringify(obj, Object.keys(obj).sort());
+    return new Uint8Array(createHash("sha256").update(sorted).digest());
+  }
+
+  /**
+   * Issue #1065: Verify that a metadata object matches the hash stored on a
+   * payment. Calls `PaymentProcessor.verify_metadata_hash` on-chain.
+   *
+   * Returns `true`  when sha256(JSON.stringify(obj, sortedKeys)) matches the
+   *                  hash stored on the payment.
+   * Returns `false` when the hashes differ, or no hash was stored.
+   * Throws `PaymentNotFoundError` when the payment does not exist.
+   *
+   * @throws {FluxapayError} If the contract operation fails or returns an error.
+   */
+  async verifyMetadataHash(
+    paymentId: string,
+    obj: Record<string, unknown>,
+  ): Promise<boolean> {
+    const preimage = FluxapayClient.hashMetadata(obj);
+    const result = await withMappedContractError(() =>
+      (this.contract as any).verify_metadata_hash({
+        payment_id: paymentId,
+        preimage: Buffer.from(preimage),
+      }),
+    );
+    const value = (result as { result?: unknown }).result ?? result;
+    return Boolean(value);
+  }
+
+  // ------------------------------------------------------------------ #1066: fee collection history
+
+  /**
+   * Issue #1066: Fetch a paginated page of fee collection records (newest first).
+   * Calls `PaymentProcessor.get_fee_collection_history` on-chain.
+   *
+   * @param offset - Number of records to skip (0 = most recent first).
+   * @param limit  - Maximum records to return; silently capped at 200 on-chain.
+   * @throws {FluxapayError} If the contract operation fails or returns an error.
+   */
+  async getFeeCollectionHistory(offset = 0, limit = 100): Promise<FeeRecord[]> {
+    const raw = await withMappedContractError(() =>
+      (this.contract as any).get_fee_collection_history({ offset, limit }),
+    );
+    const arr: unknown[] = Array.isArray((raw as any).result) ? (raw as any).result : Array.isArray(raw) ? raw : [];
+    return arr.map((r: any) => ({
+      paymentId: r.payment_id as string,
+      feeAmount: BigInt(r.fee_amount ?? 0),
+      token: r.token as string,
+      collectedAt: BigInt(r.collected_at ?? 0),
+    }));
+  }
+
+  /**
+   * Issue #1066: Admin-only — return lifetime total fees collected for a token.
+   * Calls `PaymentProcessor.get_total_fees_collected` on-chain.
+   *
+   * @param admin - Admin address (must sign the transaction).
+   * @param token - Token contract address to sum fees for.
+   * @throws {FluxapayError} If the contract operation fails or returns an error.
+   */
+  async getTotalFeesCollected(admin: string, token: string): Promise<bigint> {
+    const result = await withMappedContractError(() =>
+      (this.contract as any).get_total_fees_collected({ admin, token }),
+    );
+    const value = (result as { result?: unknown }).result ?? result;
+    return BigInt(value as bigint | number | string);
+  }
+
+  // ------------------------------------------------------------------ #1067: invoice lifecycle
+
+  /**
+   * Issue #1067: Void an invoice (merchant must sign). Transitions Pending or
+   * Overdue → Voided. A Paid invoice cannot be voided.
+   * Calls `PaymentProcessor.void_invoice` on-chain.
+   *
+   * @throws {FluxapayError} If the invoice is Paid or not found.
+   */
+  async voidInvoice(merchantId: string, invoiceId: string): Promise<void> {
+    return withMappedContractError(async () => {
+      await (this.contract as any).void_invoice({ merchant_id: merchantId, invoice_id: invoiceId });
+    });
+  }
+
+  /**
+   * Issue #1067: Mark an invoice as Overdue. Permissionless — the daemon calls
+   * this when `now > invoice.due_date` and the invoice is still Pending.
+   * Calls `PaymentProcessor.mark_invoice_overdue` on-chain.
+   *
+   * @throws {FluxapayError} If the invoice is not found or not yet past due.
+   */
+  async markInvoiceOverdue(invoiceId: string): Promise<void> {
+    return withMappedContractError(async () => {
+      await (this.contract as any).mark_invoice_overdue({ invoice_id: invoiceId });
+    });
+  }
+
+  // ------------------------------------------------------------------ #1064: leaderboard
+
+  /**
+   * Issue #1064: Return the top merchants sorted by score (cumulative gross
+   * volume) descending. Calls `PaymentProcessor.get_top_merchants_v2` on-chain.
+   *
+   * `limit` is silently capped at 100 (TOP_MERCHANTS_MAX_LIMIT) on-chain.
+   *
+   * @throws {FluxapayError} If the contract operation fails or returns an error.
+   */
+  async getTopMerchants(limit = 20): Promise<MerchantRankEntry[]> {
+    const raw = await withMappedContractError(() =>
+      (this.contract as any).get_top_merchants_v2({ limit }),
+    );
+    const arr: unknown[] = Array.isArray((raw as any).result) ? (raw as any).result : Array.isArray(raw) ? raw : [];
+    return arr.map((r: any) => ({
+      merchantId: r.merchant_id as string,
+      score: BigInt(r.score ?? 0),
+      kycTier: r.kyc_tier as string,
+      confirmedPaymentCount: BigInt(r.confirmed_payment_count ?? 0),
+      cumulativeVolume: BigInt(r.cumulative_volume ?? 0),
+    }));
   }
 }
 
