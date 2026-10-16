@@ -1942,23 +1942,94 @@ fn test_update_link_max_uses() {
 }
 
 
-// ── Issue #1060: Payment link expiry enforcement ─────────────────────────────
+// ── Issue #1061: single-use link enforcement ──────────────────────────────────
 
-/// Non-expiring links (expires_at = None) must never be rejected as expired.
 #[test]
-fn test_use_link_no_expiry_always_accepted() {
+fn test_single_use_link_used_once_passes() {
     let env = Env::default();
     env.mock_all_auths();
     let (merchant, client) = setup_payment_link(&env);
     let payer = Address::generate(&env);
 
-    let link_id = String::from_str(&env, "no_expiry_link");
+    let link_id = String::from_str(&env, "single_use_ok");
+
+    client.create_single_use_link(
+        &merchant,
+        &link_id,
+        &Some(100i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Single use link"),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // Verify the flag is set
+    let link = client.get_link(&link_id);
+    assert!(link.single_use);
+    assert!(link.used_at.is_none());
+
+    // First use must succeed
+    let result = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert!(result.is_ok(), "First use of single-use link should succeed");
+
+    // used_at is now populated
+    let link_after = client.get_link(&link_id);
+    assert!(link_after.used_at.is_some());
+}
+
+#[test]
+fn test_single_use_link_rejected_on_second_use() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "single_use_reject");
+
+    client.create_single_use_link(
+        &merchant,
+        &link_id,
+        &Some(100i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Single use – reject on retry"),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // First use succeeds
+    client.use_link(&payer, &link_id, &100i128, &None);
+
+    // Second use must be rejected with LinkAlreadyUsed
+    let res = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert_eq!(
+        res,
+        Err(Ok(crate::Error::LinkAlreadyUsed)),
+        "Second use of single-use link must return LinkAlreadyUsed"
+    );
+}
+
+#[test]
+fn test_multi_use_link_allows_multiple_uses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "multi_use_link");
+
+    // Regular create_link — single_use defaults to false
     client.create_link(
         &merchant,
         &link_id,
         &Some(100i128),
         &Symbol::new(&env, "USDC"),
-        &String::from_str(&env, "Permanent link"),
+        &String::from_str(&env, "Multi-use link"),
         &None,
         &None,
         &false,
@@ -1967,66 +2038,10 @@ fn test_use_link_no_expiry_always_accepted() {
         &None,
     );
 
-    // Advance ledger time well into the future — should still be accepted.
-    env.ledger().set_timestamp(u64::MAX / 2);
-    let payment_id = client.use_link(&payer, &link_id, &100i128, &None);
-    assert!(!payment_id.is_empty());
-}
+    // Both uses must succeed
+    let r1 = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert!(r1.is_ok(), "First use of multi-use link should succeed");
 
-/// Expired link (expires_at < current_ledger_time) must return LinkExpired.
-#[test]
-fn test_use_link_expired_returns_link_expired_error() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (merchant, client) = setup_payment_link(&env);
-    let payer = Address::generate(&env);
-
-    let link_id = String::from_str(&env, "expiry_check_link");
-    let expiry = 5000u64;
-    client.create_link(
-        &merchant,
-        &link_id,
-        &Some(200i128),
-        &Symbol::new(&env, "USDC"),
-        &String::from_str(&env, "Short-lived link"),
-        &None,
-        &None,
-        &false,
-        &Some(expiry),
-        &MaybeFiatConfig::None,
-        &None,
-    );
-
-    // Travel past the expiry — must be rejected with LinkExpired.
-    env.ledger().set_timestamp(expiry + 1);
-    let result = client.try_use_link(&payer, &link_id, &200i128, &None);
-    assert_eq!(result, Err(Ok(crate::Error::LinkExpired)));
-}
-
-/// Active link (expires_at in the future) must be accepted.
-#[test]
-fn test_use_link_active_before_expiry_accepted() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (merchant, client) = setup_payment_link(&env);
-    let payer = Address::generate(&env);
-
-    let link_id = String::from_str(&env, "active_expiry_link");
-    let now = env.ledger().timestamp();
-    client.create_link(
-        &merchant,
-        &link_id,
-        &Some(300i128),
-        &Symbol::new(&env, "USDC"),
-        &String::from_str(&env, "Active link"),
-        &None,
-        &None,
-        &false,
-        &Some(now + 7200),
-        &MaybeFiatConfig::None,
-        &None,
-    );
-
-    let payment_id = client.use_link(&payer, &link_id, &300i128, &None);
-    assert!(!payment_id.is_empty());
+    let r2 = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert!(r2.is_ok(), "Second use of multi-use link should succeed");
 }

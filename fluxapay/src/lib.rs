@@ -554,6 +554,8 @@ pub enum Error {
     InvalidPaymentLink = 84,
     /// Issue #777: Payment amount or monthly volume exceeds the merchant's KYC tier limit.
     KycLimitExceeded = 85,
+    /// Issue #1061: A single-use payment link has already been redeemed and cannot be used again.
+    LinkAlreadyUsed = 86,
 }
 
 #[contracttype]

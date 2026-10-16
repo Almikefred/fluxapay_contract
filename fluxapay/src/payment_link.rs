@@ -60,6 +60,8 @@ pub struct CreateLinkArgs {
     pub metadata: Option<Map<String, String>>,
     pub fiat: MaybeFiatConfig,
     pub base_url: Option<String>,
+    /// Issue #1061: When `true`, the created link may only be redeemed once.
+    pub single_use: bool,
 }
 
 /// Issue #637: Maximum number of links that may be created in one
@@ -98,6 +100,12 @@ pub struct PaymentLink {
     /// via `set_payment_link_fee_bps(admin, None, bps)`. Only settable by
     /// the admin via `set_payment_link_fee_bps`.
     pub fee_bps: Option<i128>,
+    /// Issue #1061: When `true`, the link may only be used once; subsequent
+    /// calls to `use_link` are rejected with `LinkAlreadyUsed`.
+    pub single_use: bool,
+    /// Issue #1061: Timestamp (Unix seconds) when the link was first
+    /// successfully used. `None` means the link has never been used.
+    pub used_at: Option<u64>,
 }
 
 /// Analytics summary for a payment link.
@@ -396,6 +404,47 @@ impl PaymentLinkManager {
                 metadata,
                 fiat,
                 base_url,
+                single_use: false,
+            },
+        )
+    }
+
+    /// Issue #1061: Create a payment link that can only be redeemed once.
+    ///
+    /// Identical to `create_link` but sets `single_use: true` on the resulting
+    /// `PaymentLink`. A second call to `use_link` on such a link will return
+    /// `Error::LinkAlreadyUsed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_single_use_link(
+        env: Env,
+        merchant: Address,
+        link_id: String,
+        amount: Option<i128>,
+        currency: Symbol,
+        description: String,
+        expires_at: Option<u64>,
+        direct_transfer: bool,
+        metadata: Option<Map<String, String>>,
+        fiat: MaybeFiatConfig,
+        base_url: Option<String>,
+    ) -> Result<String, crate::Error> {
+        merchant.require_auth();
+        Self::require_merchant_role(&env, &merchant)?;
+        Self::build_and_store_link(
+            &env,
+            &merchant,
+            CreateLinkArgs {
+                link_id,
+                amount,
+                currency,
+                description,
+                expires_at,
+                max_uses: Some(1),
+                direct_transfer,
+                metadata,
+                fiat,
+                base_url,
+                single_use: true,
             },
         )
     }
@@ -490,6 +539,8 @@ impl PaymentLinkManager {
             fiat: args.fiat,
             shareable_url,
             fee_bps: None,
+            single_use: args.single_use,
+            used_at: None,
         };
 
         env.storage()
@@ -643,6 +694,11 @@ impl PaymentLinkManager {
             }
         }
 
+        // Issue #1061: Reject single-use links that have already been redeemed.
+        if link.single_use && link.used_at.is_some() {
+            return Err(crate::Error::LinkAlreadyUsed);
+        }
+
         // Resolve the effective USDC amount:
         // - If fiat config is set, compute USDC equivalent via the FX oracle
         // - Otherwise use the caller-supplied amount (validated against link.amount if fixed)
@@ -699,6 +755,10 @@ impl PaymentLinkManager {
         // Accumulate revenue from this payment and record the timestamp.
         link.total_revenue = link.total_revenue.saturating_add(resolved_amount);
         link.last_used_at = Some(env.ledger().timestamp());
+        // Issue #1061: Mark a single-use link as consumed on its first redemption.
+        if link.single_use && link.used_at.is_none() {
+            link.used_at = Some(env.ledger().timestamp());
+        }
         env.storage()
             .persistent()
             .set(&LinkDataKey::Link(link_id.clone()), &link);
@@ -837,13 +897,24 @@ impl PaymentLinkManager {
         env.events().publish(
             (Symbol::new(&env, "LINK"), Symbol::new(&env, "USED")),
             (
-                link_id,
+                link_id.clone(),
                 payer,
                 resolved_amount,
                 payment_id.clone(),
                 link.metadata.clone(),
             ),
         );
+
+        // Issue #1061: Emit PAYMENT_LINK/USED event when a single-use link is consumed.
+        if link.single_use {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT_LINK"),
+                    Symbol::new(&env, "USED"),
+                ),
+                (link_id, payment_id.clone()),
+            );
+        }
 
         Ok(payment_id)
     }
