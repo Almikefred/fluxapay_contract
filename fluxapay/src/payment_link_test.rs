@@ -1941,3 +1941,92 @@ fn test_update_link_max_uses() {
     assert!(res_after.is_ok());
 }
 
+
+// ── Issue #1060: Payment link expiry enforcement ─────────────────────────────
+
+/// Non-expiring links (expires_at = None) must never be rejected as expired.
+#[test]
+fn test_use_link_no_expiry_always_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "no_expiry_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(100i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Permanent link"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // Advance ledger time well into the future — should still be accepted.
+    env.ledger().set_timestamp(u64::MAX / 2);
+    let payment_id = client.use_link(&payer, &link_id, &100i128, &None);
+    assert!(!payment_id.is_empty());
+}
+
+/// Expired link (expires_at < current_ledger_time) must return LinkExpired.
+#[test]
+fn test_use_link_expired_returns_link_expired_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "expiry_check_link");
+    let expiry = 5000u64;
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(200i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Short-lived link"),
+        &None,
+        &None,
+        &false,
+        &Some(expiry),
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    // Travel past the expiry — must be rejected with LinkExpired.
+    env.ledger().set_timestamp(expiry + 1);
+    let result = client.try_use_link(&payer, &link_id, &200i128, &None);
+    assert_eq!(result, Err(Ok(crate::Error::LinkExpired)));
+}
+
+/// Active link (expires_at in the future) must be accepted.
+#[test]
+fn test_use_link_active_before_expiry_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "active_expiry_link");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(300i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Active link"),
+        &None,
+        &None,
+        &false,
+        &Some(now + 7200),
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    let payment_id = client.use_link(&payer, &link_id, &300i128, &None);
+    assert!(!payment_id.is_empty());
+}
