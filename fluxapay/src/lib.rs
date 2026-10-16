@@ -39,6 +39,13 @@ const DISPUTE_BOND_AMOUNT: i128 = 100_000;
 pub const DEFAULT_DISPUTE_DEADLINE_THRESHOLD_AMOUNT: i128 = 1_000_000_000;
 pub const SMALL_DISPUTE_DEADLINE_SECS: u64 = 3 * 24 * 60 * 60;
 pub const LARGE_DISPUTE_DEADLINE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default maximum swap slippage when setting the effective minimum output.
+pub const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 50;
+/// Default maximum adverse deviation from an FX oracle reference price.
+pub const MAX_PRICE_IMPACT_BPS: u32 = 100;
+/// Default maximum aggregate swap input per PaymentProcessor per ledger.
+pub const MAX_SWAP_VOLUME_PER_LEDGER: i128 = 10_000_000_000_000;
+const BASIS_POINTS_DENOMINATOR: i128 = 10_000;
 
 // Issue #167: Tiered refund fees based on merchant KYC tier
 const REFUND_FEE_BPS_BASIC: i128 = 100; // 1.0% for Basic tier
@@ -522,40 +529,10 @@ pub enum Error {
     TimelockNotExpired = 68,
     /// Issue #622: Evidence field is not a valid IPFS CID (CIDv0 starts with "Qm"/46 chars; CIDv1 starts with "bafy"/≥59 chars).
     InvalidEvidenceCid = 69,
-    /// Issue #841: Incoming muxed sub-account ID does not match the expected muxed_payer.
-    MuxedAccountMismatch = 70,
-    /// Treasury multisig configuration not set or invalid.
-    TreasuryMultisigNotConfigured = 71,
-    /// Caller is not an authorized treasury multisig signer.
-    NotAuthorizedTreasurySigner = 72,
-    /// Treasury withdrawal proposal not found.
-    TreasuryProposalNotFound = 73,
-    /// Treasury withdrawal proposal has already been executed.
-    TreasuryProposalAlreadyExecuted = 74,
-    /// Treasury withdrawal proposal has been cancelled.
-    TreasuryProposalCancelled = 75,
-    /// Treasury withdrawal proposal timelock has not expired.
-    TreasuryTimelockNotExpired = 76,
-    /// Treasury withdrawal proposal has expired.
-    TreasuryProposalExpired = 77,
-    /// Signer has already approved this treasury withdrawal proposal.
-    TreasuryAlreadyApproved = 78,
-    /// Insufficient approvals to execute treasury withdrawal.
-    TreasuryInsufficientApprovals = 79,
-    /// Invalid treasury multisig threshold (zero or exceeds signer count).
-    InvalidTreasuryThreshold = 80,
-    /// Treasury withdrawal amount exceeds token balance.
-    InsufficientTokenTreasuryBalance = 81,
-    /// Issue #836: Subscription is still in its free trial; no charge yet.
-    TrialActive = 82,
-    /// Issue #836: Requested trial_days exceeds the maximum of 90 days.
-    TrialTooLong = 83,
-    /// Payment link does not exist or belongs to a different merchant.
-    InvalidPaymentLink = 84,
-    /// Issue #777: Payment amount or monthly volume exceeds the merchant's KYC tier limit.
-    KycLimitExceeded = 85,
-    /// Issue #1061: A single-use payment link has already been redeemed and cannot be used again.
-    LinkAlreadyUsed = 86,
+    /// Aggregate swap input exceeds the configured per-ledger limit.
+    SwapVolumeLimitExceeded = 70,
+    /// DEX quote is too far below the FX oracle reference price.
+    PriceImpactTooHigh = 71,
 }
 
 #[contracttype]
@@ -632,6 +609,30 @@ pub struct CreateDisputeArgs {
 pub enum DisputeBatchItemResult {
     Ok(String),
     Err(u32),
+}
+
+/// Resolution details for one dispute in `batch_resolve_disputes`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolution {
+    pub dispute_id: String,
+    pub in_favor_of: Address,
+    pub notes: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapLimits {
+    pub default_max_slippage_bps: u32,
+    pub max_price_impact_bps: u32,
+    pub max_swap_volume_per_ledger: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SwapLedgerVolume {
+    ledger_sequence: u32,
+    volume: i128,
 }
 
 /// Hard cap for dispute batch size.
@@ -1107,6 +1108,192 @@ pub const DEFAULT_DISPUTE_PER_PAYER_OPEN: u32 = 5;
 pub const DEFAULT_DISPUTE_GLOBAL_PER_HOUR: u32 = 100;
 /// Global dispute creation window length (1 hour).
 pub const DISPUTE_GLOBAL_WINDOW_SECS: u64 = 3600;
+
+#[contracttype]
+pub enum DataKey {
+    Payment(String),
+    PaymentStatusHistory(String),
+    MerchantPayments(Address),
+    MerchantRateLimit(Address),
+    Refund(String),
+    PaymentRefunds(String),
+    RefundCounter,
+    Dispute(String),
+    PaymentDisputes(String),
+    DisputeCounter,
+    Stream(String),
+    TreasuryBalance,
+    UsdcToken,
+    Paused,
+    CreationPaused,
+    MerchantRegistryAddress,
+    AllowedToken(Address),
+    Blacklisted(Address),
+    MerchantAmountLimits(Address),
+    GlobalAmountLimits,
+    IdempotencyKey(String),
+    SubscriptionPlan(String),
+    Subscription(String),
+    PayerSubscriptions(Address),
+    SubscriptionCounter,
+    StreamCounter,
+    /// Stores operator notes keyed by dispute_id for on-chain transparency.
+    DisputeOperatorNote(String),
+    /// Stores all arbitrators who have voted on a dispute.
+    DisputeArbitratorVotes(String),
+    /// Locked stake for a dispute arbitrator: (dispute_id, arbitrator) → amount
+    DisputeStake(String, Address),
+    /// Vote cast by an arbitrator: (dispute_id, arbitrator) → VoteChoice
+    DisputeVote(String, Address),
+    /// Tally of votes for a dispute
+    DisputeVoteTally(String),
+    /// Cross-contract address of the configured FX oracle (Issue #304).
+    FxOracleAddress,
+    /// Whether `process_refund` requires a `receipt_hash` on refunds (Issue #176).
+    RequireReceiptHash,
+    /// Cross-contract address of the configured DEX router (Issue #173).
+    DexRouterAddress,
+    /// Configurable refund expiry window in seconds (Issue #170).
+    RefundExpirySecs,
+    /// Vote cast by an arbitrator under the simple ARBITRATOR-role voting
+    /// flow: (dispute_id, arbitrator) → ArbitratorVoteChoice.
+    ArbitratorVote(String, Address),
+    /// Tally of ARBITRATOR-role votes for a dispute.
+    ArbitratorVoteTally(String),
+    /// Issue #168: Fee split configuration (treasury_bps, developer_bps, treasury_addr, developer_addr)
+    FeeSplitConfig,
+    /// Monthly volume tracker: (merchant_id, month_epoch) → i128 cumulative amount
+    MerchantMonthlyVolume(Address, u32),
+    /// Cumulative all-time payment volume per merchant for KYC tier auto-upgrades (issue #207).
+    MerchantCumulativeVolume(Address),
+    FeeProposal,
+    CurrentFee,
+    GlobalRateLimit,
+    MerchantSpecificRateLimit(Address),
+    PayerRateLimit(Address),
+    /// Issue #184: Total disputes filed against a merchant (keyed by merchant address).
+    MerchantDisputeCount(Address),
+    /// Issue #184: Total confirmed payments registered for a merchant (keyed by merchant address).
+    MerchantPaymentCount(Address),
+    /// Issue #185: Collaborative settlement record for a dispute.
+    CollaborativeSettlement(String),
+    /// Issue #664: Append-only log of `UsageMetrics` records for a
+    /// subscription, keyed by subscription_id.
+    UsageMetricsLog(String),
+    /// Issue #301: List of supported token addresses for enumeration.
+    SupportedTokens,
+    /// Issue #303: KYC tier limits configuration.
+    KycTierLimitsConfig,
+    /// Issue #302: List of active subscription IDs for process_due_subscriptions.
+    ActiveSubscriptions,
+    /// Issue #304: FX Oracle contract address for rate staleness checks.
+    FXOracleAddress,
+    /// Issue #302: Counter for subscription tick payment IDs.
+    SubscriptionTickCounter,
+    /// Issue #313: Reentrancy lock for process_refund_internal and settle_payment.
+    ReentrancyLock,
+    /// Per-refund reentrancy flag set for the duration of `process_refund_internal`.
+    RefundLock(String),
+    /// Admin-configurable dispute rate limits (`DisputeRateLimitConfig`).
+    DisputeRateLimits,
+    /// Number of open/under-review disputes for a disputer address.
+    PayerOpenDisputeCount(Address),
+    /// Fixed-window global dispute creation counter (`DisputeCreationRateState`).
+    GlobalDisputeCreationRate,
+    /// When true, non-empty dispute evidence must be a valid IPFS CID.
+    RequireEvidenceCid,
+    /// Contract version string, updated on each successful upgrade.
+    ContractVersion,
+    /// Configurable settlement fee rate in basis points (issue: settle_payment fee).
+    SettlementFeeRate,
+    /// Configurable dispute bond amount in stablecoin stroops (overrides DISPUTE_BOND_AMOUNT const).
+    DisputeBondAmount,
+    /// Admin-configurable amount threshold for 3-day versus 7-day dispute deadlines.
+    DisputeDeadlineThresholdAmount,
+    /// Configurable monthly volume cap per KYC tier in stablecoin stroops (overrides TIER_CAP_* const).
+    TierVolumeCap(KycTier),
+    /// Configurable refund fee in basis points (overrides REFUND_FEE_BPS const).
+    RefundFeeBps,
+    /// Issue #471: Whether overpaid payments automatically create a pending refund.
+    AutoRefundOverpayment,
+    /// Configurable refund cooldown period in seconds (overrides REFUND_COOLDOWN_SECS const).
+    RefundCooldownSecs,
+    /// Configured swap protection limits.
+    SwapLimits,
+    /// Per-ledger input volume used by swap_and_pay.
+    SwapLedgerVolume,
+    /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
+    /// Keyed by the code string itself.
+    FeeWaiverCode(String),
+    /// When true, `cancel_subscription` may create a prorated pending refund.
+    AllowProratedRefunds,
+    /// Paginated log of treasury withdrawals (newest-first, capped at 100).
+    TreasuryWithdrawalHistory,
+    /// Issue #485: Marks a payment as created from a direct_transfer payment link.
+    /// Prevents future disputes from being created for this payment.
+    DirectTransferPayment(String),
+    /// Issue #483: Maps token address to its currency symbol (e.g., USDC, EURC, BRLT).
+    TokenCurrency(Address),
+    Invoice(String),
+    MerchantInvoices(Address),
+    InvoiceCounter,
+    /// Configurable invoice overdue grace period in seconds (Issue #607).
+    InvoiceGracePeriodSecs,
+    /// Issue #482: Payment retry chain tracking - maps original_id to list of retry payment IDs
+    PaymentRetries(String),
+    /// Issue #478: FX oracle max rate deviation per currency pair in basis points
+    MaxRateDeviation(Symbol),
+    /// Issue #481: Admin-configurable dispute threshold for auto-suspension
+    DisputeThreshold,
+    /// Minimum payment duration in seconds (default: CREATE_PAYMENT_WINDOW_SECS = 60).
+    MinPaymentDurationSecs,
+    /// Maximum payment duration in seconds (default: 30 days).
+    MaxPaymentDurationSecs,
+    /// Issue #489: Reverse index from metadata_hash to payment_id for order reconciliation.
+    MetadataHashPayment(BytesN<32>),
+    /// Issue #492: Customer profile keyed by (merchant_id, customer_id) for CRM features.
+    CustomerProfile(Address, Address),
+    /// Issue #437: Allowlisted DEX router address
+    AllowedRouter(Address),
+    /// Issue #437: List of allowlisted DEX router addresses
+    AllowedRoutersList,
+    /// Issue #434: Wrapped XLM (WXLM) token contract address
+    WrappedXlmContract,
+    /// Issue #504: Payment IDs grouped by approximate expiry ledger bucket.
+    PaymentsByExpiry(u32),
+    /// Issue #504: Sorted set of expiry buckets that currently contain payment IDs.
+    PaymentExpiryBuckets,
+    /// Issue #678: Daily-bucketed payment ID index for O(days) analytics queries.
+    /// Key: (merchant_id, day_bucket = created_at / 86_400) → Vec<payment_id>.
+    DailyPaymentIndex(Address, u64),
+    /// Issue #666: Paginated log of platform-fee collection events (newest-first,
+    /// capped at `FEE_COLLECTION_HISTORY_CAP`), consumed by `get_platform_fee_report`.
+    FeeCollectionHistory,
+    /// Issue #667: Arbitrary on-chain contract metadata (description, deployment notes,
+    /// audit commit hash, etc.), keyed by an admin-chosen Symbol.
+    ContractMetadata(Symbol),
+    /// Issue #628: Cumulative gross payment volume per merchant (sum of `amount`
+    /// over every payment ever created for the merchant). Read by
+    /// `get_top_merchants` to rank merchants without scanning payment records.
+    MerchantGrossVolume(Address),
+    /// Issue #628: Append-only list of every merchant address that has had at
+    /// least one payment created, for `get_top_merchants` enumeration.
+    TrackedMerchants,
+    /// Issue #638: Refund idempotency key → `RefundIdempotencyRecord`. Stored with a
+    /// 30-day TTL so a retried `create_refund` with the same key returns the original
+    /// `refund_id` rather than creating a duplicate refund.
+    RefundIdempotencyKey(String),
+    /// Issue #633: Append-only index of subscription IDs for a plan, keyed by
+    /// plan_id. Updated atomically on every `subscribe` / `subscribe_to_plan`.
+    /// Appended at the end of the enum to preserve existing discriminants.
+    PlanSubscribers(String),
+    /// Issue #624: Timelock delay in seconds for critical admin operations.
+    TimelockDelaySecs,
+    /// Issue #624: Pending timelocked action keyed by a unique action ID.
+    PendingTimelockAction(String),
+    /// Issue #624: Counter for generating unique pending action IDs.
+    TimelockActionCounter,
+}
 
 /// Default initial contract version string.
 pub const INITIAL_CONTRACT_VERSION: &str = "1.0.0";
@@ -3678,6 +3865,18 @@ impl RefundManager {
                     dispute.amount,
                 ),
             );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "DISPUTE"),
+                    Symbol::new(&env, "ADJUSTMENT"),
+                ),
+                (
+                    dispute_id.clone(),
+                    dispute.payment_id.clone(),
+                    None::<String>,
+                    dispute.amount.saturating_neg(),
+                ),
+            );
 
             return Ok(dispute_id);
         }
@@ -3742,6 +3941,18 @@ impl RefundManager {
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
         Self::release_open_dispute_slot(&env, &dispute.disputer);
+        env.events().publish(
+            (
+                Symbol::new(&env, "DISPUTE"),
+                Symbol::new(&env, "ADJUSTMENT"),
+            ),
+            (
+                dispute_id.clone(),
+                dispute.payment_id.clone(),
+                Some(refund_id.clone()),
+                dispute.amount.saturating_neg(),
+            ),
+        );
 
         // Interactions: return bonds after effects are persisted.
         let usdc_token_address = env
@@ -3783,6 +3994,134 @@ impl RefundManager {
         );
 
         Ok(refund_id)
+    }
+
+    /// Resolve up to `MAX_DISPUTE_BATCH` disputes independently.
+    ///
+    /// The favored party must be either the customer who filed the dispute or
+    /// the merchant. Their bond is returned and the other party's bond is
+    /// forfeited to the admin/treasury. Invalid or already resolved disputes
+    /// return an item-level error without preventing later items from running.
+    pub fn batch_resolve_disputes(
+        env: Env,
+        operator: Address,
+        resolutions: Vec<DisputeResolution>,
+    ) -> Result<Vec<Result<(), Error>>, Error> {
+        operator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &operator)
+            && !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator)
+        {
+            return Err(Error::Unauthorized);
+        }
+        Self::require_not_paused(&env)?;
+
+        if resolutions.len() > MAX_DISPUTE_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut results = Vec::new(&env);
+        for resolution in resolutions.iter() {
+            results.push_back(Self::resolve_dispute_batch_item(
+                &env, &operator, resolution,
+            ));
+        }
+
+        Ok(results)
+    }
+
+    fn resolve_dispute_batch_item(
+        env: &Env,
+        operator: &Address,
+        resolution: DisputeResolution,
+    ) -> Result<(), Error> {
+        if resolution.notes.len() as usize > MAX_NOTES_LEN {
+            return Err(Error::InputTooLong);
+        }
+
+        let dispute_id = resolution.dispute_id;
+        let mut dispute = Self::get_dispute_internal(env, &dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        let winner = if resolution.in_favor_of == dispute.disputer {
+            dispute.disputer.clone()
+        } else if resolution.in_favor_of == dispute.merchant_id {
+            dispute.merchant_id.clone()
+        } else {
+            return Err(Error::InvalidAddress);
+        };
+
+        let token_address = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .ok_or(Error::Unauthorized)?;
+        let token_client = token::TokenClient::new(env, &token_address);
+        let contract_address = env.current_contract_address();
+        let bond_amount = Self::get_dispute_bond_amount(env.clone());
+        if token_client.balance(&contract_address) < bond_amount.saturating_mul(2) {
+            return Err(Error::Unauthorized);
+        }
+        let collector = AccessControl::get_admin(env).unwrap_or_else(|| contract_address.clone());
+
+        if !matches!(
+            token_client.try_transfer(&contract_address, &winner, &bond_amount),
+            Ok(Ok(()))
+        ) || !matches!(
+            token_client.try_transfer(&contract_address, &collector, &bond_amount),
+            Ok(Ok(()))
+        ) {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolved_at = Some(now);
+        dispute.resolution_notes = Some(resolution.notes.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+        Self::bump_dispute_ttl(env, &dispute_id, &dispute.status);
+        Self::release_open_dispute_slot(env, &dispute.disputer);
+
+        let merchant_dispute_key = DataKey::MerchantDisputeCount(dispute.merchant_id.clone());
+        let merchant_dispute_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&merchant_dispute_key)
+            .unwrap_or(0u64);
+        if merchant_dispute_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&merchant_dispute_key, &(merchant_dispute_count - 1));
+        }
+
+        let note = DisputeOperatorNote {
+            dispute_id: dispute_id.clone(),
+            operator: operator.clone(),
+            resolution_notes: resolution.notes,
+            operator_signature: String::from_str(env, ""),
+            recorded_at: now,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeOperatorNote(dispute_id.clone()), &note);
+        Self::bump_ttl(
+            env,
+            &DataKey::DisputeOperatorNote(dispute_id.clone()),
+            LONG_LIVE_TTL,
+        );
+
+        events::emit_dispute_bond_returned(env, dispute_id.clone(), winner, bond_amount);
+        events::emit_dispute_bond_forfeited(env, dispute_id.clone(), collector, bond_amount);
+        env.events().publish(
+            (Symbol::new(env, "DISPUTE"), Symbol::new(env, "RESOLVED")),
+            (dispute_id, dispute.payment_id),
+        );
+
+        Ok(())
     }
 
     pub fn reject_dispute(
@@ -6368,6 +6707,51 @@ impl PaymentProcessor {
             .persistent()
             .set(&DataKey::MerchantRegistryAddress, &registry_address);
         Ok(())
+    }
+
+    /// Admin: configure swap slippage, oracle price-impact, and per-ledger volume limits.
+    pub fn set_swap_limits(
+        env: Env,
+        admin: Address,
+        default_max_slippage_bps: u32,
+        max_price_impact_bps: u32,
+        max_swap_volume_per_ledger: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if default_max_slippage_bps > 10_000
+            || max_price_impact_bps > 10_000
+            || max_swap_volume_per_ledger <= 0
+        {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage().instance().set(
+            &DataKey::SwapLimits,
+            &SwapLimits {
+                default_max_slippage_bps,
+                max_price_impact_bps,
+                max_swap_volume_per_ledger,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_swap_limits(env: Env) -> SwapLimits {
+        Self::get_swap_limits_internal(&env)
+    }
+
+    fn get_swap_limits_internal(env: &Env) -> SwapLimits {
+        env.storage()
+            .instance()
+            .get(&DataKey::SwapLimits)
+            .unwrap_or(SwapLimits {
+                default_max_slippage_bps: DEFAULT_MAX_SLIPPAGE_BPS,
+                max_price_impact_bps: MAX_PRICE_IMPACT_BPS,
+                max_swap_volume_per_ledger: MAX_SWAP_VOLUME_PER_LEDGER,
+            })
     }
 
     /// Admin: configure the FX oracle used to snapshot rates during
@@ -9951,11 +10335,26 @@ impl PaymentProcessor {
                     PaymentStatus::Settled,
                 )?;
                 Self::record_payment_status(&env, &payment);
-                env.storage().persistent().set(
-                    &DataKey::Payment(payment_id_to_key(&env, &payment_id)),
-                    &payment,
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Payment(payment_id.clone()), &payment);
+                Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "PAYMENT"),
+                        Symbol::new(&env, "FEE_TOTAL"),
+                        payment_id.clone(),
+                    ),
+                    settlement_fee.saturating_add(actual_fee),
                 );
-                Self::extend_payment_ttl(&env, &payment_id, &payment.status);
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "PAYMENT"),
+                        Symbol::new(&env, "SETTLED"),
+                        payment.merchant_id.clone(),
+                    ),
+                    (payment_id.clone(), payment.amount),
+                );
 
                 // If merchant has AnchorConfig set, emit the
                 // SETTLEMENT_ANCHOR_WITHDRAW event so the off-chain
@@ -10105,6 +10504,15 @@ impl PaymentProcessor {
             &payment,
         );
         Self::extend_payment_ttl(&env, &payment_id, &payment.status);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "FEE_TOTAL"),
+                payment_id.clone(),
+            ),
+            settlement_fee.saturating_add(platform_fee),
+        );
 
         // Issue #166: Optimize event topics
         env.events().publish(
@@ -10396,6 +10804,46 @@ impl PaymentProcessor {
         Ok(())
     }
 
+    fn validate_swap_price_impact(
+        env: &Env,
+        fx_oracle: &Address,
+        oracle_pair: &Symbol,
+        amount_in: i128,
+        dex_quoted_out: i128,
+        max_price_impact_bps: u32,
+    ) -> Result<(), Error> {
+        let oracle_client = FXOracleClient::new(env, fx_oracle);
+        let rate_data = match oracle_client.try_get_rate(oracle_pair) {
+            Ok(Ok(data)) => data,
+            _ => return Err(Error::OraclePriceDeviation),
+        };
+
+        let mut divisor = 1i128;
+        for _ in 0..rate_data.decimals {
+            divisor = divisor.saturating_mul(10);
+        }
+        let expected_out = amount_in
+            .checked_mul(rate_data.rate)
+            .and_then(|value| value.checked_div(divisor))
+            .ok_or(Error::OraclePriceDeviation)?;
+        if expected_out <= 0 {
+            return Err(Error::OraclePriceDeviation);
+        }
+
+        if dex_quoted_out < expected_out {
+            let impact_bps = expected_out
+                .saturating_sub(dex_quoted_out)
+                .checked_mul(BASIS_POINTS_DENOMINATOR)
+                .map(|difference| difference / expected_out)
+                .ok_or(Error::PriceImpactTooHigh)?;
+            if impact_bps > max_price_impact_bps as i128 {
+                return Err(Error::PriceImpactTooHigh);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Atomic swap and pay: swap sender's token to merchant's required token and create payment.
     /// Integrates with DEX (e.g., Soroswap) for atomic asset conversion.
     ///
@@ -10526,6 +10974,22 @@ impl PaymentProcessor {
             return Err(Error::SwapPathInvalid);
         }
 
+        let limits = Self::get_swap_limits_internal(&env);
+        let ledger_sequence = env.ledger().sequence();
+        let stored_volume: Option<SwapLedgerVolume> =
+            env.storage().instance().get(&DataKey::SwapLedgerVolume);
+        let ledger_volume = stored_volume
+            .filter(|volume| volume.ledger_sequence == ledger_sequence)
+            .map(|volume| volume.volume)
+            .unwrap_or(0);
+        if args.amount_in
+            > limits
+                .max_swap_volume_per_ledger
+                .saturating_sub(ledger_volume)
+        {
+            return Err(Error::SwapVolumeLimitExceeded);
+        }
+
         // Issue #437: DEX router allowlist check
         let allowed_list = Self::get_allowed_routers(env.clone());
         if !allowed_list.is_empty()
@@ -10558,18 +11022,36 @@ impl PaymentProcessor {
             &args.path,
         )?;
 
-        if let (Some(fx_oracle), Some(oracle_pair)) = (&args.fx_oracle, &args.oracle_pair) {
-            let quoted_out = quoted_amounts
-                .get(args.path.len() - 1)
-                .ok_or(Error::SwapPathInvalid)?;
-            Self::validate_oracle_swap_rate(
-                &env,
-                fx_oracle,
-                oracle_pair,
-                args.amount_in,
-                quoted_out,
-                args.max_deviation_bps,
-            )?;
+        let quoted_out = quoted_amounts
+            .get(args.path.len() - 1)
+            .ok_or(Error::SwapPathInvalid)?;
+        let slippage_floor = quoted_out
+            .checked_mul(BASIS_POINTS_DENOMINATOR - limits.default_max_slippage_bps as i128)
+            .and_then(|value| value.checked_div(BASIS_POINTS_DENOMINATOR))
+            .ok_or(Error::InvalidAmount)?;
+        let effective_min_output = core::cmp::max(args.amount_out_min, slippage_floor);
+
+        match (&args.fx_oracle, &args.oracle_pair) {
+            (Some(fx_oracle), Some(oracle_pair)) => {
+                Self::validate_swap_price_impact(
+                    &env,
+                    fx_oracle,
+                    oracle_pair,
+                    args.amount_in,
+                    quoted_out,
+                    limits.max_price_impact_bps,
+                )?;
+                Self::validate_oracle_swap_rate(
+                    &env,
+                    fx_oracle,
+                    oracle_pair,
+                    args.amount_in,
+                    quoted_out,
+                    args.max_deviation_bps,
+                )?;
+            }
+            (None, None) => {}
+            _ => return Err(Error::OraclePriceDeviation),
         }
 
         let deadline = env.ledger().timestamp().saturating_add(3_600);
@@ -10577,7 +11059,7 @@ impl PaymentProcessor {
 
         let swap_result = dex_client.swap_exact_tokens_for_tokens(
             &args.amount_in,
-            &args.amount_out_min,
+            &effective_min_output,
             &args.path,
             &args.deposit_address,
             &deadline,
@@ -10586,13 +11068,10 @@ impl PaymentProcessor {
         let actual_out = swap_result
             .get(args.path.len() - 1)
             .ok_or(Error::SwapPathInvalid)?;
-        if actual_out < args.amount_out_min {
+        if actual_out < effective_min_output {
             return Err(Error::InvalidAmount);
         }
 
-        let quoted_out = quoted_amounts
-            .get(args.path.len() - 1)
-            .ok_or(Error::SwapPathInvalid)?;
         if actual_out < quoted_out {
             return Err(Error::ArbitrageDetected);
         }
@@ -10642,6 +11121,15 @@ impl PaymentProcessor {
                 args.amount_in,
                 actual_out,
             ),
+        );
+        env.storage().instance().set(
+            &DataKey::SwapLedgerVolume,
+            &SwapLedgerVolume {
+                ledger_sequence,
+                volume: ledger_volume
+                    .checked_add(args.amount_in)
+                    .ok_or(Error::SwapVolumeLimitExceeded)?,
+            },
         );
         Ok(payment)
     }

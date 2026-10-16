@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert";
+import * as crypto from "node:crypto";
 import test, { describe, it } from "node:test";
 import { loadConfigFromEnv, EventSubscriber } from "../src/index";
 import { createServer } from "../src/server";
@@ -20,8 +21,16 @@ function createMockDatabase() {
     payments: new Map<string, any>(),
     refunds: new Map<string, any>(),
     disputes: new Map<string, any>(),
+    merchants: new Map<string, { registeredAt: Date | string; kycSubmittedAt: Date | string | null }>(),
     contractEvents: new Array<any>(),
     dlqEvents: new Map<string, any>(),
+    reconciliationData: {
+      payments: [] as Array<Record<string, any>>,
+      settlements: [] as Array<Record<string, any>>,
+      refunds: [] as Array<Record<string, any>>,
+      disputeAdjustments: [] as Array<Record<string, any>>,
+      fxRates: [] as Array<Record<string, any>>,
+    },
     dbConnected: true,
   };
 
@@ -65,6 +74,14 @@ function createMockDatabase() {
         list = list.filter((d) => d.status === status);
       }
       return list;
+    },
+
+    async getMerchantOnboardingState(merchantId: string) {
+      return state.merchants.get(merchantId) || null;
+    },
+
+    async getReconciliationData() {
+      return state.reconciliationData;
     },
 
     async getRefundById(refundId: string) {
@@ -192,6 +209,30 @@ function createMockDatabase() {
   };
 
   return mockDb as unknown as Database & { state: typeof state };
+}
+
+const onboardingAuthConfig = {
+  webAuthEndpoint: "https://example.test/auth",
+  homeDomain: "example.test",
+  serverPublicKey: "c2VydmVy",
+  adminAccounts: new Set<string>(),
+};
+
+function createSEP10Token(merchantId: string): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    iss: "server",
+    sub: "account",
+    merchant_id: merchantId,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 60,
+  })).toString("base64url");
+  const message = `${header}.${payload}`;
+  const signature = crypto
+    .createHmac("sha256", Buffer.from(onboardingAuthConfig.serverPublicKey, "base64"))
+    .update(message)
+    .digest("base64url");
+  return `${message}.${signature}`;
 }
 
 describe("ISSUE #618 — Multi-Contract Support", () => {
@@ -498,6 +539,94 @@ describe("ISSUE #616 — Indexer REST API Server", () => {
       assert.strictEqual(res.status, 503);
       assert.strictEqual(data.status, "unhealthy");
       assert.strictEqual(data.database, "disconnected");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("should return 401 for the onboarding endpoint without a SEP-10 bearer token", async () => {
+    const app = createServer(createMockDatabase(), undefined, onboardingAuthConfig);
+    const server = app.listen(0);
+    const address = server.address() as any;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/merchants/me/onboarding`);
+      assert.strictEqual(res.status, 401);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("should return zero progress for a merchant with no indexed setup state", async () => {
+    const app = createServer(createMockDatabase(), undefined, onboardingAuthConfig);
+    const server = app.listen(0);
+    const address = server.address() as any;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/merchants/me/onboarding`, {
+        headers: { Authorization: `Bearer ${createSEP10Token("merchant-new")}` },
+      });
+      const data = await res.json() as any;
+
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(data.completion_pct, 0);
+      assert.strictEqual(data.steps.length, 6);
+      assert.ok(data.steps.every((step: any) => !step.completed && step.action_url));
+    } finally {
+      server.close();
+    }
+  });
+
+  it("should count registration as one of the six onboarding steps", async () => {
+    const mockDb = createMockDatabase();
+    mockDb.state.merchants.set("merchant-registered", {
+      registeredAt: "2026-01-01T00:00:00.000Z",
+      kycSubmittedAt: null,
+    });
+    const app = createServer(mockDb, undefined, onboardingAuthConfig);
+    const server = app.listen(0);
+    const address = server.address() as any;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/merchants/me/onboarding`, {
+        headers: { Authorization: `Bearer ${createSEP10Token("merchant-registered")}` },
+      });
+      const data = await res.json() as any;
+
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(data.completion_pct, 17);
+      assert.strictEqual(data.steps[0].completed, true);
+      assert.strictEqual(data.steps[1].completed, false);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("should count indexed registration and KYC verification toward six-step progress", async () => {
+    const mockDb = createMockDatabase();
+    mockDb.state.merchants.set("merchant-1", {
+      registeredAt: "2026-01-01T00:00:00.000Z",
+      kycSubmittedAt: "2026-01-02T00:00:00.000Z",
+    });
+    const app = createServer(mockDb, undefined, onboardingAuthConfig);
+    const server = app.listen(0);
+    const address = server.address() as any;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/merchants/me/onboarding`, {
+        headers: { Authorization: `Bearer ${createSEP10Token("merchant-1")}` },
+      });
+      const data = await res.json() as any;
+
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(data.completion_pct, 33);
+      assert.deepStrictEqual(
+        data.steps.filter((step: any) => step.completed).map((step: any) => step.key),
+        ["merchant_registered", "kyc_submitted"]
+      );
+      assert.strictEqual(data.steps[0].completed_at, "2026-01-01T00:00:00.000Z");
+      assert.strictEqual(data.steps[1].completed_at, "2026-01-02T00:00:00.000Z");
+      assert.strictEqual(data.steps[2].action_url, "/settings/webhooks");
     } finally {
       server.close();
     }
@@ -831,39 +960,150 @@ describe("ISSUE #616 — Indexer REST API Server", () => {
   });
 });
 
-describe("Issue #957 — GET /v1/fx/rates", () => {
-  it("requires an API key and returns all cached pairs with staleness", async () => {
-    process.env.API_KEY = "fx_rates_key";
-    const { setCachedRate, clearCachedRates } = await import("../src/fx-rate-cache");
-    clearCachedRates();
-    const now = Math.floor(Date.now() / 1000);
-    setCachedRate("USDC_NGN", 1620.5, now);
-    setCachedRate("USDC_GHS", 15.2, now - 10_000);
+describe("ISSUE #1081 — Reconciliation report export", () => {
+  it("should return merchant-scoped report totals with FX equivalents and CSV export", async () => {
+    const previousKeys = process.env.MERCHANT_API_KEYS;
+    process.env.MERCHANT_API_KEYS = JSON.stringify({ "merchant-report-key": "m_1" });
+    const mockDb = createMockDatabase();
+    mockDb.state.reconciliationData = {
+      payments: [
+        {
+          payment_id: "pay_report_1",
+          amount: "1000000000",
+          currency: "USDC",
+          status: "SETTLED",
+          created_at: "2026-10-02T12:00:00.000Z",
+          settled_at: "2026-10-02T12:01:00.000Z",
+          fee_amount: "10000000",
+          fiat_amount: "16000.00",
+          fiat_currency: "NGN",
+          customer_ref: "order-1",
+          tags: ["online"],
+        },
+        {
+          payment_id: "pay_report_2",
+          amount: "500000000",
+          currency: "USDC",
+          status: "SETTLED",
+          created_at: "2026-10-03T12:00:00.000Z",
+          settled_at: "2026-10-03T12:01:00.000Z",
+          fee_amount: "5000000",
+          fiat_amount: null,
+          fiat_currency: null,
+          customer_ref: null,
+          tags: null,
+        },
+      ],
+      settlements: [
+        { payment_id: "pay_report_1", amount: "1000000000", currency: "USDC", fee_amount: "10000000", settled_at: "2026-10-02T12:01:00.000Z" },
+        { payment_id: "pay_report_2", amount: "500000000", currency: "USDC", fee_amount: "5000000", settled_at: "2026-10-03T12:01:00.000Z" },
+      ],
+      refunds: [
+        { refund_id: "refund_report_1", payment_id: "pay_report_1", amount: "100000000", currency: "USDC", status: "PROCESSED", created_at: "2026-10-04T12:00:00.000Z" },
+      ],
+      disputeAdjustments: [
+        { dispute_id: "disp_report_1", payment_id: "pay_report_1", refund_id: "refund_report_1", amount: "-100000000", currency: "USDC", created_at: "2026-10-04T12:00:00.000Z" },
+      ],
+      fxRates: [
+        { pair: "USDC_NGN", rate: "1600000000", decimals: 7 },
+        { pair: "USDC_USD", rate: "10000000", decimals: 7 },
+      ],
+    };
 
-    const app = createServer(createMockDatabase());
+    const app = createServer(mockDb);
     const server = app.listen(0);
-    const { port } = server.address() as any;
-    try {
-      const unauth = await fetch(`http://127.0.0.1:${port}/v1/fx/rates`);
-      assert.strictEqual(unauth.status, 401);
+    const address = server.address() as any;
+    const url = `http://127.0.0.1:${address.port}/v1/reports/reconciliation?from=2026-10-01&to=2026-10-15&merchant_id=m_1`;
 
-      const res = await fetch(`http://127.0.0.1:${port}/v1/fx/rates`, {
-        headers: { authorization: "Bearer fx_rates_key" },
+    try {
+      const response = await fetch(url, { headers: { "x-api-key": "merchant-report-key" } });
+      const report = await response.json() as any;
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(report.period, { from: "2026-10-01", to: "2026-10-15" });
+      assert.strictEqual(report.summary.total_gross_usdc, "150.00");
+      assert.strictEqual(report.summary.total_fees_usdc, "1.50");
+      assert.strictEqual(report.summary.total_refunds_usdc, "10.00");
+      assert.strictEqual(report.summary.total_net_settled_usdc, "138.50");
+      assert.strictEqual(report.summary.fiat_equivalent.NGN, "22160.00");
+      assert.strictEqual(report.summary.fiat_equivalent.USD, "138.50");
+      assert.strictEqual(report.summary.dispute_adjustments, "-10.00");
+      assert.strictEqual(report.payments[0].fiat_equivalent.NGN, "16000.00");
+      assert.strictEqual(report.settlements[0].net_amount, "99.00");
+
+      const csvResponse = await fetch(url, {
+        headers: { "x-api-key": "merchant-report-key", Accept: "text/csv" },
       });
-      const body = (await res.json()) as any;
-      assert.strictEqual(res.status, 200);
-      assert.strictEqual(typeof body.staleness_threshold_secs, "number");
-      const ngn = body.rates.find((r: any) => r.to === "NGN");
-      const ghs = body.rates.find((r: any) => r.to === "GHS");
-      assert.deepStrictEqual(
-        { from: ngn.from, rate: ngn.rate, stale: ngn.stale },
-        { from: "USDC", rate: "1620.5", stale: false },
+      const csv = await csvResponse.text();
+      assert.strictEqual(csvResponse.status, 200);
+      assert.match(csvResponse.headers.get("content-type") || "", /text\/csv/);
+      assert.match(csv, /record_type/);
+      assert.match(csv, /pay_report_1/);
+
+      const forbidden = await fetch(
+        url.replace("merchant_id=m_1", "merchant_id=m_2"),
+        { headers: { "x-api-key": "merchant-report-key" } }
       );
-      assert.strictEqual(ngn.updated_at, new Date(now * 1000).toISOString());
-      assert.strictEqual(ghs.stale, true);
+      assert.strictEqual(forbidden.status, 403);
+
+      const invalidRange = await fetch(
+        `http://127.0.0.1:${address.port}/v1/reports/reconciliation?from=2026-10-01&to=2026-11-01`,
+        { headers: { "x-api-key": "merchant-report-key" } }
+      );
+      assert.strictEqual(invalidRange.status, 400);
     } finally {
       server.close();
-      clearCachedRates();
+      if (previousKeys === undefined) delete process.env.MERCHANT_API_KEYS;
+      else process.env.MERCHANT_API_KEYS = previousKeys;
     }
+  });
+
+  it("should decode rate and dispute-adjustment events for report storage", () => {
+    const subscriber = new EventSubscriber(
+      loadConfigFromEnv({ CONTRACT_IDS: "C_TEST" }),
+      createMockDatabase()
+    );
+    const fxEvent = subscriber.parseEvent({
+      id: "evt_fx_report",
+      timestamp: 1790942400,
+      ledger: 10,
+      txHash: "tx_fx",
+      contractId: "C_FX",
+      topic: ["FX_RATE", "UPDATED"],
+      value: ["USDC_NGN", 1600000000n, 7],
+    }) as any;
+    const adjustmentEvent = subscriber.parseEvent({
+      id: "evt_dispute_adjustment",
+      timestamp: 1790942400,
+      ledger: 11,
+      txHash: "tx_dispute",
+      contractId: "C_REFUND",
+      topic: ["DISPUTE", "ADJUSTMENT"],
+      value: ["disp_1", "pay_1", "refund_1", -100000000n],
+    }) as any;
+    const feeEvent = subscriber.parseEvent({
+      id: "evt_fee_total",
+      timestamp: 1790942400,
+      ledger: 12,
+      txHash: "tx_fee",
+      contractId: "C_PAYMENT",
+      topic: ["PAYMENT", "FEE_TOTAL", "pay_1"],
+      value: 15000000n,
+    }) as any;
+
+    assert.deepStrictEqual(fxEvent.value, {
+      pair: "USDC_NGN",
+      rate: "1600000000",
+      decimals: 7,
+    });
+    assert.deepStrictEqual(adjustmentEvent.value, {
+      dispute_id: "disp_1",
+      payment_id: "pay_1",
+      refund_id: "refund_1",
+      amount: "-100000000",
+    });
+    assert.deepStrictEqual(feeEvent.value, {
+      payment_id: "pay_1",
+      amount: "15000000",
+    });
   });
 });
