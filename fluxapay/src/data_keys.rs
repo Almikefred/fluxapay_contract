@@ -1,6 +1,7 @@
 //! Data keys for persistent storage in FluxaPay.
 
 use crate::merchant_registry::KycTier;
+use crate::types::PauseScope;
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Symbol};
 
 /// Converts a payment ID String into a 32-byte hash key for storage.
@@ -212,4 +213,6 @@ pub enum DataKey {
     AutoRefundQueue,
     /// Global append-only index of all refund IDs for paginated enumeration.
     RefundIndex,
+    /// Pause state keyed by operation scope. Appended to preserve existing storage keys.
+    PauseScope(PauseScope),
 }

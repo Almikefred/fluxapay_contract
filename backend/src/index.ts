@@ -27,21 +27,27 @@ app.use(requireJsonContentType);
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 const SERVER_PUBLIC_KEY = process.env.SEP10_SERVER_PUBLIC_KEY;
+const SERVER_SECRET_KEY = process.env.SEP10_SERVER_SECRET;
+const JWT_SECRET = process.env.SEP10_JWT_SECRET;
 const NETWORK_PASSPHRASE = process.env.STELLAR_NETWORK === "mainnet"
   ? Networks.PUBLIC
   : Networks.TESTNET;
 const HOME_DOMAIN = process.env.SEP10_HOME_DOMAIN || "fluxapay.stellar.org";
 
-if (!SERVER_PUBLIC_KEY) {
-  throw new Error("SEP10_SERVER_PUBLIC_KEY env var is required to start the backend.");
+if (!SERVER_PUBLIC_KEY || !SERVER_SECRET_KEY || !JWT_SECRET) {
+  throw new Error("SEP10_SERVER_PUBLIC_KEY, SEP10_SERVER_SECRET, and SEP10_JWT_SECRET are required to start the backend.");
 }
 
 app.use(
   "/auth",
   createAuthRouter({
     serverPublicKey: SERVER_PUBLIC_KEY,
+    serverSecretKey: SERVER_SECRET_KEY,
+    jwtSecret: JWT_SECRET,
     networkPassphrase: NETWORK_PASSPHRASE,
+    rpcUrl: process.env.SOROBAN_RPC_URL,
     homeDomain: HOME_DOMAIN,
+    jwtExpirySecs: Number(process.env.JWT_EXPIRY_SECS || 86_400),
     // TODO(#675): resolve the merchant id via MerchantRegistryClient instead
     // of falling back to the account's own public key.
   }),

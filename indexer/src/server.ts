@@ -1,4 +1,5 @@
 import express, { type Request, type Response, type NextFunction } from "express";
+import { createHash } from "crypto";
 import * as dotenv from "dotenv";
 import { z } from "zod";
 import { Database } from "./database";
@@ -13,6 +14,7 @@ import {
 } from "./webhooks";
 import { getCachedRate } from "./fx-rate-cache";
 import { createRateLimitMiddleware } from "./rate-limit";
+import { anchorEvidenceHash, parseEvidenceMultipart, pinEvidence } from "./evidence";
 
 dotenv.config();
 
@@ -117,6 +119,71 @@ export function createServer(
 
   // Issue #817: rate limit ALL routes (auth gets a stricter per-IP budget).
   app.use(createRateLimitMiddleware());
+
+  app.post(
+    "/v1/disputes/:id/evidence",
+    requireSEP10Auth(sep10Config),
+    express.raw({ type: "multipart/form-data", limit: "50mb" }),
+    async (req: Request, res: Response) => {
+      try {
+        const context = await database.getDisputeEvidenceContext(req.params.id);
+        if (!context) {
+          res.status(404).json({ error: "Dispute not found" });
+          return;
+        }
+        if (req.auth?.sub !== context.disputer && req.auth?.sub !== context.merchantId) {
+          res.status(403).json({ error: "Only a dispute party may upload evidence" });
+          return;
+        }
+        if (!Buffer.isBuffer(req.body)) {
+          res.status(400).json({ error: "Expected multipart file upload" });
+          return;
+        }
+
+        const file = parseEvidenceMultipart(req.body, req.headers["content-type"] || "");
+        const evidenceHash = createHash("sha256").update(file.bytes).digest();
+        const pinned = await pinEvidence(file);
+        const txHash = await anchorEvidenceHash(req.params.id, req.auth.sub, evidenceHash);
+        const item = {
+          ipfs_cid: pinned.cid,
+          evidence_hash: evidenceHash.toString("hex"),
+          ipfs_gateway_url: pinned.gatewayUrl,
+          filename: file.filename,
+          content_type: file.contentType,
+          uploaded_by: req.auth.sub,
+          tx_hash: txHash,
+          created_at: new Date().toISOString(),
+        };
+        const evidence = await database.appendDisputeEvidence(req.params.id, item);
+        if (!evidence) {
+          res.status(404).json({ error: "Dispute not found" });
+          return;
+        }
+        res.status(201).json({ ...item, evidence });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Evidence upload failed";
+        const status = /multipart|file type|size limit|file field|boundary/i.test(message) ? 400 : 502;
+        res.status(status).json({ error: message });
+      }
+    },
+  );
+
+  app.get(
+    "/v1/disputes/:id/evidence",
+    requireSEP10Auth(sep10Config),
+    async (req: Request, res: Response) => {
+      const context = await database.getDisputeEvidenceContext(req.params.id);
+      if (!context) {
+        res.status(404).json({ error: "Dispute not found" });
+        return;
+      }
+      if (req.auth?.sub !== context.disputer && req.auth?.sub !== context.merchantId) {
+        res.status(403).json({ error: "Only a dispute party may view evidence" });
+        return;
+      }
+      res.status(200).json({ evidence: context.evidence });
+    },
+  );
 
   // GET /health - Public endpoint checking database connection
   app.get("/health", async (_req: Request, res: Response) => {
@@ -498,6 +565,73 @@ export function createServer(
   });
 
   // ------------------------------------------------------------------ Issue #1067: Invoice lifecycle routes
+
+  app.get(
+    "/v1/subscriptions/:id/invoices",
+    requireSEP10Auth(sep10Config),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const invoices = await database.getInvoicesBySubscription(req.params.id);
+        if (invoices.length > 0 && !invoices.some(
+          (invoice) => invoice.merchantId === req.auth?.sub || invoice.subscriber === req.auth?.sub,
+        )) {
+          res.status(403).json({ error: "Not authorized for this subscription" });
+          return;
+        }
+        res.status(200).json({ invoices });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  app.get(
+    "/v1/invoices/:id/pdf",
+    requireSEP10Auth(sep10Config),
+    async (req: Request, res: Response) => {
+      const invoice = await database.getInvoiceById(req.params.id);
+      if (!invoice) {
+        res.status(404).json({ error: "Invoice not found" });
+        return;
+      }
+      if (invoice.merchantId !== req.auth?.sub && invoice.subscriber !== req.auth?.sub) {
+        res.status(403).json({ error: "Not authorized for this invoice" });
+        return;
+      }
+      const escapePdfText = (value: unknown) => String(value ?? "").replace(/[^\x20-\x7e]/g, "?").replace(/[\\()]/g, "\\$&");
+      const amount = invoice.totalAmount == null ? "0.0000000" : (Number(invoice.totalAmount) / 10_000_000).toFixed(7);
+      const lines = [
+        `Invoice ${invoice.invoiceNumber || invoice.invoiceId}`,
+        `Merchant: ${invoice.merchantId || ""}`,
+        `Subscriber: ${invoice.subscriber || ""}`,
+        `Subscription: ${invoice.subscriptionId || ""}`,
+        `Billing cycle: ${invoice.cycleNumber ?? ""}`,
+        `Billing period: ${invoice.billingPeriodStart?.toISOString() || ""} - ${invoice.billingPeriodEnd?.toISOString() || ""}`,
+        `Amount: ${amount}`,
+        `Status: ${invoice.status || ""}`,
+      ];
+      const text = lines.map((line, index) => `BT /F1 12 Tf 50 ${760 - index * 24} Td (${escapePdfText(line)}) Tj ET`).join("\n");
+      const stream = `${text}\n`;
+      const objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        `<< /Length ${Buffer.byteLength(stream, "ascii")} >>\nstream\n${stream}endstream`,
+      ];
+      let pdf = "%PDF-1.4\n";
+      const offsets = [0];
+      objects.forEach((object, index) => {
+        offsets.push(Buffer.byteLength(pdf, "ascii"));
+        pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+      });
+      const xrefOffset = Buffer.byteLength(pdf, "ascii");
+      pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+      for (const offset of offsets.slice(1)) pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
+      pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+      res.status(200).type("application/pdf").send(Buffer.from(pdf, "ascii"));
+    },
+  );
 
   /** GET /v1/invoices?status=Pending|Paid|Overdue|Voided&merchant_id=... */
   app.get("/v1/invoices", requireScope("read:payments"), async (req: Request, res: Response, next: NextFunction) => {

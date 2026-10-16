@@ -15,6 +15,7 @@ import {
   serial,
   text,
   timestamp,
+  uniqueIndex,
   varchar,
 } from "drizzle-orm/pg-core";
 
@@ -87,11 +88,13 @@ export const disputes = pgTable(
     disputeId: varchar("dispute_id", { length: 255 }).notNull().unique(),
     paymentId: varchar("payment_id", { length: 255 }).notNull(),
     amount: bigint("amount", { mode: "bigint" }).notNull(),
+    disputer: varchar("disputer", { length: 255 }),
     status: varchar("status", { length: 50 }),
     createdAt: timestamp("created_at"),
     updatedAt: timestamp("updated_at").defaultNow(),
     escalated: boolean("escalated").default(false),
     resolvedAt: timestamp("resolved_at"),
+    evidence: jsonb("evidence").notNull().default([]),
   },
 );
 
@@ -142,12 +145,20 @@ export const invoices = pgTable("invoices", {
   paidAt: timestamp("paid_at"),
   voidedAt: timestamp("voided_at"),
   linkedPaymentId: varchar("linked_payment_id", { length: 255 }),
+  subscriptionId: varchar("subscription_id", { length: 255 }),
+  cycleNumber: integer("cycle_number"),
+  invoiceNumber: varchar("invoice_number", { length: 64 }),
+  subscriber: varchar("subscriber", { length: 255 }),
+  subscriberEmail: varchar("subscriber_email", { length: 320 }),
+  billingPeriodStart: timestamp("billing_period_start"),
+  billingPeriodEnd: timestamp("billing_period_end"),
   createdAt: timestamp("created_at"),
   updatedAt: timestamp("updated_at").defaultNow(),
 },
 (t) => ({
   merchantIdIdx: index("idx_invoice_merchant_id").on(t.merchantId),
   statusIdx: index("idx_invoice_status").on(t.status),
+  merchantNumberIdx: uniqueIndex("idx_invoice_merchant_number").on(t.merchantId, t.invoiceNumber),
 }),
 );
 
@@ -158,6 +169,11 @@ export const disputeBonds = pgTable("dispute_bonds", {
   amount: bigint("amount", { mode: "bigint" }),
   status: varchar("status", { length: 50 }),
   createdAt: timestamp("created_at"),
+});
+
+export const merchantInvoiceSequences = pgTable("merchant_invoice_sequences", {
+  merchantId: varchar("merchant_id", { length: 255 }).primaryKey(),
+  nextNumber: integer("next_number").notNull().default(1),
 });
 
 export const deadLetterEvents = pgTable("dead_letter_events", {
