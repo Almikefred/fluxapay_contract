@@ -1,7 +1,9 @@
 //! Contract types and struct definitions for FluxaPay.
 
 use crate::merchant_registry::KycTier;
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Map, String, Symbol, Vec};
+use soroban_sdk::{
+    contracterror, contracttype, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -394,6 +396,27 @@ pub enum Error {
     KycLimitExceeded = 85,
     /// Issue #1061: A single-use payment link has already been redeemed and cannot be used again.
     LinkAlreadyUsed = 86,
+    /// Issues #1026/#1027: `leaf_count` is zero or exceeds `MAX_MERKLE_BATCH_LEAVES`.
+    InvalidMerkleLeafCount = 87,
+    /// Issues #1026/#1027: No Merkle batch distribution exists with the given ID.
+    MerkleDistributionNotFound = 88,
+    /// Issues #1026/#1027: This `(distribution_id, index)` allocation was already claimed.
+    MerkleAlreadyClaimed = 89,
+    /// Issues #1026/#1027: Submitted Merkle proof does not resolve to the stored root.
+    InvalidMerkleProof = 90,
+    /// Issues #1026/#1027: Batch distribution's `expires_at` has passed; claims are closed.
+    MerkleDistributionExpired = 91,
+    /// Issues #1026/#1027: Batch distribution has not yet expired; defund not allowed.
+    MerkleDistributionNotExpired = 92,
+    /// Issues #1026/#1027: Batch distribution was already defunded by its creator.
+    MerkleDistributionAlreadyDefunded = 93,
+    /// Issue #1013: Withdrawal amount exceeds the configured single-admin threshold
+    /// and must instead go through `propose_treasury_withdrawal` multisig governance.
+    TreasuryExceedsSingleAdminThreshold = 94,
+    /// Issue #1014: Payment amount exceeds the merchant's KYC tier single-payment limit.
+    ExceedsTierSingleLimit = 95,
+    /// Issue #1014: Payment would exceed the merchant's KYC tier monthly volume limit.
+    ExceedsTierMonthlyLimit = 96,
 }
 
 /// Issue #841: Muxed account (M-address) wrapping a G-address and 64-bit sub-account ID.
@@ -690,6 +713,29 @@ pub struct TreasuryMultisigConfig {
     pub admin_signers: Vec<Address>,
     pub min_delay_secs: u64,
     pub max_delay_secs: u64,
+}
+
+/// Issues #1026/#1027: A Merkle-root batch payment distribution for bulk
+/// disbursements (payroll, airdrops). The creator deposits `total_amount` of
+/// `token` up front; recipients independently withdraw their share by
+/// proving inclusion of `(index, recipient, amount)` under `merkle_root`.
+///
+/// `claimed_bitmap` tracks which leaf indices have been claimed using one bit
+/// per leaf, packed into a single persistent storage entry per distribution
+/// (replay protection without a storage write per recipient).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleDistribution {
+    pub distribution_id: u64,
+    pub creator: Address,
+    pub token: Address,
+    pub merkle_root: BytesN<32>,
+    pub total_amount: i128,
+    pub claimed_amount: i128,
+    pub leaf_count: u32,
+    pub expires_at: u64,
+    pub defunded: bool,
+    pub claimed_bitmap: Bytes,
 }
 
 /// Treasury withdrawal proposal status for querying.

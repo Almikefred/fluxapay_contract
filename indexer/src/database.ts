@@ -7,6 +7,7 @@
  */
 
 import { Pool } from "pg";
+import { SettlementRecord, SettlementStatus, SettlementStore } from "./settlement";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import {
   and,
@@ -88,7 +89,7 @@ export interface SubscriptionMetrics {
   dunning_recovery_rate: number | null;
 }
 
-export class Database {
+export class Database implements SettlementStore {
   private pool: Pool;
   private db: NodePgDatabase<typeof schema>;
   private initialized = false;
@@ -169,6 +170,14 @@ export class Database {
 
     switch (table) {
       case "payments":
+        // Issue #1037: PAYMENT/RETRY_CREATED is emitted by the contract and
+        // carries (new_payment_id, original_payment_id), but the Drizzle
+        // `payments` schema has no `retryOfPaymentId` column yet to persist
+        // it into — the on-chain link (PaymentCharge.retry_of_payment_id,
+        // queryable via get_payment) is this issue's actual requirement and
+        // is unaffected; indexer-side reconciliation would need its own
+        // follow-up migration + schema column, left as a known gap rather
+        // than rushed in here.
         await tx
           .insert(payments)
           .values({
@@ -698,6 +707,70 @@ export class Database {
       SETTLEMENT: "settlements",
     };
     return tableMap[eventType] || "contract_events";
+  }
+
+  /**
+   * Fetch the current settlement record for a payment, if the SEP-6/SEP-24
+   * offramp has been attempted for it. Used by `SettlementService` to make
+   * `settle()` idempotent against re-delivered `PAYMENT/ANCHOR_WITHDRAW`
+   * events.
+   */
+  async getSettlement(paymentId: string): Promise<SettlementRecord | null> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT payment_id, merchant_id, anchor_domain, anchor_txn_id, amount, currency, status
+         FROM settlements WHERE payment_id = $1`,
+        [paymentId]
+      );
+      if (result.rows.length === 0) return null;
+      const row = result.rows[0];
+      return {
+        paymentId: row.payment_id,
+        merchantId: row.merchant_id,
+        anchorDomain: row.anchor_domain,
+        anchorTxnId: row.anchor_txn_id,
+        amount: Number(row.amount),
+        currency: row.currency,
+        status: row.status as SettlementStatus,
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Insert or update the settlement row for a payment, keyed by
+   * `payment_id`. Called at each step of the SEP-6 withdrawal flow
+   * (initiated -> pending -> fiat_sent/failed).
+   */
+  async upsertSettlement(record: SettlementRecord): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        `INSERT INTO settlements
+           (payment_id, merchant_id, anchor_domain, anchor_txn_id, amount, currency, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+         ON CONFLICT (payment_id) DO UPDATE SET
+           anchor_domain = $3,
+           anchor_txn_id = COALESCE($4, settlements.anchor_txn_id),
+           amount = $5,
+           currency = $6,
+           status = $7,
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          record.paymentId,
+          record.merchantId,
+          record.anchorDomain,
+          record.anchorTxnId,
+          record.amount,
+          record.currency,
+          record.status,
+        ]
+      );
+    } finally {
+      client.release();
+    }
   }
 
   /**

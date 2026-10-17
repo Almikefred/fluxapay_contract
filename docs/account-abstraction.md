@@ -72,6 +72,43 @@ Topics are `(SESSION, ACTION, account)`, the same shape as `SESSION/REGISTERED`,
 
 Registration, expiry, and revocation still return `Unauthorized`, `SessionNotFound`, `SessionExpired`, and `SignerRevoked`.
 
+## Merchant → sub-account delegation (Issue #1029)
+
+Separate from session keys above: a merchant can delegate specific payment
+operations to a sub-account (a POS terminal, an employee key, etc.). The
+sub-account signs the delegated call directly with its own key — the
+merchant does not sign again at call time.
+
+### Scopes
+
+| Scope | Covers |
+|-------|--------|
+| `CreatePayment` | `PaymentProcessor::create_payment_delegated` |
+| `CreateRefund` | `PaymentProcessor::create_refund_delegated` |
+| `ReadOnly` | Reserved for future read-only delegated queries; not enforced on any write path yet |
+| `All` | Every delegated operation above |
+
+### Entry points
+
+| Function | Caller | Effect |
+|----------|--------|--------|
+| `grant_delegation(merchant, sub_account, scope, expires_at)` | Merchant | Creates or replaces the sub-account's delegation |
+| `revoke_delegation(merchant, sub_account)` | Merchant | Marks the delegation revoked (idempotent) |
+| `list_delegations(merchant)` | Anyone | Read-only audit view, including revoked/expired entries |
+| `create_payment_delegated(sub_account, args)` | Sub-account | Creates a payment for `args.merchant_id`, requiring a live `CreatePayment` (or `All`) delegation |
+| `create_refund_delegated(sub_account, payment_id, refund_amount, reason, receipt_hash)` | Sub-account | Creates a refund for the payment's merchant, requiring a live `CreateRefund` (or `All`) delegation |
+
+### Errors
+
+| Name | When |
+|------|------|
+| `Error::DelegationExpired` | `now > delegation.expires_at` |
+| `Error::DelegationRevoked` | The merchant called `revoke_delegation` for this sub-account |
+| `Error::Unauthorized` | No delegation exists, or the granted scope does not cover the requested operation |
+
+A re-`grant_delegation` call for the same `(merchant, sub_account)` pair
+replaces the previous grant (new scope/expiry, `revoked` reset to `false`),
+mirroring `register_session_key`'s re-registration semantics above.
 
 ## Offline signing (air-gapped transactions)
 

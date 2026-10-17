@@ -82,6 +82,16 @@ document on every CI run to catch drift between them.
 | 69 | `InvalidEvidenceCid` | Evidence field is not a valid IPFS CID. | Passing a non-CID string as dispute evidence. | Pass a valid IPFS CID (v0 starting with Qm or v1 starting with bafy). |
 | 70 | `InvalidPaymentLink` | Payment link configuration or parameters are invalid. | Malformed payment link creation parameters. | Verify payment link arguments and try again. |
 | 71 | `KycLimitExceeded` | Payment amount or cumulative monthly volume exceeds merchant's KYC tier cap. | Single payment exceeds tier max, or cumulative monthly volume exceeds tier cap under ADR-0003. | Upgrade merchant KYC tier to increase payment volume limits. |
+| 87 | `InvalidMerkleLeafCount` | `leaf_count` passed to `create_batch` is zero or exceeds the maximum. | Creating a batch distribution with 0 or more than 10,000 leaves. | Pass a `leaf_count` between 1 and `MAX_MERKLE_BATCH_LEAVES`. |
+| 88 | `MerkleDistributionNotFound` | No Merkle batch distribution exists with the given `distribution_id`. | Typo'd or stale `distribution_id`. | Verify the ID via `get_batch`. |
+| 89 | `MerkleAlreadyClaimed` | This `(distribution_id, index)` allocation was already claimed. | Submitting the same claim twice. | No action needed — the recipient already received their funds. |
+| 90 | `InvalidMerkleProof` | The submitted proof does not resolve to the distribution's stored Merkle root. | Wrong `index`/`amount`/sibling hashes, or a proof built against a different tree. | Regenerate the proof with `sdk/src/merkle.ts` from the exact leaf set used to create the batch. |
+| 91 | `MerkleDistributionExpired` | The batch distribution's `expires_at` has passed. | Claiming after the distribution's claim window closed. | Claims must happen before `expires_at`; contact the creator about a new batch. |
+| 92 | `MerkleDistributionNotExpired` | Attempted to `defund_batch` before `expires_at`. | Calling `defund_batch` while claims are still open. | Wait until after `expires_at` to defund. |
+| 93 | `MerkleDistributionAlreadyDefunded` | The batch distribution was already defunded by its creator. | Calling `claim_batch_payment` or `defund_batch` again after defunding. | No action needed — the distribution is closed. |
+| 94 | `TreasuryExceedsSingleAdminThreshold` | Withdrawal amount exceeds the configured single-admin threshold. | Calling `withdraw_treasury` for more than `get_treasury_single_admin_threshold()` (default 1000 USDC). | Use `propose_treasury_withdrawal` / `approve_treasury_withdrawal` / `execute_treasury_withdrawal` for larger amounts, or lower the amount. |
+| 95 | `ExceedsTierSingleLimit` | Payment amount exceeds the merchant's KYC tier single-payment limit. | Merchant's KYC tier (`TIER_0_MAX_SINGLE` / `TIER_1_MAX_SINGLE` / `TIER_2_MAX_SINGLE`) can't cover this payment. | Reduce the amount, or upgrade the merchant's KYC tier. |
+| 96 | `ExceedsTierMonthlyLimit` | Payment would exceed the merchant's KYC tier monthly volume limit. | Cumulative volume for the current calendar month (UTC) plus this payment exceeds the tier's monthly cap. | Wait for the next calendar month, reduce the amount, or upgrade the merchant's KYC tier. |
 | 404 | `PaymentNotFound` | No payment exists with the given `payment_id`. | Typo'd ID, or payment was never created. | Verify the ID via `get_payment` / listing endpoints. |
 | 405 | `RefundNotFound` | No refund exists with the given `refund_id`. | Typo'd ID, or refund was never created. | Verify the ID via `get_refund` / `get_payment_refunds`. |
 | 406 | `InvalidAmount` | Amount is zero, negative, or otherwise invalid. | Passing a non-positive amount to a payment/refund call. | Pass a strictly positive `i128` amount. |
@@ -153,6 +163,8 @@ document on every CI run to catch drift between them.
 | 7 | `WhitelistModeRequiresBusinessTier` | Only Business-tier merchants may enable whitelist mode. | Enabling customer whitelist mode below Business tier. | Upgrade the merchant to Business tier first. |
 | 8 | `PayerNotWhitelisted` | Payer is not in the merchant's customer whitelist. | Whitelist mode is on and the payer isn't listed. | Merchant must add the payer to the whitelist. |
 | 12 | `KycLimitExceeded` | Single payment or cumulative monthly volume exceeds merchant's KYC tier cap. | Merchant at tier 0 or tier 1 breached per-payment or monthly limit. | Upgrade merchant KYC tier. |
+| 15 | `TierSingleLimitExceeded` | Payment amount exceeds the merchant's KYC tier single-payment limit. | `check_kyc_limit` called from `create_payment` with `amount > tier_single_max`. | Reduce the amount, or upgrade the merchant's KYC tier. |
+| 16 | `TierMonthlyLimitExceeded` | Payment would exceed the merchant's KYC tier monthly volume limit. | `check_kyc_limit` / `check_monthly_limit_only` found current-month volume plus this amount exceeds the tier's monthly cap. | Wait for the next calendar month, reduce the amount, or upgrade the merchant's KYC tier. |
 
 ## `MerchantAuthError` (`fluxapay/src/merchant_auth.rs`)
 
@@ -194,3 +206,114 @@ document on every CI run to catch drift between them.
 ---
 
 *Generated for #458. Keep this table in sync with the `#[contracterror]` enums it documents — `scripts/check-error-map-sync.ts` checks `FLUXAPAY_CONTRACT_ERROR_MAP` (Core table) against `fluxapay/src/lib.rs` on every CI run.*
+
+## Tiered Refund Fee Reference (Issue #1016)
+
+`process_refund` (via `process_refund_internal`) and `refund_instantly`
+look up the merchant's KYC tier through `MerchantRegistry` and apply the
+matching fee rate below, instead of a single flat rate for every merchant.
+Both entry points emit the applied rate as the `fee_bps` field in the
+`REFUND/COMPLETED` event payload.
+
+| KYC Tier | Refund Fee (bps) | Refund Fee (%) | Constant |
+|---|---|---|---|
+| Unverified | 100 (falls back to `CurrentFee`, default `REFUND_FEE_BPS`) | 1.0% | `REFUND_FEE_BPS` |
+| Basic | 100 | 1.0% | `REFUND_FEE_BPS_BASIC` |
+| Full | 80 | 0.8% | `REFUND_FEE_BPS_FULL` |
+| Business | 50 | 0.5% | `REFUND_FEE_BPS_BUSINESS` |
+
+Notes:
+
+- Unverified merchants use whatever the admin has configured as the
+  contract-wide default fee (`DataKey::CurrentFee`, falling back to the
+  `REFUND_FEE_BPS` constant of 100 bps) rather than a tier-specific
+  constant, since "Unverified" has no dedicated constant of its own.
+- `refund_instantly` only accepts callers whose tier is already `Full` or
+  `Business` (see the `is_high_trust` check in `fluxapay/src/lib.rs`), so
+  in practice it only ever applies `REFUND_FEE_BPS_FULL` or
+  `REFUND_FEE_BPS_BUSINESS`; the `Basic`/`Unverified` match arms exist for
+  defensive completeness and future tier expansion.
+- A merchant's tier is read at the moment the refund is processed, not at
+  the moment the original payment or refund request was created. A tier
+  upgrade (see #1015) that lands between refund creation and processing is
+  reflected in the fee actually charged.
+- `RefundManager` needs its own `MerchantRegistry` address configured via
+  `set_merchant_registry_address` (admin-only) — it is a separate contract
+  from `PaymentProcessor` and does not share that configuration
+  automatically. If no registry address is set, every tier falls back to
+  the flat default fee.
+
+## Error Enum (`fluxapay::Error`)
+
+| Variant | Code |
+|---|---|
+| Unauthorized | 1 |
+| PaymentAlreadyExists | 2 |
+| PaymentExpired | 3 |
+| InvalidPaymentId | 4 |
+| RefundAlreadyProcessed | 8 |
+| DisputeNotFound | 9 |
+| DisputeAlreadyResolved | 12 |
+| PaymentAlreadyProcessed | 14 |
+| AccessControlError | 15 |
+| RefundExceedsPayment | 16 |
+| ContractPaused | 17 |
+| RateLimitExceeded | 18 |
+| RefundCancelled | 19 |
+| UnsupportedToken | 20 |
+| AmountBelowMin | 21 |
+| AmountAboveMax | 22 |
+| InvalidExpiry | 23 |
+| InvalidSettlement | 24 |
+| DuplicateIdempotencyKey | 25 |
+| InvalidAddress | 26 |
+| ArbitrageDetected | 27 |
+| SwapPathInvalid | 28 |
+| OraclePriceDeviation | 29 |
+| SubscriptionInGracePeriod | 30 |
+| SubscriptionRetryExhausted | 31 |
+| InvalidResumeTimestamp | 32 |
+| MerchantAuthError | 33 |
+| TierVolumeLimitExceeded | 34 |
+| BatchTooLarge | 35 |
+| RefundExpired | 36 |
+| InsufficientArbitrators | 37 |
+| ArbitrationVotingThresholdNotMet | 38 |
+| FeeProposalNotReady | 39 |
+| InvalidEvidenceFormat | 40 |
+| InvalidSettlementSignature | 41 |
+| RefundCooldownNotElapsed | 42 |
+| Reentrancy | 43 |
+| NoFeeProposal | 44 |
+| StaleOracleRate | 45 |
+| LinkExpired / InsufficientTreasuryBalance | 46 |
+| MetadataValueTooLong | 47 |
+| UpgradeFailed | 48 |
+| MetadataTooLarge | 49 |
+| InvalidMemoType | 50 |
+| MemoTooLong | 51 |
+| InvalidMemoId | 52 |
+| PayerNotWhitelisted | 53 |
+| LinkMaxUsesReached / DirectTransferNotDisputable / MaxRetriesExceeded / InvalidStatusTransition | 54 |
+| RateDeviationExceeded | 55 |
+| DisputeRateLimitExceeded | 54 |
+| PaymentNotFound | 404 |
+| RefundNotFound | 405 |
+| InvalidAmount | 406 |
+
+> Several variants above intentionally or unintentionally share the same
+> numeric discriminant (e.g. `46`, `54`) in the current contract source.
+> This table reflects the enum as written in `fluxapay/src/lib.rs` rather
+> than resolving that pre-existing duplication, which is out of scope for
+> this change. Resolving it would alter wire-level error codes for
+> existing integrators and should be its own tracked change.
+
+## Refund-Specific Errors Most Relevant to Tiered Fees
+
+| Error | When it's returned |
+|---|---|
+| `PaymentNotFound` | `process_refund_internal` cannot find the `Payment` record for the refund's `payment_id` (needed to resolve the merchant for the tier lookup). |
+| `RefundAlreadyProcessed` | The refund is not `Pending` (already completed, rejected, or cancelled). |
+| `RefundExpired` | Called after the refund's `expiry_at` has passed. |
+| `Unauthorized` | `refund_instantly` rejects merchants whose KYC tier is not `Full` or `Business`, or whose `require_auth()`/blacklist checks fail. |
+| `Reentrancy` | Reentrant or concurrent `process_refund` calls for the same `refund_id`, guarded by `DataKey::ReentrancyLock` / `DataKey::RefundLock`. |
