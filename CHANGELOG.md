@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+- **Issue #1039**: SSE broadcast for all 6 dispute lifecycle events (`dispute.opened`, `.responded`, `.escalated`, `.vote_cast`, `.resolved`, `.auto_resolved`) on `GET /v1/events/stream`, filterable by `payment_id`/`dispute_id`. Previously `SSEManager.broadcast` was never called by the event consumer for any event type. New dispute detail dashboard page subscribes live.
+- **Issue #1035**: `payer_muxed_id` now flows end-to-end from `verify_payment`'s M-address extraction through the `PAYMENT/VERIFIED` event, the indexer's `payments` table (new `payer_muxed_id` column, migration `009_payments_muxed_id.sql`), and the REST API (`GET /payments/:paymentId`, filterable on `GET /v1/payments`).
+- **Issue #1024**: Four new `cargo-fuzz` targets — `fuzz_refund_fee_calculation`, `fuzz_dispute_bond_computation`, `fuzz_stream_accrual`, `fuzz_metadata_validation` — covering refund fee arithmetic, the (previously unused) proportional dispute bond formula from issue #820, lazy stream accrual, and metadata size limits. Added to the weekly `fuzz.yml` matrix.
+
+### Changed
+- **Issue #1036 / PR #TBD**: Bumped `soroban-sdk` from `"26"` to `"29"` (latest stable) in the root workspace and the `fuzz/` crate. Reviewed the v27/v28/v29 migration notes (`bytes!`/`bytesn!` decimal literals, `experimental_spec_shaking_v2` removal, `deploy_v2`/`update_current_contract_wasm` deprecation, sparse event data, the new `ContractExecutable::ExternalRef` variant): none of this contract's code hits those breaking paths today. `rust-toolchain.toml` (1.94.1) already exceeds the SDK's minimum. `Cargo.lock` needs `cargo update -p soroban-sdk --precise 29.0.1` run with registry access, which this change's sandboxed environment did not have.
 - **Issue #893 / PR #910**:
   - Sponsored meta-transactions for gasless actions with domain-separated Ed25519 signatures, replay prevention nonces, and execution deadlines.
   - Core actions supported: `create_charge`, `authorize_refund`, `rotate_webhook_key`, and `set_fee_recipient`.

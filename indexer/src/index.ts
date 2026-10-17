@@ -8,6 +8,7 @@ import { SorobanRpc as rpc, scValToNative } from "stellar-sdk";
 import { Database } from "./database";
 import { ContractEvent, AnyEvent, StreamEvent } from "./types";
 import { startServer } from "./server";
+import { sseManager } from "./sse";
 import {
   buildEnvelope,
   deliverOnce,
@@ -45,6 +46,11 @@ function getWebhookEventType(event: AnyEvent): WebhookEventType | null {
     "PAYMENT/CREATED": "payment.created",
     "PAYMENT/PENDING": "payment.pending",
     "PAYMENT/CONFIRMED": "payment.confirmed",
+    // The contract's actual topic for a confirmed payment is "VERIFIED" (see
+    // `fluxapay::PaymentProcessor::verify_payment`/`confirm_payment`); kept
+    // alongside "PAYMENT/CONFIRMED" above in case any emitter path uses that
+    // literal topic instead.
+    "PAYMENT/VERIFIED": "payment.confirmed",
     "PAYMENT/SETTLED": "payment.confirmed",
     "PAYMENT/PARTIALLY_PAID": "payment.partially_paid",
     "PAYMENT/OVERPAID": "payment.overpaid",
@@ -52,10 +58,48 @@ function getWebhookEventType(event: AnyEvent): WebhookEventType | null {
     "PAYMENT/CANCELLED": "payment.cancelled",
     "REFUND/CREATED": "refund.created",
     "REFUND/COMPLETED": "refund.completed",
+    // Issue #1039: all 6 dispute lifecycle events, broadcast over SSE (and
+    // available to webhooks) with a schema matching `dispute.*` elsewhere.
     "DISPUTE/CREATED": "dispute.opened",
+    "DISPUTE/REVIEWED": "dispute.responded",
+    "DISPUTE/ESCALATED": "dispute.escalated",
+    "DISPUTE/VOTE_CAST": "dispute.vote_cast",
     "DISPUTE/RESOLVED": "dispute.resolved",
+    "DISPUTE/AUTO_RESOLVED": "dispute.auto_resolved",
   };
   return eventTypes[`${type}/${subtype}`] ?? null;
+}
+
+/**
+ * Issue #1039: resolve the merchant that owns `event` for live SSE
+ * broadcasting. Mirrors the replay webhook dispatcher's `merchant_id` /
+ * `payment_id` lookup, plus a `dispute_id` fallback for dispute events that
+ * carry only a dispute ID (`DISPUTE/VOTE_CAST`, `DISPUTE/AUTO_RESOLVED`).
+ */
+async function resolveMerchantIdForEvent(
+  database: Database,
+  value: Record<string, unknown>,
+): Promise<string | null> {
+  if (typeof value.merchant_id === "string") {
+    return value.merchant_id;
+  }
+
+  let paymentId = typeof value.payment_id === "string" ? value.payment_id : null;
+  if (!paymentId && typeof value.dispute_id === "string") {
+    const dispute = (await database.getDisputeById(value.dispute_id)) as
+      | { payment_id?: unknown }
+      | null;
+    if (dispute && typeof dispute.payment_id === "string") {
+      paymentId = dispute.payment_id;
+    }
+  }
+
+  if (!paymentId) return null;
+
+  const payment = (await database.getPaymentById(paymentId)) as
+    | { merchant_id?: unknown }
+    | null;
+  return payment && typeof payment.merchant_id === "string" ? payment.merchant_id : null;
 }
 
 export function createReplayWebhookDispatcher(
@@ -266,6 +310,7 @@ export class EventSubscriber {
           if (wasStored) {
             stored++;
             console.log(`✓ Stored event ${parsedEvent.id} from contract ${parsedEvent.contractId}`);
+            await this.dispatchLiveSSE(parsedEvent);
           }
         }
       } catch (error: any) {
@@ -280,6 +325,28 @@ export class EventSubscriber {
     }
 
     return { processed, stored, errors };
+  }
+
+  /**
+   * Issue #1039: broadcast a just-stored event over SSE to the owning
+   * merchant's connected clients (e.g. a dispute detail page subscribed via
+   * `GET /v1/events/stream?dispute_id=...`). Failures here are logged, not
+   * thrown — a broadcast problem must never roll back the DB write or land
+   * the event in the dead-letter queue, since it was already stored fine.
+   */
+  private async dispatchLiveSSE(event: AnyEvent): Promise<void> {
+    try {
+      const eventType = getWebhookEventType(event);
+      if (!eventType) return;
+
+      const value = event.value as Record<string, unknown>;
+      const merchantId = await resolveMerchantIdForEvent(this.database, value);
+      if (!merchantId) return;
+
+      sseManager.broadcast(merchantId, eventType, value);
+    } catch (error) {
+      console.error(`Error broadcasting SSE for event ${event.id}:`, error);
+    }
   }
 
   parseEvent(event: any): AnyEvent | null {
@@ -420,6 +487,17 @@ export class EventSubscriber {
           merchant_id: value[1],
           amount: value[2],
           amount_received: value[3],
+        };
+      // Issue #1035: merchant_id travels in topics[2] (not value) for this
+      // event, and the 4th value element is the optional payer_muxed_id
+      // (null for a non-muxed G-address payer).
+      case "PAYMENT/VERIFIED":
+        return {
+          payment_id: value[0],
+          merchant_id: topics[2],
+          amount: value[1],
+          amount_received: value[2],
+          payer_muxed_id: value[3] ?? null,
         };
       case "PAYMENT/SETTLED":
         return {

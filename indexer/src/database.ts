@@ -186,6 +186,9 @@ export class Database {
             tags: value.tags != null ? String(value.tags) : null,
             settledAt:
               event.topic[1] === "SETTLED" ? ts : null,
+            // Issue #1035: sub-account ID from an M-address payer.
+            payerMuxedId:
+              value.payer_muxed_id != null ? BigInt(String(value.payer_muxed_id)) : null,
           })
           .onConflictDoUpdate({
             target: payments.paymentId,
@@ -198,6 +201,10 @@ export class Database {
               updatedAt: new Date(),
               settledAt:
                 event.topic[1] === "SETTLED" ? ts : undefined,
+              payerMuxedId:
+                value.payer_muxed_id != null
+                  ? BigInt(String(value.payer_muxed_id))
+                  : undefined,
             },
           });
         break;
@@ -720,9 +727,28 @@ export class Database {
         status: payments.status,
         created_at: payments.createdAt,
         updated_at: payments.updatedAt,
+        // Issue #1035: sub-account ID from an M-address payer, for reconciliation.
+        payer_muxed_id: payments.payerMuxedId,
       })
       .from(payments)
       .where(eq(payments.paymentId, paymentId))
+      .limit(1);
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  // Issue #1039: resolve a dispute's payment/merchant so live dispute events
+  // that only carry `dispute_id` (e.g. `DISPUTE/VOTE_CAST`,
+  // `DISPUTE/AUTO_RESOLVED`) can still be routed to the right merchant's SSE
+  // stream and webhook endpoints.
+  async getDisputeById(disputeId: string): Promise<unknown | null> {
+    const rows = await this.db
+      .select({
+        dispute_id: disputes.disputeId,
+        payment_id: disputes.paymentId,
+        status: disputes.status,
+      })
+      .from(disputes)
+      .where(eq(disputes.disputeId, disputeId))
       .limit(1);
     return rows.length > 0 ? rows[0] : null;
   }
@@ -1007,6 +1033,8 @@ export class Database {
     to?: string;
     limit: number;
     cursor?: { createdAt: string; id: string };
+    // Issue #1035: filter to payments routed from a specific muxed sub-account.
+    payerMuxedId?: bigint;
   }): Promise<{ payments: Array<Record<string, unknown>>; total: number }> {
     const conditions = [eq(payments.merchantId, opts.merchantId)];
     if (opts.statuses && opts.statuses.length > 0) {
@@ -1017,6 +1045,9 @@ export class Database {
     }
     if (opts.to) {
       conditions.push(lte(payments.createdAt, new Date(opts.to)));
+    }
+    if (opts.payerMuxedId !== undefined) {
+      conditions.push(eq(payments.payerMuxedId, opts.payerMuxedId));
     }
     if (opts.cursor) {
       const cursorDate = new Date(opts.cursor.createdAt);
@@ -1046,6 +1077,7 @@ export class Database {
         status: payments.status,
         created_at: payments.createdAt,
         updated_at: payments.updatedAt,
+        payer_muxed_id: payments.payerMuxedId,
       })
       .from(payments)
       .where(and(...conditions))
