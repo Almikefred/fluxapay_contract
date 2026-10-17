@@ -79,6 +79,13 @@ export interface CreatePaymentParams {
    * codes.
    */
   feeWaiverCode?: string;
+  /**
+   * Issue #1025: Opt in to accepting an optional tip/gratuity on this
+   * payment. Defaults to `false` (no tipping) when omitted. When `true`,
+   * `verifyPayment`'s `tipAmount` is validated against `MAX_TIP_BPS`
+   * (20%) of `amount` and stored separately from the base amount.
+   */
+  tipEnabled?: boolean;
 }
 
 export interface RegisterMerchantParams {
@@ -136,6 +143,8 @@ export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   39: "NoFeeProposal",
   47: "MetadataValueTooLong",
   49: "MetadataTooLarge",
+  56: "InvalidRetryTarget",
+  57: "TipExceedsMax",
   404: "PaymentNotFound",
   405: "RefundNotFound",
   406: "InvalidAmount",
@@ -228,6 +237,7 @@ function toCreatePaymentArgs(params: CreatePaymentParams): CreatePaymentArgs {
     metadata_hash: undefined,
     metadata: params.metadata,
     fee_waiver_code: params.feeWaiverCode,
+    tip_enabled: params.tipEnabled,
   };
 }
 
@@ -369,6 +379,12 @@ export class FluxapayClient {
     transactionHash: Buffer;
     payerAddress: string;
     amountReceived: bigint;
+    /**
+     * Issue #1025: Tip/gratuity portion of `amountReceived`, reported
+     * separately. Only honored when the payment was created with
+     * `tipEnabled: true`; otherwise ignored on-chain.
+     */
+    tipAmount?: bigint;
   }) {
     return withMappedContractError(() =>
       this.contract.verify_payment({
@@ -377,6 +393,7 @@ export class FluxapayClient {
         transaction_hash: params.transactionHash,
         payer_address: params.payerAddress,
         amount_received: params.amountReceived,
+        tip_amount: params.tipAmount,
       }),
     );
   }
@@ -432,6 +449,28 @@ export class FluxapayClient {
 
     return withMappedContractError(() =>
       this.contract.get_merchant({
+        merchant_id: merchantId,
+      }),
+    );
+  }
+
+  /**
+   * Get the merchant's accumulated pending settlement balance.
+   *
+   * Delegates to `MerchantRegistryClient.getPendingSettlement` when the
+   * merchant registry contract ID is configured; falls back to calling
+   * `get_pending_settlement` on the main contract (embedded MerchantRegistry
+   * path).
+   *
+   * Backs the `useMerchantBalance` React hook.
+   */
+  async getMerchantBalance(merchantId: string): Promise<bigint> {
+    if (this.config.merchantRegistryContractId) {
+      return this.getMerchantRegistry().getPendingSettlement(merchantId);
+    }
+
+    return withMappedContractError(() =>
+      this.contract.get_pending_settlement({
         merchant_id: merchantId,
       }),
     );
@@ -671,6 +710,20 @@ export class FluxapayClient {
   }
 
   /**
+   * Get a payment stream's full on-chain record (sender, receiver, rate,
+   * remaining deposit, last checkpoint, status, etc).
+   *
+   * Backs the `useStreamAccrual` React hook: the hook polls this on an
+   * interval and extrapolates the live accrued amount between polls using
+   * `computeTotalAccrued`, mirroring the contract's lazy accrual formula.
+   */
+  async getStream(streamId: string) {
+    return withMappedContractError(() =>
+      this.contract.get_stream({ stream_id: streamId }),
+    );
+  }
+
+  /**
    * Issue #492: Get customer profile for a merchant.
    */
   async getCustomer(merchantId: string, customerId: string) {
@@ -879,6 +932,7 @@ export {
   type CreatePaymentLinkResult,
 } from "./contracts/payment-link-manager.js";
 export { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
+export { computeTotalAccrued, computeRemainingAfterWithdraw } from "./stream-utils.js";
 
 
 

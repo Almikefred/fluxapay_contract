@@ -128,8 +128,15 @@ class EventSubscriber {
       let value: Record<string, unknown> = {};
       if (event.value) {
         try {
-          // stellar-sdk returns values as ScVal objects; we need to convert them
-          value = this.scValToObject(event.value);
+          if (topics[0] === "PAYMENT" && topics[1] === "RETRY_CREATED") {
+            // Issue #1037: PAYMENT/RETRY_CREATED carries a positional 2-tuple
+            // (original_payment_id, new_payment_id) rather than the usual
+            // named-field map, so it needs its own conversion.
+            value = this.parsePaymentRetryCreatedValue(event.value);
+          } else {
+            // stellar-sdk returns values as ScVal objects; we need to convert them
+            value = this.scValToObject(event.value);
+          }
         } catch (e) {
           console.warn("Could not parse event value:", e);
         }
@@ -151,6 +158,29 @@ class EventSubscriber {
       console.error("Error parsing event:", error);
       return null;
     }
+  }
+
+  /**
+   * Issue #1037: Convert the (original_payment_id, new_payment_id) tuple
+   * emitted by PAYMENT/RETRY_CREATED into a named value object. Handles both
+   * a plain array of two strings and an array of ScVal-like entries (each
+   * carrying its string under `.value` once run through the same basic
+   * unwrapping as `scValToObject`).
+   */
+  private parsePaymentRetryCreatedValue(raw: any): Record<string, unknown> {
+    const unwrap = (entry: any): string =>
+      typeof entry === "string" ? entry : String(entry?.value ?? entry ?? "");
+
+    const tuple = Array.isArray(raw) ? raw : raw?.raw;
+    if (Array.isArray(tuple) && tuple.length >= 2) {
+      return {
+        original_payment_id: unwrap(tuple[0]),
+        new_payment_id: unwrap(tuple[1]),
+      };
+    }
+
+    console.warn("Could not parse PAYMENT/RETRY_CREATED value as a 2-tuple:", raw);
+    return {};
   }
 
   private scValToObject(scval: any): Record<string, unknown> {

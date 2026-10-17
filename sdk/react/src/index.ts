@@ -10,9 +10,13 @@ export {
   useMerchantPayments,
   useRefund,
   useCreatePayment,
+  useMerchantBalance,
+  useStreamAccrual,
 } from "./hooks.js";
 export type {
   UseMerchantPaymentsOptions,
   UseCreatePaymentResult,
   MutationStatus,
+  UseMerchantBalanceResult,
+  UseStreamAccrualResult,
 } from "./hooks.js";

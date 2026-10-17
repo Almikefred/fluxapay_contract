@@ -7,6 +7,9 @@ use soroban_sdk::{
 };
 
 pub const PAYMENT_TOLERANCE: i128 = 1;
+/// Issue #1025: Maximum tip/gratuity as a fraction of the base payment amount, in
+/// basis points (2000 = 20%). Enforced by `verify_payment` when `tip_enabled` is set.
+pub const MAX_TIP_BPS: i128 = 2000;
 const SHORT_LIVE_TTL: u32 = 120_960; // ~1 week at 5s/ledger
 const LONG_LIVE_TTL: u32 = 18_921_600; // ~3 years at 5s/ledger
 const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
@@ -124,6 +127,12 @@ pub struct PaymentCharge {
     pub retry_of_payment_id: Option<String>,
     /// Issue #484: Muxed account ID from payer M-address; None for G-addresses or on-chain payments.
     pub payer_muxed_id: Option<u64>,
+    /// Issue #1025: Whether this payment accepts an optional tip/gratuity on top of `amount`.
+    /// Set at `create_payment` time; `false` means `verify_payment` ignores any tip passed to it.
+    pub tip_enabled: bool,
+    /// Issue #1025: Tip amount recorded by `verify_payment`, capped at `MAX_TIP_BPS` of `amount`.
+    /// `None` until verified, or if `tip_enabled` is `false`, or the payer chose not to tip.
+    pub tip_amount: Option<i128>,
 }
 
 #[contracttype]
@@ -350,6 +359,11 @@ pub enum Error {
     RateDeviationExceeded = 55,
     /// Issue #505: Invalid payment status transition attempted.
     InvalidStatusTransition = 54,
+    /// Issue #1037: `retry_of_payment_id` passed to `create_payment` does not refer to
+    /// an existing payment owned by the same merchant that is in `Expired` status.
+    InvalidRetryTarget = 56,
+    /// Issue #1025: Tip passed to `verify_payment` exceeds `MAX_TIP_BPS` of the base amount.
+    TipExceedsMax = 57,
 }
 
 #[contracttype]
@@ -379,6 +393,9 @@ pub struct CreatePaymentArgs {
     /// Customer/payer address, checked against the merchant's whitelist when
     /// `Merchant.whitelist_mode` is enabled (issue #516).
     pub payer: Option<Address>,
+    /// Issue #1025: Opt in to accepting an optional tip/gratuity on this payment.
+    /// Defaults to `false` (no tipping) when omitted.
+    pub tip_enabled: Option<bool>,
 }
 
 #[contracttype]
@@ -1270,6 +1287,8 @@ impl RefundManager {
                 fee_waiver_code: None,
             retry_of_payment_id: None,
             payer_muxed_id: None,
+            tip_enabled: false,
+            tip_amount: None,
             };
             env.storage()
                 .persistent()
@@ -4313,6 +4332,8 @@ impl RefundManager {
                 fee_waiver_code: None,
             retry_of_payment_id: None,
             payer_muxed_id: None,
+            tip_enabled: false,
+            tip_amount: None,
             };
 
             env.storage()
@@ -5557,6 +5578,23 @@ impl PaymentProcessor {
 
         Self::enforce_create_payment_rate_limit(&env, &args.merchant_id)?;
 
+        // Issue #1037: When this is a retry (`retry_of_payment_id` set), validate the
+        // original payment exists, belongs to the same merchant, and is in `Expired`
+        // status before linking the two. This is distinct from the `retry_payment`
+        // entry point (issue #482), which also accepts `Failed` originals and manages
+        // its own retry chain depth; `create_payment` retries are a direct, simpler
+        // flow for the common "expired payment" case described in the dashboard UX.
+        if let Some(ref original_id) = args.retry_of_payment_id {
+            let original = Self::get_payment_internal(&env, original_id)
+                .map_err(|_| Error::InvalidRetryTarget)?;
+            if original.merchant_id != args.merchant_id {
+                return Err(Error::InvalidRetryTarget);
+            }
+            if original.status != PaymentStatus::Expired {
+                return Err(Error::InvalidRetryTarget);
+            }
+        }
+
         let now = env.ledger().timestamp();
         let min_duration = env.storage()
             .persistent()
@@ -5610,14 +5648,40 @@ impl PaymentProcessor {
             fx_rate_at: None,
             metadata: args.metadata.clone(),
             fee_waiver_code: args.fee_waiver_code.clone(),
-            retry_of_payment_id: None,
+            retry_of_payment_id: args.retry_of_payment_id.clone(),
             payer_muxed_id: None,
+            tip_enabled: args.tip_enabled.unwrap_or(false),
+            tip_amount: None,
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Payment(args.payment_id.clone()), &payment);
         Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+
+        // Issue #1037: Link the retry to its original and emit PAYMENT/RETRY_CREATED.
+        // Reuses the same `DataKey::PaymentRetries` index as `retry_payment` (issue #482)
+        // so `retried_by`-style lookups see every retry regardless of which entry point
+        // created it.
+        if let Some(ref original_id) = args.retry_of_payment_id {
+            let retries_key = DataKey::PaymentRetries(original_id.clone());
+            let mut retries: Vec<String> = env
+                .storage()
+                .persistent()
+                .get(&retries_key)
+                .unwrap_or_else(|| vec![&env]);
+            retries.push_back(args.payment_id.clone());
+            env.storage().persistent().set(&retries_key, &retries);
+            Self::bump_ttl(&env, &retries_key, LONG_LIVE_TTL);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "RETRY_CREATED"),
+                ),
+                (original_id.clone(), args.payment_id.clone()),
+            );
+        }
 
         // Issue #489: Store reverse index for metadata_hash → payment_id lookup
         if let Some(ref hash) = args.metadata_hash {
@@ -5869,10 +5933,14 @@ impl PaymentProcessor {
                 fx_rate: None,
                 fx_rate_at: None,
                 metadata: args.metadata.clone(),
-                fee_waiver_code: None,
-            retry_of_payment_id: None,
-            payer_muxed_id: None,
                 fee_waiver_code: args.fee_waiver_code.clone(),
+                // Note: batch creation does not support the retry-linking validation
+                // added to `create_payment` (issue #1037); retries must go through
+                // the single-payment path so `retry_of_payment_id` can be validated.
+                retry_of_payment_id: None,
+                payer_muxed_id: None,
+                tip_enabled: args.tip_enabled.unwrap_or(false),
+                tip_amount: None,
             };
 
             env.storage()
@@ -5945,6 +6013,10 @@ impl PaymentProcessor {
         payer_address: Address,
         amount_received: i128,
         payer_muxed_id: Option<u64>,
+        // Issue #1025: Tip/gratuity portion of `amount_received`, reported separately
+        // so it can be validated against `MAX_TIP_BPS` and broken out for reconciliation.
+        // Ignored (treated as no tip) when `payment.tip_enabled` is `false`.
+        tip_amount: Option<i128>,
     ) -> Result<PaymentStatus, Error> {
         Self::require_not_paused(&env)?;
         oracle.require_auth();
@@ -5980,6 +6052,29 @@ impl PaymentProcessor {
         payment.confirmed_at = Some(env.ledger().timestamp());
         // Issue #484: Store muxed ID if M-address was used
         payment.payer_muxed_id = payer_muxed_id;
+
+        // Issue #1025: Validate and record the tip/gratuity, if this payment accepts one.
+        // A tip passed when `tip_enabled` is false is ignored rather than erroring, since
+        // older clients/oracles may not know about the field.
+        let tip: Option<i128> = if payment.tip_enabled {
+            match tip_amount {
+                Some(tip) if tip < 0 => return Err(Error::TipExceedsMax),
+                Some(tip) => {
+                    let max_tip = payment.amount.saturating_mul(MAX_TIP_BPS) / 10_000;
+                    if tip > max_tip {
+                        return Err(Error::TipExceedsMax);
+                    }
+                    Some(tip)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        payment.tip_amount = tip;
+
+        // The expected total received is the base amount plus any validated tip.
+        let expected_total = payment.amount.saturating_add(tip.unwrap_or(0));
 
         // Get merchant-specific tolerance if available, otherwise use global default
         let merchant_tolerance = if let Some(registry_address) = env
@@ -6038,7 +6133,9 @@ impl PaymentProcessor {
         let max_tolerance = payment.amount / 100; // 1% of payment amount
         let tolerance = tolerance.min(max_tolerance);
 
-        let diff = amount_received - payment.amount;
+        // Issue #1025: Compare against `expected_total` (base amount + validated tip) so a
+        // tipped payment isn't misclassified as Overpaid just because it includes a tip.
+        let diff = amount_received - expected_total;
 
         let mut new_status = if (0..=tolerance).contains(&diff) {
             // Exact match or tiny overpay within tolerance → Confirmed
@@ -6055,7 +6152,7 @@ impl PaymentProcessor {
         };
 
         let overpaid_refund_amount = if new_status == PaymentStatus::Overpaid {
-            Some(amount_received.saturating_sub(payment.amount))
+            Some(amount_received.saturating_sub(expected_total))
         } else {
             None
         };
@@ -6227,9 +6324,12 @@ impl PaymentProcessor {
         };
 
         // Issue #166: Optimize event topics for efficient indexing
+        // Issue #1025: Payload now also carries `tip_amount` (None if tipping wasn't
+        // enabled or the payer chose not to tip) so downstream consumers (indexer,
+        // reconciliation) can break the tip out from the base amount.
         env.events().publish(
             (Symbol::new(&env, "PAYMENT"), event_name, payment.merchant_id.clone()),
-            (payment_id.clone(), payment.amount, amount_received),
+            (payment_id.clone(), payment.amount, amount_received, payment.tip_amount),
         );
 
         Ok(new_status)
@@ -6393,6 +6493,8 @@ impl PaymentProcessor {
             fee_waiver_code: original.fee_waiver_code.clone(),
             retry_of_payment_id: Some(original_payment_id.clone()),
             payer_muxed_id: None,
+            tip_enabled: original.tip_enabled,
+            tip_amount: None,
         };
 
         // Store new payment
@@ -8768,6 +8870,10 @@ mod payment_link_test;
 mod test;
 #[cfg(test)]
 mod payment_metadata_test;
+#[cfg(test)]
+mod payment_retry_test;
+#[cfg(test)]
+mod payment_tip_test;
 
 // Payment streaming module (Issue #127)
 pub mod stream;

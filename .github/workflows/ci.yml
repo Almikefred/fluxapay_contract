@@ -234,6 +234,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-wasm-
 
+      - name: Cache Stellar CLI
+        uses: actions/cache@v4
+        id: cache-stellar-cli
+        with:
+          path: ~/.cargo/bin/stellar
+          key: ${{ runner.os }}-stellar-cli-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system dependencies
+        if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Stellar CLI
+        if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
+        run: cargo install --locked stellar-cli
+
       - name: Build contracts (release)
         working-directory: fluxapay
         run: cargo build --target wasm32-unknown-unknown --release
@@ -260,6 +275,48 @@ jobs:
           if [ "$failed" -eq 1 ]; then
             exit 1
           fi
+
+      - name: Optimize WASM for baseline comparison
+        working-directory: fluxapay
+        run: stellar contract optimize --wasm target/wasm32-unknown-unknown/release/fluxapay.wasm
+
+      - name: Check WASM size against baseline
+        run: |
+          BASELINE_FILE=".wasm-size-baseline"
+          WASM_PATH="target/wasm32-unknown-unknown/release/fluxapay.wasm"
+          HARD_CAP_BYTES=$((245 * 1024))
+          TOLERANCE_BYTES=5120
+
+          if [ ! -f "$BASELINE_FILE" ]; then
+            echo "❌ Missing $BASELINE_FILE. Run ./scripts/update-wasm-baseline.sh and commit the result."
+            exit 1
+          fi
+          if [ ! -f "$WASM_PATH" ]; then
+            echo "❌ Expected WASM artifact not found at $WASM_PATH"
+            exit 1
+          fi
+
+          BASELINE=$(cat "$BASELINE_FILE" | tr -d '[:space:]')
+          WASM_SIZE=$(stat -c%s "$WASM_PATH")
+          DIFF=$((WASM_SIZE - BASELINE))
+
+          echo "WASM size: $WASM_SIZE bytes (baseline: $BASELINE bytes, diff: $DIFF bytes)"
+
+          # Absolute hard cap: always fail if WASM exceeds 245 KB, regardless of baseline.
+          if [ "$WASM_SIZE" -gt "$HARD_CAP_BYTES" ]; then
+            echo "❌ ERROR: WASM size ($WASM_SIZE bytes) exceeds the absolute hard cap of $HARD_CAP_BYTES bytes (245 KB)."
+            echo "   Soroban's upload limit is 256 KB; this cap keeps a 10 KB safety buffer."
+            exit 1
+          fi
+
+          # Regression gate: fail if size grew more than 5 KB above the recorded baseline.
+          if [ "$DIFF" -gt "$TOLERANCE_BYTES" ]; then
+            echo "❌ ERROR: WASM size increased by $DIFF bytes, which is more than $TOLERANCE_BYTES bytes (5 KB) above baseline ($BASELINE bytes)."
+            echo "   If this growth is intentional, run ./scripts/update-wasm-baseline.sh and commit the updated .wasm-size-baseline."
+            exit 1
+          fi
+
+          echo "✅ WASM size is within the allowed baseline tolerance and hard cap."
 
   # Job 5: Run tests
   test:

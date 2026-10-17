@@ -36,7 +36,15 @@ export default function App({ children }: { children: React.ReactNode }) {
 Then use the hooks anywhere below the provider:
 
 ```tsx
-import { usePayment, useMerchant, useMerchantPayments, useCreatePayment, useRefund } from "@fluxapay/react";
+import {
+  usePayment,
+  useMerchant,
+  useMerchantPayments,
+  useCreatePayment,
+  useRefund,
+  useMerchantBalance,
+  useStreamAccrual,
+} from "@fluxapay/react";
 
 function PaymentStatus({ paymentId }: { paymentId: string }) {
   const { data: payment, loading, error } = usePayment(paymentId);
@@ -66,6 +74,33 @@ function RecentPayments({ merchantId }: { merchantId: string }) {
 function RefundDetails({ refundId }: { refundId: string }) {
   const { data: refund, loading } = useRefund(refundId);
   return loading ? <p>Loading...</p> : <p>{refund?.reason}</p>;
+}
+
+function MerchantBalanceWidget({ merchantId }: { merchantId: string }) {
+  const { balance, loading, error, refresh } = useMerchantBalance(merchantId);
+
+  if (loading) return <p>Loading...</p>;
+  if (error) return <p>Error: {error.message}</p>;
+  return (
+    <div>
+      <p>Pending balance: {balance?.toString() ?? "0"}</p>
+      <button onClick={refresh}>Refresh</button>
+    </div>
+  );
+}
+
+function StreamStatus({ streamId }: { streamId: string }) {
+  // Polls every 5s by default; the displayed amount animates smoothly
+  // between polls using the contract's accrual formula client-side.
+  const { accrued, remainingDeposit, loading, error } = useStreamAccrual(streamId);
+
+  if (loading) return <p>Loading...</p>;
+  if (error) return <p>Error: {error.message}</p>;
+  return (
+    <p>
+      Accrued: {accrued?.toString() ?? "0"} / remaining deposit: {remainingDeposit?.toString() ?? "0"}
+    </p>
+  );
 }
 
 function CreatePaymentForm() {
@@ -99,6 +134,8 @@ the pattern used by React Query / SWR consumers.
 - `useMerchantPayments(merchantId, { offset?, limit? })` — fetch a merchant's paginated payments.
 - `useRefund(refundId)` — fetch a single refund.
 - `useCreatePayment()` — returns `{ mutate, data, status, loading, error }` for creating a payment.
+- `useMerchantBalance(merchantId)` — returns `{ balance, loading, error, refresh }` for the merchant's current pending settlement balance. Polls in the background (every 10s) and exposes `refresh()` for an immediate update, e.g. right after your own app observes a confirmed-payment event.
+- `useStreamAccrual(streamId, pollIntervalMs = 5000)` — returns `{ accrued, remainingDeposit, loading, error }` for a payment stream's live accrued amount. Re-fetches the on-chain record every `pollIntervalMs`, and smoothly extrapolates the displayed value between polls client-side using the same accrual formula as the contract (`compute_total_accrued`).
 
 ## License
 

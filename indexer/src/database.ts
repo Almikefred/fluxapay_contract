@@ -85,10 +85,29 @@ export class Database {
 
     switch (table) {
       case "payments":
+        if (event.topic[1] === "RETRY_CREATED") {
+          // Issue #1037: Link the new payment row to its original. The new
+          // payment's own PAYMENT/CREATED row may or may not have landed
+          // yet (events can arrive out of order within a poll batch), so
+          // this upserts a minimal row if needed and otherwise just sets
+          // the FK column.
+          await client.query(
+            `INSERT INTO payments (payment_id, retry_of_payment_id, created_at)
+             VALUES ($1, $2, to_timestamp($3))
+             ON CONFLICT (payment_id) DO UPDATE SET retry_of_payment_id = $2`,
+            [value.new_payment_id, value.original_payment_id, event.timestamp]
+          );
+          break;
+        }
+
         await client.query(
           `INSERT INTO payments (payment_id, merchant_id, amount, currency, status, created_at)
            VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
-           ON CONFLICT (payment_id) DO UPDATE SET status = $5`,
+           ON CONFLICT (payment_id) DO UPDATE SET
+             merchant_id = EXCLUDED.merchant_id,
+             amount = EXCLUDED.amount,
+             currency = EXCLUDED.currency,
+             status = EXCLUDED.status`,
           [
             value.payment_id,
             value.merchant_id,

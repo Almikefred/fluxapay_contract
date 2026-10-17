@@ -189,6 +189,7 @@ Before marking a PR ready for review:
 - [ ] New features and bug fixes include tests
 - [ ] PR title follows Conventional Commits format
 - [ ] PR description explains *what* changed, *why*, and how it was tested
+- [ ] If your change affects the compiled contract (new dependency, new public function, large refactor), run `./scripts/update-wasm-baseline.sh` and commit the updated `.wasm-size-baseline` so the CI size gate compares against the right number
 
 ### Changelog Format
 
