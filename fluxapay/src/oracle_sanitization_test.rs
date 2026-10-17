@@ -1,10 +1,11 @@
 use crate::{
-    fx_oracle::{FXOracle, FXOracleClient},
+    fx_oracle::{FXOracle, FXOracleClient, FXOracleError},
     merchant_registry::{MerchantRegistry, MerchantRegistryClient},
     DexRouter, DexRouterClient, PaymentProcessor, PaymentProcessorClient, SwapAndPayArgs,
 };
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String, Symbol};
+use soroban_sdk::{testutils::Address as _, token, vec, Address, Env, String, Symbol};
 
+use crate::merchant_registry::MaybeFeeConfig;
 fn setup_oracle_swap_env(
     env: &Env,
 ) -> (
@@ -36,8 +37,13 @@ fn setup_oracle_swap_env(
     let oracle_operator = Address::generate(env);
     oracle_client.oracle_grant_role(&admin, &Symbol::new(env, "ORACLE"), &oracle_operator);
 
-    let token_a = Address::generate(env);
-    let token_b = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     payment_client.allow_token(&admin, &token_b);
 
     (
@@ -71,7 +77,7 @@ fn test_oracle_sanitization_rejects_deviating_dex_quote() {
         &String::from_str(&env, "USD"),
         &None,
         &None,
-        &None,
+        &MaybeFeeConfig::None,
     );
     merchant_client.verify_merchant(&admin, &merchant);
     payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
@@ -123,7 +129,7 @@ fn test_oracle_sanitization_accepts_aligned_dex_quote() {
         &String::from_str(&env, "USD"),
         &None,
         &None,
-        &None,
+        &MaybeFeeConfig::None,
     );
     merchant_client.verify_merchant(&admin, &merchant);
     payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
@@ -131,6 +137,8 @@ fn test_oracle_sanitization_accepts_aligned_dex_quote() {
     let pair = Symbol::new(&env, "USDC_USD");
     // Match DEX stub quote: 10000 in -> 9900 out (rate 9900 with 4 decimals)
     oracle_client.set_rate(&oracle_operator, &pair, &9_900i128, &4);
+
+    token::StellarAssetClient::new(&env, &token_a).mint(&payer, &10_000);
 
     let path = vec![&env, token_a.clone(), token_b.clone()];
     let args = SwapAndPayArgs {
@@ -153,4 +161,19 @@ fn test_oracle_sanitization_accepts_aligned_dex_quote() {
 
     let payment = payment_client.swap_and_pay(&args);
     assert_eq!(payment.payment_id, String::from_str(&env, "PAY_ORACLE_02"));
+}
+
+#[test]
+fn test_set_rates_batch_rejects_empty_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _, _, oracle_client, _, _, _, _) = setup_oracle_swap_env(&env);
+
+    let oracle_operator = Address::generate(&env);
+    oracle_client.oracle_grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle_operator);
+
+    // Issue #851: Submitting an empty batch must be rejected with EmptyBatch
+    let empty_rates = vec![&env];
+    let result = oracle_client.try_set_rates_batch(&oracle_operator, &empty_rates);
+    assert_eq!(result, Err(Ok(FXOracleError::EmptyBatch)));
 }

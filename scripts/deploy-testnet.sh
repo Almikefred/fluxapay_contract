@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/deploy-testnet.sh
 #
-# Deploys all five FluxaPay contracts to Stellar testnet (or the network set
+# Deploys all six FluxaPay contracts to Stellar testnet (or the network set
 # in STELLAR_NETWORK) in dependency order, initialises each contract with the
 # deployer as admin, and writes the resulting contract IDs to .env.testnet.
 #
@@ -16,6 +16,7 @@
 #   3. PaymentProcessor
 #   4. RefundManager
 #   5. PaymentLinkManager
+#   6. GasEstimator
 #
 # Required environment variables:
 #   STELLAR_SECRET_KEY  — deployer secret key (starts with S)
@@ -128,19 +129,22 @@ echo "=== Deploying Contracts ==="
 echo ""
 
 # 1. FXOracle
-FX_ORACLE_CONTRACT_ID="$(deploy_contract "1/5" "FXOracle" | tail -1)"
+FX_ORACLE_CONTRACT_ID="$(deploy_contract "1/6" "FXOracle" | tail -1)"
 
 # 2. MerchantRegistry
-MERCHANT_REGISTRY_CONTRACT_ID="$(deploy_contract "2/5" "MerchantRegistry" | tail -1)"
+MERCHANT_REGISTRY_CONTRACT_ID="$(deploy_contract "2/6" "MerchantRegistry" | tail -1)"
 
 # 3. PaymentProcessor
-PAYMENT_PROCESSOR_CONTRACT_ID="$(deploy_contract "3/5" "PaymentProcessor" | tail -1)"
+PAYMENT_PROCESSOR_CONTRACT_ID="$(deploy_contract "3/6" "PaymentProcessor" | tail -1)"
 
 # 4. RefundManager
-REFUND_MANAGER_CONTRACT_ID="$(deploy_contract "4/5" "RefundManager" | tail -1)"
+REFUND_MANAGER_CONTRACT_ID="$(deploy_contract "4/6" "RefundManager" | tail -1)"
 
 # 5. PaymentLinkManager
-PAYMENT_LINK_MANAGER_CONTRACT_ID="$(deploy_contract "5/5" "PaymentLinkManager" | tail -1)"
+PAYMENT_LINK_MANAGER_CONTRACT_ID="$(deploy_contract "5/6" "PaymentLinkManager" | tail -1)"
+
+# 6. GasEstimator
+GAS_ESTIMATOR_CONTRACT_ID="$(deploy_contract "6/6" "GasEstimator" | tail -1)"
 
 echo ""
 echo "=== Initialising Contracts ==="
@@ -201,6 +205,17 @@ invoke "$REFUND_MANAGER_CONTRACT_ID" \
     echo "   (RefundManager init skipped — may need real USDC token address)"
 echo "   Done."
 
+# Authorize the deployed system contracts for MerchantRegistry callbacks.
+invoke "$MERCHANT_REGISTRY_CONTRACT_ID" \
+    set_refund_manager_address \
+    --admin "$DEPLOYER_ADDRESS" \
+    --refund_manager "$REFUND_MANAGER_CONTRACT_ID"
+invoke "$MERCHANT_REGISTRY_CONTRACT_ID" \
+    set_payment_processor_address \
+    --admin "$DEPLOYER_ADDRESS" \
+    --payment_processor "$PAYMENT_PROCESSOR_CONTRACT_ID"
+echo "   MerchantRegistry system callers configured."
+
 # ── Initialize PaymentLinkManager ────────────────────────────────────────────
 
 echo ">> Initialising PaymentLinkManager..."
@@ -226,12 +241,14 @@ MERCHANT_REGISTRY_CONTRACT_ID=${MERCHANT_REGISTRY_CONTRACT_ID}
 PAYMENT_PROCESSOR_CONTRACT_ID=${PAYMENT_PROCESSOR_CONTRACT_ID}
 REFUND_MANAGER_CONTRACT_ID=${REFUND_MANAGER_CONTRACT_ID}
 PAYMENT_LINK_MANAGER_CONTRACT_ID=${PAYMENT_LINK_MANAGER_CONTRACT_ID}
+GAS_ESTIMATOR_CONTRACT_ID=${GAS_ESTIMATOR_CONTRACT_ID}
 
 # Aliases kept for backward compatibility with existing tooling
 PAYMENT_PROCESSOR_ID=${PAYMENT_PROCESSOR_CONTRACT_ID}
 REFUND_MANAGER_ID=${REFUND_MANAGER_CONTRACT_ID}
 MERCHANT_REGISTRY_ID=${MERCHANT_REGISTRY_CONTRACT_ID}
 FX_ORACLE_ID=${FX_ORACLE_CONTRACT_ID}
+GAS_ESTIMATOR_ID=${GAS_ESTIMATOR_CONTRACT_ID}
 EOF
 
 echo "   Written."
@@ -341,6 +358,7 @@ echo "  MerchantRegistry       : $MERCHANT_REGISTRY_CONTRACT_ID"
 echo "  PaymentProcessor       : $PAYMENT_PROCESSOR_CONTRACT_ID"
 echo "  RefundManager          : $REFUND_MANAGER_CONTRACT_ID"
 echo "  PaymentLinkManager     : $PAYMENT_LINK_MANAGER_CONTRACT_ID"
+echo "  GasEstimator           : $GAS_ESTIMATOR_CONTRACT_ID"
 echo ""
 echo "  Contract IDs written to: $ENV_OUT"
 echo ""

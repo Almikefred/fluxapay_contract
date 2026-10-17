@@ -73,6 +73,17 @@ PaymentLinkManager
   └─ stores links independently (no external calls)
 ```
 
+## Subscription Metrics (#1083)
+
+The indexer retains subscription plan ownership/pricing and lifecycle events
+from `SUBSCRIPTION` contract events. The merchant-scoped
+`GET /v1/subscriptions/metrics?merchant_id=...&period=YYYY-MM` endpoint uses
+that history to calculate active subscribers at the start of the month, churn,
+trial conversions, and dunning recoveries; current subscription state and plan
+amounts supply active subscriber count, past-due count, and MRR. API responses
+are cached for five minutes and require a merchant-bound API key with the
+`read:analytics` scope (admin keys may query any merchant).
+
 ### Key Call Flows
 
 **Payment Creation Flow:**
@@ -99,9 +110,40 @@ PaymentLinkManager
 5. Refund event emitted
 6. Funds transferred to original payer
 
+**Swap and Pay Protection:**
+`PaymentProcessor::swap_and_pay()` applies a default 50 bps (0.5%) minimum
+output floor relative to the on-chain DEX quote, in addition to the caller's
+`amount_out_min`. If an FX oracle and pair are provided, the quoted output is
+also checked against that independent reference and rejected when adverse
+price impact exceeds 100 bps (1%). Swaps without an oracle still receive the
+minimum-output and volume protections, but cannot be checked against a
+reference-market price.
+
+The PaymentProcessor tracks successful `amount_in` swap volume for the current
+ledger sequence in instance storage. A swap that would exceed the default
+10,000,000,000,000-unit per-ledger cap is rejected before calling the DEX.
+Admin accounts can adjust all three defaults with `set_swap_limits`; the
+volume counter starts fresh when the ledger sequence changes.
+
 ---
 
 ## Role Model
+
+Access control uses a fixed **role registry** (`KNOWN_ROLES` in
+`fluxapay/src/access_control.rs`). `grant_role` and `revoke_role` reject any
+`Symbol` not in this list with `AccessControlError::UnknownRole`, preventing
+phantom permissions from typo'd role names.
+
+| Symbol | Constant helper |
+|--------|-----------------|
+| `ADMIN` | `role_admin()` |
+| `ORACLE` | `role_oracle()` |
+| `MERCHANT` | `role_merchant()` |
+| `SETTLEMENT_OPERATOR` | `role_settlement_operator()` |
+| `ARBITRATOR` | `role_arbitrator()` |
+
+When adding a new system role, update `KNOWN_ROLES` first — it is the single
+source of truth.
 
 ### Admin Role
 
@@ -120,13 +162,12 @@ PaymentLinkManager
 ### Merchant Role
 
 **Permissions:**
-- Create payment links via PaymentLinkManager
-- Register in MerchantRegistry
-- Set merchant-specific rate limits
+- Create payments, payment links, and payment-link invoices as the address holding the role
+- Request refunds for its own payments
 - View their own payments and refunds
 - Receive payment settlements
 
-**How Granted:** Admin grants via `grant_role()` after merchant verification
+**How Granted:** Admin grants or revokes the role via `grant_merchant_role()` / `revoke_merchant_role()` on the relevant contract. Payment creation and invoice-linked payment links also validate the merchant's configured registry record when a MerchantRegistry is configured. PaymentLinkManager maintains its own role state, administered by its initialized contract admin. A role never authorizes acting for another merchant address.
 
 ### Oracle Role
 
@@ -227,8 +268,26 @@ PaymentLinkManager
 
 - **DEX Router**: Atomic token swaps for `swap_and_pay()` and swap-based refunds
 - **FX Oracle**: Optional multi-currency rate validation to prevent price slippage abuse
-- **Merchant Registry**: Verification, KYC tier tracking, merchant lookup
+- **Merchant Registry**: Verification, KYC tier tracking, merchant lookup (see [MerchantRegistry API Reference](merchant-registry-api-reference.md))
 - **Payment Link Manager**: Independent links with direct transfers and metadata validation
+
+---
+
+## MerchantRegistry API Reference
+
+For detailed entry point documentation, parameters, return types, authorization requirements, and emitted events for merchant management, see the dedicated reference document:
+
+👉 **[MerchantRegistry API Reference](merchant-registry-api-reference.md)**
+
+Key operations documented include:
+- `register_merchant` — Registration & initial tier assignment
+- `update_merchant` — Payout address and profile updates
+- `verify_merchant` / `verify_merchant_with_signature` — Verification flows
+- `set_kyc_tier` / `auto_upgrade_kyc_tier` — Tier management & automated upgrades
+- `set_fee_config` / `calculate_platform_fee` — Platform fee configurations
+- `add_to_whitelist` / `is_address_whitelisted` — Payer whitelist controls
+- `suspend_merchant` / `reinstate_merchant` — Lifecycle & suspension management
+- `get_all_merchants` — Paginated merchant catalog queries
 
 ---
 
@@ -352,8 +411,34 @@ Full SEP-6 / SEP-24 protocol integration details, request payloads, anchor statu
 
 ---
 
+### DEX Router & Slippage Tolerance (#856)
+
+FluxaPay integrates with Soroswap-compatible DEX routers (`DexRouter`) to support atomic token swaps prior to payment settlement (`swap_and_pay`) or for swap-based refunds.
+
+#### `execute_swap` Entry Point
+
+```rust
+pub fn execute_swap(
+    env: Env,
+    caller: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: i128,
+    min_amount_out: i128,
+    max_slippage_bps: u32,
+) -> Result<i128, DexRouterError>
+```
+
+- **Slippage Enforcement**: `min_amount_out` specifies the absolute minimum token output the caller is willing to receive. If the actual swap output is less than `min_amount_out`, the swap reverts with `DexRouterError::SlippageExceeded` (code 4).
+- **Secondary Quoted Price Guard**: `max_slippage_bps` enforces a relative tolerance in basis points against the simulated quoted price (`get_amounts_out`). The parameter is strictly capped at `≤ 5000` bps (50% max). If actual execution deviates beyond this range or if `max_slippage_bps > 5000`, the transaction is rejected with `SlippageExceeded`.
+- **Price Impact Guard**: Swaps also enforce an internal price impact guard to protect against pool imbalance.
+
+---
+
 ## Security Considerations
 
+- **Threat Model**: See the [FluxaPay threat model](threat-model.md) for assets,
+  attack surfaces, mitigations, and residual risks.
 - **Reentrancy Protection**: `ReentrancyLock` guards concurrent settle/refund operations
 - **Rate Limiting**: Per-merchant, per-payer, and global limits prevent spam
 - **Idempotency**: Duplicate payment requests detected via idempotency keys
@@ -362,3 +447,39 @@ Full SEP-6 / SEP-24 protocol integration details, request payloads, anchor statu
 - **Arbitration Voting**: Stake-locked voting with threshold ensures fair dispute resolution
 - **Two-Step Admin Transfer**: Prevents accidental admin loss via `pending_admin` + `claim_admin()`
 - **Metadata Validation**: Payment links enforce max key count (20) and value length (256 chars)
+
+## Indexer Event Replay
+
+The indexer can recover contract events missed during downtime through
+`POST /v1/admin/replay`, which accepts `from_ledger` and `to_ledger` in the
+JSON request body. The inclusive ledger range is limited to 10,000 ledgers and
+the caller must provide an API key with the `admin` scope. The legacy
+`POST /admin/replay` route remains available for existing operator clients.
+
+Replay reads contract events from the configured Soroban RPC endpoint, then
+passes each event through the normal persistence pipeline. `event_id` is
+unique in `contract_events`; an already-stored event is skipped without
+reapplying its payment, refund, or dispute update. Newly stored events update
+the typed index tables and dispatch matching enabled merchant webhooks. Replay
+webhook envelopes include `replayed: true` at the top level and in `data`, so
+consumers can distinguish recovery deliveries from live notifications.
+
+The endpoint streams progress and a final summary as Server-Sent Events. Each
+update reports processed events, newly stored events, and skipped duplicates.
+RPC or persistence errors are surfaced as an SSE error rather than reported as
+a successful replay.
+
+## Error Codes
+
+Every `#[contracterror]` enum across all contracts (`Error`, `AccessControlError`,
+`StreamError`, `FXOracleError`, `MerchantError`, `MerchantAuthError`,
+`DexRouterError`, `AccountAbstractionError`) is documented in a single
+reference table, including common causes and remediation: see
+[error-codes.md](error-codes.md).
+
+## Architecture Decision Records
+
+- [ADR-0001: Access Control Split](ADR-0001-access-control-split.md)
+- [ADR-0002: Payment Stream Design](ADR-0002-payment-stream-design.md)
+- [ADR-0003: KYC Tier System](ADR-0003-kyc-tier-system.md)
+- [ADR-0004: Multi-Sig Admin Governance](ADR-0004-multisig-admin-governance.md)

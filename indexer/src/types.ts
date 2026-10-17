@@ -1,6 +1,6 @@
 /**
  * FluxaPay Indexer Event Types
- * Defines the structure of events emitted by the FluxaPay contract
+ * Defines the structure of events emitted by FluxaPay contracts
  */
 
 export interface ContractEvent {
@@ -14,7 +14,7 @@ export interface ContractEvent {
 }
 
 export interface PaymentEvent extends ContractEvent {
-  topic: ["PAYMENT", "CREATED" | "CONFIRMED" | "SETTLED" | "FAILED"];
+  topic: ["PAYMENT", "CREATED" | "CONFIRMED" | "SETTLED" | "FAILED" | "CANCELLED"];
   value: {
     payment_id: string;
     merchant_id: string;
@@ -37,6 +37,14 @@ export interface PaymentRetryCreatedEvent extends ContractEvent {
   };
 }
 
+export interface PaymentFeeEvent extends ContractEvent {
+  topic: ["PAYMENT", "FEE_TOTAL"];
+  value: {
+    payment_id: string;
+    amount: string | number | bigint;
+  };
+}
+
 export interface RefundEvent extends ContractEvent {
   topic: ["REFUND", "CREATED" | "PROCESSED" | "REJECTED"];
   value: {
@@ -47,7 +55,7 @@ export interface RefundEvent extends ContractEvent {
 }
 
 export interface DisputeEvent extends ContractEvent {
-  topic: ["DISPUTE", "CREATED" | "RESOLVED" | "ESCALATED"];
+  topic: ["DISPUTE", "CREATED" | "RESOLVED" | "REJECTED" | "ESCALATED" | "ADJUSTMENT"];
   value: {
     dispute_id: string;
     payment_id: string;
@@ -55,8 +63,22 @@ export interface DisputeEvent extends ContractEvent {
   };
 }
 
+/**
+ * Issue #677: dispute bond lifecycle events. Emitted when a bond is
+ * released back to its owner (BOND_RETURNED) or forfeited to the treasury
+ * (BOND_FORFEITED) after a dispute is resolved or rejected.
+ */
+export interface DisputeBondEvent extends ContractEvent {
+  topic: ["DISPUTE", "BOND_RETURNED" | "BOND_FORFEITED"];
+  value: {
+    dispute_id: string;
+    recipient: string;
+    amount: number;
+  };
+}
+
 export interface MerchantEvent extends ContractEvent {
-  topic: ["MERCHANT", "REGISTERED" | "VERIFIED" | "SUSPENDED"];
+  topic: ["MERCHANT", "REGISTERED" | "VERIFIED" | "SUSPENDED" | "REINSTATED"];
   value: {
     merchant_id: string;
     status: string;
@@ -64,21 +86,44 @@ export interface MerchantEvent extends ContractEvent {
 }
 
 export interface StreamEvent extends ContractEvent {
-  topic: ["STREAM", "CREATED" | "CLOSED" | "PAUSED" | "RESUMED"];
+  topic: ["STREAM", "CREATED" | "CLOSED" | "PAUSED" | "RESUMED" | "CANCELLED" | "WITHDRAWN"];
   value: {
     stream_id: string;
-    sender: string;
-    receiver: string;
-    amount: number;
+    sender?: string;
+    receiver?: string;
+    recipient?: string;
+    amount?: number;
+    remaining_deposit?: number;
+    memo?: string | null;
   };
 }
 
 export interface SubscriptionEvent extends ContractEvent {
-  topic: ["SUBSCRIPTION", "CREATED" | "ACTIVE" | "CANCELLED" | "PAUSED"];
+  topic: [
+    "SUBSCRIPTION",
+    | "PLAN_CREATED"
+    | "PLAN_DEACTIVATED"
+    | "CREATED"
+    | "ACTIVE"
+    | "CHARGED"
+    | "CHARGE_FAILED"
+    | "DUNNING_TRIGGERED"
+    | "CANCELLED"
+    | "EXPIRED"
+    | "COMPLETED"
+    | "PAUSED"
+    | "RESUMED"
+    | "TRIAL_STARTED"
+    | "TRIAL_ENDED"
+  ];
   value: {
-    subscription_id: string;
-    payer: string;
-    status: string;
+    subscription_id?: string;
+    payer?: string;
+    status?: string;
+    plan_id?: string;
+    merchant_id?: string;
+    amount?: number;
+    interval_secs?: number;
   };
 }
 
@@ -91,12 +136,73 @@ export interface InvoiceEvent extends ContractEvent {
   };
 }
 
+export interface FXOracleEvent extends ContractEvent {
+  topic: ["FX_ORACLE" | "ORACLE" | "FX_RATE", "UPDATED" | "SET" | "REMOVED"];
+  value: {
+    pair?: string;
+    asset?: string;
+    rate: string | number | bigint;
+    decimals?: number;
+  };
+}
+
+export interface LinkCreatedEvent extends ContractEvent {
+  topic: ["LINK", "CREATED"];
+  value: {
+    link_id: string;
+    merchant_id: string;
+  };
+}
+
+export interface LinkUsedEvent extends ContractEvent {
+  topic: ["LINK", "USED"];
+  value: {
+    link_id: string;
+    payer: string;
+    amount: bigint | number;
+    payment_id: string;
+    metadata?: Record<string, string>;
+  };
+}
+
+export interface LinkDeactivatedEvent extends ContractEvent {
+  topic: ["LINK", "DEACTIVATED"];
+  value: {
+    link_id: string;
+  };
+}
+
+export interface LinkExpiredEvent extends ContractEvent {
+  topic: ["LINK", "EXPIRED"];
+  value: {
+    link_id: string;
+  };
+}
+
+export interface LinkViewedEvent extends ContractEvent {
+  topic: ["LINK", "VIEWED"];
+  value: {
+    link_id: string;
+  };
+}
+
+export type PaymentLinkEvent =
+  | LinkCreatedEvent
+  | LinkUsedEvent
+  | LinkDeactivatedEvent
+  | LinkExpiredEvent
+  | LinkViewedEvent;
+
 export type AnyEvent =
   | PaymentEvent
   | PaymentRetryCreatedEvent
+  | PaymentFeeEvent
   | RefundEvent
   | DisputeEvent
+  | DisputeBondEvent
   | MerchantEvent
   | StreamEvent
   | SubscriptionEvent
-  | InvoiceEvent;
+  | InvoiceEvent
+  | FXOracleEvent
+  | PaymentLinkEvent;
