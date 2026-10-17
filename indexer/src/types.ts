@@ -23,6 +23,20 @@ export interface PaymentEvent extends ContractEvent {
   };
 }
 
+/**
+ * Issue #1037: Emitted by both `create_payment` (when called with
+ * `retry_of_payment_id`) and `retry_payment` when a new payment is linked to
+ * an expired/failed original. Payload is a positional 2-tuple, not the usual
+ * named-field map, matching the on-chain `env.events().publish(topic, (a, b))` call.
+ */
+export interface PaymentRetryCreatedEvent extends ContractEvent {
+  topic: ["PAYMENT", "RETRY_CREATED"];
+  value: {
+    original_payment_id: string;
+    new_payment_id: string;
+  };
+}
+
 export interface PaymentFeeEvent extends ContractEvent {
   topic: ["PAYMENT", "FEE_TOTAL"];
   value: {
@@ -203,6 +217,7 @@ export type PaymentLinkEvent =
   | LinkViewedEvent;
 export type AnyEvent =
   | PaymentEvent
+  | PaymentRetryCreatedEvent
   | PaymentFeeEvent
   | RefundEvent
   | DisputeEvent

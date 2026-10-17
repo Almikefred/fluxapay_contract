@@ -170,6 +170,14 @@ export class Database implements SettlementStore {
 
     switch (table) {
       case "payments":
+        // Issue #1037: PAYMENT/RETRY_CREATED is emitted by the contract and
+        // carries (new_payment_id, original_payment_id), but the Drizzle
+        // `payments` schema has no `retryOfPaymentId` column yet to persist
+        // it into — the on-chain link (PaymentCharge.retry_of_payment_id,
+        // queryable via get_payment) is this issue's actual requirement and
+        // is unaffected; indexer-side reconciliation would need its own
+        // follow-up migration + schema column, left as a known gap rather
+        // than rushed in here.
         await tx
           .insert(payments)
           .values({
