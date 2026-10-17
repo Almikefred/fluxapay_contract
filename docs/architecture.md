@@ -97,10 +97,23 @@ are cached for five minutes and require a merchant-bound API key with the
 **Payment Settlement Flow:**
 1. Operator calls `PaymentProcessor::settle_payment(payment_id)`
 2. PaymentProcessor acquires reentrancy lock
-3. PaymentProcessor updates payment status to SETTLED
-4. Fees are calculated and split
-5. Settlement event is emitted
-6. Reentrancy lock is released
+3. **(Issue #1031)** If the merchant's `settlement_schedule` is `Daily` or
+   `Weekly`, PaymentProcessor rejects the call with
+   `Error::SettlementIntervalNotElapsed` unless at least one interval has
+   passed since `last_settlement_at`, and with `Error::SettlementBelowMinimum`
+   if the merchant's pending balance (including this payment) is still below
+   `SETTLEMENT_MIN_AMOUNT`. `Manual`-schedule merchants are unaffected and
+   settle immediately, matching `trigger_settlement`'s existing semantics for
+   the aggregate sweep.
+4. PaymentProcessor updates payment status to SETTLED
+5. Fees are calculated and split
+6. **(Issue #1017)** If the merchant has a `reserve_policy`, the configured
+   `reserve_bps` share of the net settlement amount is withheld in a rolling
+   reserve bucket (`PAYMENT/RESERVE_HELD`) instead of being credited to
+   pending settlement; it becomes available after `holding_period_secs` via
+   `release_merchant_reserve`.
+7. Settlement event is emitted
+8. Reentrancy lock is released
 
 **Refund Processing Flow:**
 1. Operator/Payer calls `RefundManager::process_refund(refund_id)`
