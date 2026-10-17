@@ -1075,14 +1075,10 @@ impl MerchantRegistry {
             .persistent()
             .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "MERCHANT"),
-                Symbol::new(&env, "KYC_UPGRADED"),
-            ),
-            merchant_id.clone(),
-        );
-
+        // `emit_kyc_tier_upgraded` below already publishes MERCHANT/KYC_TIER_UPGRADED
+        // with (merchant_id, old_tier, new_tier) — issue #1015's requirement — so no
+        // separate inline publish is needed here (both prior attempts at one were
+        // redundant with it).
         crate::events::emit_kyc_tier_upgraded(&env, &merchant_id, &old_tier, &new_tier);
 
         Ok(())
