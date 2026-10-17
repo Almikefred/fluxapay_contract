@@ -106,6 +106,7 @@ pub mod account_abstraction;
 mod dex_router;
 pub mod events;
 pub mod fx_oracle;
+pub mod htlc;
 pub mod merchant_auth;
 pub mod meta_transaction;
 mod payment_state_machine;
@@ -120,6 +121,7 @@ pub use access_control::AccessControlDataKey;
 pub use access_control::{AdminAction, AdminProposal};
 pub use dex_router::{DexRouter, DexRouterClient};
 pub use fx_oracle::{FXOracle, FXOracleClient, FXOracleError};
+pub use htlc::{Htlc, HtlcClient, HtlcDataKey, HtlcError, HtlcRecord, HtlcStatus};
 pub use merchant_auth::{ApiKeyRecord, MerchantAuthError, MerchantAuthorization, MerchantPreAuth};
 
 #[contract]
@@ -13529,6 +13531,7 @@ mod subscription_test;
 #[cfg(test)] mod escalate_disputes_test;
 #[cfg(test)] mod feature_tests;
 #[cfg(test)] mod fx_oracle_test;
+#[cfg(test)] mod htlc_test;
 #[cfg(test)] mod integration_test;
 #[cfg(test)] mod memo_test;
 #[cfg(test)] mod merchant_ranking_test;

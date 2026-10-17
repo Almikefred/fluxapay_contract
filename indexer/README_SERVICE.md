@@ -115,7 +115,7 @@ any merchant. The dashboard reads the merchant-bound key and merchant ID from
 `localStorage` keys `fluxapay_api_key` and `fluxapay_merchant_id`. Results are
 cached for five minutes. Indexing subscription plans and lifecycle events
 requires applying
-`migrations/008_subscription_metrics.sql`.
+`migrations/012_subscription_metrics.sql`.
 
 ---
 
@@ -165,7 +165,7 @@ and whose values are merchant IDs, for example
 global indexer API key and rejects a requested `merchant_id` that does not
 match the merchant assigned to the presented key.
 
-Migration `004_reconciliation_reports.sql` adds payment reconciliation columns,
+Migration `009_reconciliation_reports.sql` adds payment reconciliation columns,
 the `fx_rate_cache`, and dispute adjustment storage. The FXOracle emits
 `FX_RATE/UPDATED` events containing each updated pair, integer fixed-point rate,
 and decimals; the indexer mirrors the latest rate into `fx_rate_cache`.
