@@ -57,12 +57,16 @@ export const payments = pgTable(
     settledAt: timestamp("settled_at"),
     customerRef: varchar("customer_ref", { length: 255 }),
     tags: text("tags"),
+    // Issue #1035: sub-account ID extracted from the payer's M-address, for
+    // reconciliation and `GET /v1/transactions?payer_muxed_id=` filtering.
+    payerMuxedId: bigint("payer_muxed_id", { mode: "bigint" }),
   },
   (t) => ({
     paymentIdIdx: index("idx_payment_id").on(t.paymentId),
     merchantIdIdx: index("idx_merchant_id").on(t.merchantId),
     statusIdx: index("idx_status").on(t.status),
     paymentLinkIdIdx: index("idx_payments_payment_link_id").on(t.paymentLinkId),
+    payerMuxedIdIdx: index("idx_payments_payer_muxed_id").on(t.payerMuxedId),
   }),
 );
 

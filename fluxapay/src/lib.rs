@@ -11,6 +11,9 @@ use soroban_sdk::{
 };
 
 pub const PAYMENT_TOLERANCE: i128 = 1;
+/// Issue #1025: Maximum tip/gratuity as a fraction of the base payment amount, in
+/// basis points (2000 = 20%). Enforced by `verify_payment` when `tip_enabled` is set.
+pub const MAX_TIP_BPS: i128 = 2000;
 const SHORT_LIVE_TTL: u32 = 120_960; // ~1 week at 5s/ledger
 const LONG_LIVE_TTL: u32 = 18_921_600; // ~3 years at 5s/ledger
 const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
@@ -81,6 +84,8 @@ pub(crate) const ZERO_CONTRACT_STRKEY: &str =
 pub mod constants;
 pub mod data_keys;
 pub mod gas_estimator;
+/// Issues #1026/#1027: on-chain Merkle batch payment proof verifier.
+pub mod merkle_distributor;
 pub mod merchant_registry;
 pub mod payment_processor;
 pub mod refund_manager;
@@ -106,6 +111,7 @@ pub mod account_abstraction;
 mod dex_router;
 pub mod events;
 pub mod fx_oracle;
+pub mod htlc;
 pub mod merchant_auth;
 pub mod meta_transaction;
 mod payment_state_machine;
@@ -120,6 +126,7 @@ pub use access_control::AccessControlDataKey;
 pub use access_control::{AdminAction, AdminProposal};
 pub use dex_router::{DexRouter, DexRouterClient};
 pub use fx_oracle::{FXOracle, FXOracleClient, FXOracleError};
+pub use htlc::{Htlc, HtlcClient, HtlcDataKey, HtlcError, HtlcRecord, HtlcStatus};
 pub use merchant_auth::{ApiKeyRecord, MerchantAuthError, MerchantAuthorization, MerchantPreAuth};
 
 #[contract]
@@ -178,8 +185,12 @@ pub struct PaymentCharge {
     /// Issue #767: When true, allows funding the payment across multiple transactions.
     pub allow_partial: Option<bool>,
     /// Issue #844: Whether the merchant enabled an optional tip/gratuity on this payment.
+    /// Issue #1025 makes this real: `verify_payment` only honors a tip, capped at
+    /// `MAX_TIP_BPS` of `amount`, when this is `true`.
     pub tip_enabled: bool,
     /// Issue #844: Tip/gratuity amount paid by the customer; stored separately from `amount`.
+    /// Issue #1025: populated by `verify_payment` (validated against `MAX_TIP_BPS`);
+    /// `None` until verified, or if `tip_enabled` is `false`, or the payer chose not to tip.
     pub tip_amount: Option<i128>,
 }
 
@@ -573,6 +584,21 @@ pub enum Error {
     /// Issue #1032: The requested `deposit_address` is already assigned to
     /// another open (`Pending`, unexpired) payment.
     DepositAddressInUse = 89,
+    /// Issue #1031: `settle_payment` was called before the merchant's configured
+    /// Daily/Weekly settlement interval has elapsed since the last settlement.
+    SettlementIntervalNotElapsed = 88,
+    /// Issue #1031: The merchant's accumulated settlement balance (including this
+    /// payment) is below `SETTLEMENT_MIN_AMOUNT` for a Daily/Weekly schedule.
+    SettlementBelowMinimum = 89,
+    /// Issue #1029: A sub-account's merchant delegation has passed its `expires_at`.
+    DelegationExpired = 90,
+    /// Issue #1029: A sub-account's merchant delegation has been revoked.
+    DelegationRevoked = 91,
+    /// Issue #1037: `retry_of_payment_id` passed to `create_payment` does not refer to
+    /// an existing payment owned by the same merchant that is in `Expired` status.
+    InvalidRetryTarget = 88,
+    /// Issue #1025: Tip passed to `verify_payment` exceeds `MAX_TIP_BPS` of the base amount.
+    TipExceedsMax = 89,
 }
 
 #[contracttype]
@@ -607,6 +633,8 @@ pub struct CreatePaymentArgs {
     /// Issue #767: Optional flag to allow partial payment accumulation.
     pub allow_partial: Option<bool>,
     /// Issue #844: When true, customers may submit a tip via `confirm_payment`.
+    /// Issue #1025 makes this actually enforceable: `verify_payment` validates
+    /// and records a tip, capped at `MAX_TIP_BPS`, only when this is `true`.
     pub tip_enabled: bool,
 }
 
@@ -2056,6 +2084,35 @@ impl RefundManager {
         env.storage().persistent().get(&DataKey::FeeSplitConfig)
     }
 
+    /// Issue #1016: Wire RefundManager to the MerchantRegistry contract so that
+    /// `process_refund` can look up a merchant's KYC tier and apply the
+    /// tier-specific refund fee (Basic/Unverified 100 bps, Full 80 bps,
+    /// Business 50 bps) instead of always falling back to the flat default.
+    /// Admin only.
+    pub fn set_merchant_registry_address(
+        env: Env,
+        admin: Address,
+        registry_address: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantRegistryAddress, &registry_address);
+        Ok(())
+    }
+
+    /// Get the MerchantRegistry contract address used for tiered refund fee lookups.
+    pub fn get_merchant_registry_address(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantRegistryAddress)
+    }
+
     /// Returns all addresses currently holding the given role (issue #37).
     pub fn get_role_members(env: Env, role: Symbol) -> Vec<Address> {
         AccessControl::get_role_members(&env, &role)
@@ -2832,9 +2889,12 @@ impl RefundManager {
             );
         }
 
+        // Issue #1016: include the applied tier-specific fee rate (in bps)
+        // in the event payload so off-chain indexers can reconcile exactly
+        // how much was withheld without re-deriving the merchant's tier.
         env.events().publish(
             (Symbol::new(env, "REFUND"), Symbol::new(env, "COMPLETED")),
-            (refund.payment_id.clone(), refund_id.clone(), refund.amount),
+            (refund.payment_id.clone(), refund_id.clone(), refund.amount, fee_bps),
         );
 
         if refund.receipt_hash.is_some() {
@@ -3085,8 +3145,19 @@ impl RefundManager {
             .ok_or(Error::Unauthorized)?;
         let token_client = token::TokenClient::new(&env, &usdc_token_address);
 
-        let default_fee_bps = Self::get_refund_fee_bps_internal(&env);
-        let fee = refund_amount * default_fee_bps / 10_000;
+        // Issue #1016: Apply the tiered refund fee for this merchant's KYC tier
+        // (we already fetched `merchant` above to gate high-trust eligibility).
+        // Unverified falls back to this function's pre-existing default-fee
+        // source rather than `CurrentFee` (process_refund_internal's fallback
+        // source) — the two are separate, independently-admin-settable
+        // defaults that predate this change; not unified here.
+        let fee_bps = match merchant.kyc_tier {
+            crate::merchant_registry::KycTier::Business => REFUND_FEE_BPS_BUSINESS,
+            crate::merchant_registry::KycTier::Full => REFUND_FEE_BPS_FULL,
+            crate::merchant_registry::KycTier::Basic => REFUND_FEE_BPS_BASIC,
+            crate::merchant_registry::KycTier::Unverified => Self::get_refund_fee_bps_internal(&env),
+        };
+        let fee = refund_amount * fee_bps / 10_000;
         let net_amount = refund_amount - fee;
 
         let mut refund = Self::get_refund_internal(&env, &refund_id)?;
@@ -3112,7 +3183,7 @@ impl RefundManager {
 
         env.events().publish(
             (Symbol::new(&env, "REFUND"), Symbol::new(&env, "COMPLETED")),
-            (refund.payment_id, refund_id.clone(), refund_amount),
+            (refund.payment_id, refund_id.clone(), refund_amount, fee_bps),
         );
 
         Ok(refund_id)
@@ -8265,6 +8336,14 @@ impl PaymentProcessor {
                 crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
             match registry_client.try_check_kyc_limit(&args.merchant_id, &args.amount) {
                 Ok(Ok(())) => {}
+                // Issue #1014: surface which specific tier limit tripped
+                // instead of a single generic error.
+                Err(Ok(crate::merchant_registry::MerchantError::TierSingleLimitExceeded)) => {
+                    return Err(Error::ExceedsTierSingleLimit);
+                }
+                Err(Ok(crate::merchant_registry::MerchantError::TierMonthlyLimitExceeded)) => {
+                    return Err(Error::ExceedsTierMonthlyLimit);
+                }
                 Err(Ok(crate::merchant_registry::MerchantError::KycLimitExceeded)) => {
                     return Err(Error::KycLimitExceeded);
                 }
@@ -8322,6 +8401,23 @@ impl PaymentProcessor {
         Self::validate_memo(&env, &args.memo, &args.memo_type)?;
 
         Self::enforce_create_payment_rate_limit(&env, &args.merchant_id)?;
+
+        // Issue #1037: When this is a retry (`retry_of_payment_id` set), validate the
+        // original payment exists, belongs to the same merchant, and is in `Expired`
+        // status before linking the two. This is distinct from the `retry_payment`
+        // entry point (issue #482), which also accepts `Failed` originals and manages
+        // its own retry chain depth; `create_payment` retries are a direct, simpler
+        // flow for the common "expired payment" case described in the dashboard UX.
+        if let Some(ref original_id) = args.retry_of_payment_id {
+            let original = Self::get_payment_internal(&env, original_id)
+                .map_err(|_| Error::InvalidRetryTarget)?;
+            if original.merchant_id != args.merchant_id {
+                return Err(Error::InvalidRetryTarget);
+            }
+            if original.status != PaymentStatus::Expired {
+                return Err(Error::InvalidRetryTarget);
+            }
+        }
 
         let now = env.ledger().timestamp();
 
@@ -8396,7 +8492,7 @@ impl PaymentProcessor {
             fx_rate_at: None,
             metadata: args.metadata.clone(),
             fee_waiver_code: args.fee_waiver_code.clone(),
-            retry_of_payment_id: None,
+            retry_of_payment_id: args.retry_of_payment_id.clone(),
             payer_muxed_id: None,
             payment_link_id: None,
             allow_partial: args.allow_partial,
@@ -8427,6 +8523,30 @@ impl PaymentProcessor {
             &args.payment_id,
             payment.created_at,
         );
+
+        // Issue #1037: Link the retry to its original and emit PAYMENT/RETRY_CREATED.
+        // Reuses the same `DataKey::PaymentRetries` index as `retry_payment` (issue #482)
+        // so `retried_by`-style lookups see every retry regardless of which entry point
+        // created it.
+        if let Some(ref original_id) = args.retry_of_payment_id {
+            let retries_key = DataKey::PaymentRetries(original_id.clone());
+            let mut retries: Vec<String> = env
+                .storage()
+                .persistent()
+                .get(&retries_key)
+                .unwrap_or_else(|| vec![&env]);
+            retries.push_back(args.payment_id.clone());
+            env.storage().persistent().set(&retries_key, &retries);
+            Self::bump_ttl(&env, &retries_key, LONG_LIVE_TTL);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "RETRY_CREATED"),
+                ),
+                (original_id.clone(), args.payment_id.clone()),
+            );
+        }
 
         // Issue #489: Store reverse index for metadata_hash → payment_id lookup
         if let Some(ref hash) = args.metadata_hash {
@@ -8492,6 +8612,96 @@ impl PaymentProcessor {
         }
 
         Ok(payment)
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Issue #1029: Merchant → sub-account payment delegation             */
+    /* ------------------------------------------------------------------ */
+
+    /// Grant `sub_account` delegated authority to perform `scope` payment
+    /// operations on behalf of `merchant` until `expires_at`. Requires the
+    /// merchant's own authorization.
+    pub fn grant_delegation(
+        env: Env,
+        merchant: Address,
+        sub_account: Address,
+        scope: account_abstraction::DelegationScope,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        account_abstraction::grant_delegation(env, merchant, sub_account, scope, expires_at)
+    }
+
+    /// Revoke a previously granted sub-account delegation. Requires the
+    /// merchant's own authorization.
+    pub fn revoke_delegation(
+        env: Env,
+        merchant: Address,
+        sub_account: Address,
+    ) -> Result<(), Error> {
+        account_abstraction::revoke_delegation(env, merchant, sub_account)
+    }
+
+    /// List every sub-account delegation a merchant has ever granted
+    /// (including revoked/expired entries), for audit purposes.
+    pub fn list_delegations(
+        env: Env,
+        merchant: Address,
+    ) -> Vec<account_abstraction::Delegation> {
+        account_abstraction::list_delegations(env, merchant)
+    }
+
+    /// Create a payment using a merchant-delegated sub-account (e.g. a POS
+    /// terminal or employee key) instead of the merchant's own signature.
+    /// `sub_account` signs this invocation directly; its grant must cover
+    /// `DelegationScope::CreatePayment` (or `All`) for `args.merchant_id` and
+    /// must not be expired or revoked. Reuses the same temporary
+    /// merchant-authorization bypass as sponsored meta-transactions so
+    /// `create_payment`'s existing body does not need to change.
+    pub fn create_payment_delegated(
+        env: Env,
+        sub_account: Address,
+        args: CreatePaymentArgs,
+    ) -> Result<PaymentCharge, Error> {
+        account_abstraction::require_delegation(
+            &env,
+            &args.merchant_id,
+            &sub_account,
+            &account_abstraction::DelegationScope::CreatePayment,
+        )?;
+        meta_transaction::set_auth(&env, &args.merchant_id);
+        let result = Self::create_payment(env.clone(), args);
+        meta_transaction::clear_auth(&env);
+        result
+    }
+
+    /// Create a refund using a merchant-delegated sub-account instead of the
+    /// merchant's own signature. `sub_account` signs this invocation
+    /// directly; its grant must cover `DelegationScope::CreateRefund` (or
+    /// `All`) for the payment's merchant, and must not be expired or revoked.
+    pub fn create_refund_delegated(
+        env: Env,
+        sub_account: Address,
+        payment_id: String,
+        refund_amount: i128,
+        reason: String,
+        receipt_hash: Option<BytesN<32>>,
+    ) -> Result<String, Error> {
+        let merchant_id = Self::get_payment_internal(&env, &payment_id)?.merchant_id;
+        account_abstraction::require_delegation(
+            &env,
+            &merchant_id,
+            &sub_account,
+            &account_abstraction::DelegationScope::CreateRefund,
+        )?;
+        Self::create_refund_internal(
+            &env,
+            payment_id,
+            refund_amount,
+            reason,
+            merchant_id,
+            receipt_hash,
+            None,
+        )
     }
 
     /// Issue #165: Batch payment creation for optimized gas usage.
@@ -8701,6 +8911,9 @@ impl PaymentProcessor {
                 fx_rate_at: None,
                 metadata: args.metadata.clone(),
                 fee_waiver_code: args.fee_waiver_code.clone(),
+                // Note: batch creation does not support the retry-linking validation
+                // added to `create_payment` (issue #1037); retries must go through
+                // the single-payment path so `retry_of_payment_id` can be validated.
                 retry_of_payment_id: None,
                 payer_muxed_id: None,
                 payment_link_id: None,
@@ -9063,6 +9276,10 @@ impl PaymentProcessor {
         payer_address: Address,
         amount_received: i128,
         payer_muxed_id: Option<u64>,
+        // Issue #1025: Tip/gratuity portion of `amount_received`, reported separately
+        // so it can be validated against `MAX_TIP_BPS` and broken out for reconciliation.
+        // Ignored (treated as no tip) when `payment.tip_enabled` is `false`.
+        tip_amount: Option<i128>,
     ) -> Result<PaymentStatus, Error> {
         Self::require_scope_not_paused(&env, PauseScope::VerifyPayment)?;
         oracle.require_auth();
@@ -9115,6 +9332,29 @@ impl PaymentProcessor {
         }
         // Issue #484: Store muxed ID if M-address was used
         payment.payer_muxed_id = payer_muxed_id;
+
+        // Issue #1025: Validate and record the tip/gratuity, if this payment accepts one.
+        // A tip passed when `tip_enabled` is false is ignored rather than erroring, since
+        // older clients/oracles may not know about the field.
+        let tip: Option<i128> = if payment.tip_enabled {
+            match tip_amount {
+                Some(tip) if tip < 0 => return Err(Error::TipExceedsMax),
+                Some(tip) => {
+                    let max_tip = payment.amount.saturating_mul(MAX_TIP_BPS) / 10_000;
+                    if tip > max_tip {
+                        return Err(Error::TipExceedsMax);
+                    }
+                    Some(tip)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        payment.tip_amount = tip;
+
+        // The expected total received is the base amount plus any validated tip.
+        let expected_total = payment.amount.saturating_add(tip.unwrap_or(0));
 
         // Get merchant-specific tolerance if available, otherwise use global default
         let merchant_tolerance = if let Some(registry_address) = env
@@ -9173,7 +9413,12 @@ impl PaymentProcessor {
         let max_tolerance = payment.amount / 100; // 1% of payment amount
         let tolerance = tolerance.min(max_tolerance);
 
-        let diff = total_received - payment.amount;
+        // Issue #1025: Compare against `expected_total` (base amount + validated tip,
+        // from `payment.amount` otherwise) rather than bare `payment.amount`, so a
+        // tipped payment isn't misclassified as Overpaid just because it includes a
+        // tip. `total_received` already accounts for partial-payment accumulation
+        // (issue #767) on the received side.
+        let diff = total_received - expected_total;
 
         let mut new_status = if (0..=tolerance).contains(&diff) {
             // Exact match or tiny overpay within tolerance → Confirmed
@@ -9188,6 +9433,37 @@ impl PaymentProcessor {
             // Meaningfully less than expected → PartiallyPaid
             PaymentStatus::PartiallyPaid
         };
+
+        // Issue #1014: `create_payment` already enforced the KYC tier monthly
+        // volume cap against the originally invoiced `payment.amount`. An
+        // Overpaid confirmation receives *more* than that, so re-check (and
+        // record) only the extra portion here against the merchant's
+        // monthly cap — avoids double-counting the invoiced amount while
+        // still closing the gap where an overpayment could push a merchant
+        // over their tier's monthly limit unnoticed.
+        if new_status == PaymentStatus::Overpaid {
+            let extra = total_received.saturating_sub(payment.amount);
+            if extra > 0 {
+                if let Some(registry_address) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+                {
+                    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(
+                        &env,
+                        &registry_address,
+                    );
+                    match registry_client
+                        .try_check_monthly_limit_only(&payment.merchant_id, &extra)
+                    {
+                        Err(Ok(crate::merchant_registry::MerchantError::TierMonthlyLimitExceeded)) => {
+                            return Err(Error::ExceedsTierMonthlyLimit);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         payment.status = new_status.clone();
 
@@ -9239,7 +9515,7 @@ impl PaymentProcessor {
             _ => Symbol::new(&env, "FAILED"),
         };
         let overpaid_refund_amount = if new_status == PaymentStatus::Overpaid {
-            Some(total_received.saturating_sub(payment.amount))
+            Some(total_received.saturating_sub(expected_total))
         } else {
             None
         };
@@ -9440,13 +9716,25 @@ impl PaymentProcessor {
         };
 
         // Issue #166: Optimize event topics for efficient indexing
+        // Issue #1035: include payer_muxed_id (None for non-muxed payers) so
+        // downstream consumers (indexer, webhooks) can route confirmation to
+        // the correct sub-account without a separate lookup.
+        // Issue #1025: Payload now also carries `tip_amount` (None if tipping wasn't
+        // enabled or the payer chose not to tip) so downstream consumers (indexer,
+        // reconciliation) can break the tip out from the base amount.
         env.events().publish(
             (
                 Symbol::new(&env, "PAYMENT"),
                 event_name,
                 payment.merchant_id.clone(),
             ),
-            (payment_id.clone(), payment.amount, amount_received),
+            (
+                payment_id.clone(),
+                payment.amount,
+                amount_received,
+                payment.payer_muxed_id,
+            ),
+            (payment_id.clone(), payment.amount, amount_received, payment.tip_amount),
         );
 
         Ok(new_status)
@@ -10238,7 +10526,8 @@ impl PaymentProcessor {
             (payment_id.clone(), payment.amount),
         );
 
-        // Issue #767: If the payment expires before being fully funded, refund partial amount to payer
+        // Issue #767 / #1018: If the payment expires before being fully funded,
+        // automatically refund the accumulated partial amount to the payer.
         let partial_received = payment.amount_received.unwrap_or(0);
         if partial_received > 0 {
             if let Some(ref payer_addr) = payment.payer_address {
@@ -10269,6 +10558,55 @@ impl PaymentProcessor {
                     payer_addr,
                     partial_received,
                 );
+
+                // Issue #1018: Actually create the refund via RefundManager (mirroring
+                // the overpayment auto-refund flow in `verify_payment`) so the payer
+                // can claim the accumulated partial amount through the existing,
+                // already-tested refund processing path, instead of the request only
+                // sitting in the local `AutoRefundQueue` with nothing to drain it.
+                if let Some(registry_address) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+                {
+                    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(
+                        &env,
+                        &registry_address,
+                    );
+
+                    if let Some(refund_manager_address) =
+                        registry_client.get_refund_manager_address()
+                    {
+                        let refund_client =
+                            RefundManagerClient::new(&env, &refund_manager_address);
+                        refund_client.register_payment(
+                            &payment_id,
+                            &payment.merchant_id,
+                            &payment.amount,
+                            &payment.currency,
+                        );
+
+                        let auto_reason =
+                            String::from_str(&env, "Partial payment expired - auto refunded");
+                        if let Ok(Ok(auto_refund_id)) = refund_client.try_queue_auto_refund(
+                            &env.current_contract_address(),
+                            &registry_address,
+                            &payment_id,
+                            &partial_received,
+                            payer_addr,
+                            &auto_reason,
+                        ) {
+                            crate::events::emit_payment_partial_refunded(
+                                &env,
+                                &payment_id,
+                                &payment.merchant_id,
+                                payer_addr,
+                                partial_received,
+                                &auto_refund_id,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -10353,6 +10691,50 @@ impl PaymentProcessor {
 
         if payment.status != PaymentStatus::Confirmed {
             return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        // Issue #1031: Enforce the merchant's configured settlement schedule
+        // before finalizing an individual payment settlement. Daily/Weekly
+        // merchants must batch settlements at the configured cadence (mirroring
+        // `trigger_settlement`'s existing enforcement for the aggregate sweep);
+        // Manual merchants keep settling immediately, same as before.
+        if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            let merchant = registry_client.get_merchant(&payment.merchant_id);
+
+            let min_interval = match merchant.settlement_schedule {
+                crate::merchant_registry::SettlementSchedule::Daily => {
+                    Some(SETTLEMENT_DAILY_INTERVAL_SECS)
+                }
+                crate::merchant_registry::SettlementSchedule::Weekly => {
+                    Some(SETTLEMENT_WEEKLY_INTERVAL_SECS)
+                }
+                crate::merchant_registry::SettlementSchedule::Manual => None,
+            };
+
+            if let Some(interval) = min_interval {
+                let settle_now = env.ledger().timestamp();
+                if let Some(last) = merchant.last_settlement_at {
+                    if settle_now < last.saturating_add(interval) {
+                        return Err(Error::SettlementIntervalNotElapsed);
+                    }
+                }
+
+                let net_merchant_amount: i128 = splits
+                    .iter()
+                    .find(|s| s.recipient == payment.merchant_id)
+                    .map(|s| s.amount)
+                    .unwrap_or(0);
+                let pending = registry_client.get_pending_settlement(&payment.merchant_id);
+                if pending.saturating_add(net_merchant_amount) < SETTLEMENT_MIN_AMOUNT {
+                    return Err(Error::SettlementBelowMinimum);
+                }
+            }
         }
 
         // Resolve the settlement token: use payment.token_address if set, else the configured USDC token
@@ -10824,7 +11206,48 @@ impl PaymentProcessor {
             {
                 let registry_client =
                     crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
-                registry_client.add_pending_settlement(&payment.merchant_id, &net_merchant_amount);
+
+                // Issue #1017: Withhold the merchant's configured rolling-reserve
+                // share, if any, before crediting pending settlement. The
+                // withheld amount is locked in a reserve bucket that matures
+                // `holding_period_secs` from now and is swept back into pending
+                // settlement by `release_merchant_reserve`.
+                let reserve_policy = registry_client.get_reserve_policy(&payment.merchant_id);
+                let (immediate_amount, reserve_amount, unlock_at) = match reserve_policy {
+                    Some(ref policy) if policy.reserve_bps > 0 => {
+                        let reserve = net_merchant_amount
+                            .saturating_mul(policy.reserve_bps as i128)
+                            / 10_000;
+                        let unlock = now.saturating_add(policy.holding_period_secs);
+                        (net_merchant_amount.saturating_sub(reserve), reserve, unlock)
+                    }
+                    _ => (net_merchant_amount, 0, 0u64),
+                };
+
+                if reserve_amount > 0 {
+                    // Best-effort: mirrors the tolerance for failed cross-calls
+                    // elsewhere in this function (e.g. the anchor withdraw
+                    // transfer below uses `try_transfer` and ignores failures).
+                    let _ = registry_client.try_lock_reserve(
+                        &env.current_contract_address(),
+                        &payment.merchant_id,
+                        &reserve_amount,
+                        &unlock_at,
+                    );
+
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "PAYMENT"),
+                            Symbol::new(&env, "RESERVE_HELD"),
+                            payment.merchant_id.clone(),
+                        ),
+                        (payment_id.clone(), reserve_amount, unlock_at),
+                    );
+                }
+
+                if immediate_amount > 0 {
+                    registry_client.add_pending_settlement(&payment.merchant_id, &immediate_amount);
+                }
             }
         }
 
@@ -10982,6 +11405,48 @@ impl PaymentProcessor {
         );
 
         Ok(pending)
+    }
+
+    /// Issue #1017: Release any matured rolling-reserve buckets for a
+    /// merchant back into their pending settlement balance, where the next
+    /// `trigger_settlement` sweep pays them out. Intended to be invoked by an
+    /// off-chain release daemon on a schedule; requires the
+    /// `SETTLEMENT_OPERATOR` role, matching `trigger_settlement`.
+    pub fn release_merchant_reserve(
+        env: Env,
+        operator: Address,
+        merchant_id: Address,
+    ) -> Result<i128, Error> {
+        operator.require_auth();
+        if !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator) {
+            return Err(Error::Unauthorized);
+        }
+
+        let registry_address = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+            .ok_or(Error::Unauthorized)?;
+        let registry_client =
+            crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+
+        let released = registry_client
+            .try_release_reserve(&env.current_contract_address(), &merchant_id)
+            .map_err(|_| Error::Unauthorized)?
+            .map_err(|_| Error::Unauthorized)?;
+
+        if released > 0 {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "MERCHANT"),
+                    Symbol::new(&env, "RESERVE_RELEASED"),
+                    merchant_id,
+                ),
+                (released,),
+            );
+        }
+
+        Ok(released)
     }
 
     pub fn prune_expired_payments(
@@ -13443,6 +13908,198 @@ impl PaymentProcessor {
     ) -> Option<meta_transaction::RefundAuthorization> {
         meta_transaction::get_refund_authorization(&env, &merchant, &payment_id)
     }
+
+    // ========================================================================
+    // Issues #1026 / #1027: Merkle batch payment proof verifier.
+    // See `merkle_distributor` for the hashing scheme and rationale. These
+    // methods live in this impl block (rather than a separate `impl
+    // PaymentProcessor` block in that module) so they become part of the
+    // single generated `PaymentProcessorClient`.
+    // ========================================================================
+
+    /// Create a new Merkle-root batch distribution. Pulls `total_amount` of
+    /// `token` from `creator` into contract custody. Emits
+    /// `MERKLE/DISTRIBUTION_CREATED` and returns the new `distribution_id`.
+    pub fn create_batch(
+        env: Env,
+        creator: Address,
+        token: Address,
+        merkle_root: BytesN<32>,
+        total_amount: i128,
+        leaf_count: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        creator.require_auth();
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if leaf_count == 0 || leaf_count > merkle_distributor::MAX_MERKLE_BATCH_LEAVES {
+            return Err(Error::InvalidMerkleLeafCount);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidExpiry);
+        }
+
+        let counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleDistributionCounter)
+            .unwrap_or(0);
+        let distribution_id = counter + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistributionCounter, &distribution_id);
+
+        // Pull funds into escrow before recording the distribution so a
+        // failed transfer never leaves a funded-looking record behind.
+        let token_client = token::TokenClient::new(&env, &token);
+        token_client.transfer(&creator, &env.current_contract_address(), &total_amount);
+
+        let distribution = MerkleDistribution {
+            distribution_id,
+            creator: creator.clone(),
+            token: token.clone(),
+            merkle_root: merkle_root.clone(),
+            total_amount,
+            claimed_amount: 0,
+            leaf_count,
+            expires_at,
+            defunded: false,
+            claimed_bitmap: merkle_distributor::new_claim_bitmap(&env, leaf_count),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistribution(distribution_id), &distribution);
+
+        events::emit_merkle_distribution_created(
+            &env,
+            distribution_id,
+            &creator,
+            &token,
+            &merkle_root,
+            total_amount,
+            leaf_count,
+            expires_at,
+        );
+
+        Ok(distribution_id)
+    }
+
+    /// Claim a recipient's allocation from a batch distribution.
+    ///
+    /// Verifies that `(index, recipient, amount)` is included under the
+    /// distribution's stored Merkle root via `proof`, enforces one claim per
+    /// `(distribution_id, index)`, and transfers `amount` to `recipient` on
+    /// success. Emits `MERKLE/CLAIMED`.
+    pub fn claim_batch_payment(
+        env: Env,
+        distribution_id: u64,
+        index: u32,
+        recipient: Address,
+        amount: i128,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let mut distribution = Self::get_batch(env.clone(), distribution_id)?;
+
+        if distribution.defunded {
+            return Err(Error::MerkleDistributionAlreadyDefunded);
+        }
+        if env.ledger().timestamp() > distribution.expires_at {
+            return Err(Error::MerkleDistributionExpired);
+        }
+        if index >= distribution.leaf_count {
+            return Err(Error::InvalidMerkleProof);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if proof.len() > merkle_distributor::MAX_PROOF_LEN {
+            return Err(Error::InvalidMerkleProof);
+        }
+        if merkle_distributor::is_claimed_bit(&distribution.claimed_bitmap, index) {
+            return Err(Error::MerkleAlreadyClaimed);
+        }
+
+        let computed_root = merkle_distributor::compute_merkle_root(
+            &env,
+            index,
+            &recipient,
+            amount,
+            &distribution.token,
+            &proof,
+        );
+        if computed_root != distribution.merkle_root {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        let new_claimed = distribution.claimed_amount.saturating_add(amount);
+        if new_claimed > distribution.total_amount {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        distribution.claimed_amount = new_claimed;
+        merkle_distributor::set_claimed_bit(&mut distribution.claimed_bitmap, index);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistribution(distribution_id), &distribution);
+
+        let token_client = token::TokenClient::new(&env, &distribution.token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        events::emit_merkle_claimed(&env, distribution_id, index, &recipient, amount);
+
+        Ok(())
+    }
+
+    /// After `expires_at`, the distribution's creator reclaims any unclaimed
+    /// balance. Emits `MERKLE/DEFUNDED` and returns the refunded amount.
+    pub fn defund_batch(env: Env, creator: Address, distribution_id: u64) -> Result<i128, Error> {
+        creator.require_auth();
+
+        let mut distribution = Self::get_batch(env.clone(), distribution_id)?;
+
+        if distribution.creator != creator {
+            return Err(Error::Unauthorized);
+        }
+        if distribution.defunded {
+            return Err(Error::MerkleDistributionAlreadyDefunded);
+        }
+        if env.ledger().timestamp() <= distribution.expires_at {
+            return Err(Error::MerkleDistributionNotExpired);
+        }
+
+        let refund = distribution
+            .total_amount
+            .saturating_sub(distribution.claimed_amount);
+        distribution.defunded = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistribution(distribution_id), &distribution);
+
+        if refund > 0 {
+            let token_client = token::TokenClient::new(&env, &distribution.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &refund);
+        }
+
+        events::emit_merkle_defunded(&env, distribution_id, &creator, refund);
+
+        Ok(refund)
+    }
+
+    /// View: fetch a batch distribution's metadata.
+    pub fn get_batch(env: Env, distribution_id: u64) -> Result<MerkleDistribution, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerkleDistribution(distribution_id))
+            .ok_or(Error::MerkleDistributionNotFound)
+    }
+
+    /// View: has the allocation at `index` in `distribution_id` been claimed?
+    pub fn is_batch_claimed(env: Env, distribution_id: u64, index: u32) -> Result<bool, Error> {
+        let distribution = Self::get_batch(env, distribution_id)?;
+        Ok(merkle_distributor::is_claimed_bit(&distribution.claimed_bitmap, index))
+    }
 }
 
 /// Bumps the version string by incrementing the number after the last '.'.
@@ -13552,6 +14209,10 @@ mod payment_link_test;
 #[cfg(test)]
 mod payment_metadata_test;
 #[cfg(test)]
+mod payment_retry_test;
+#[cfg(test)]
+mod payment_tip_test;
+#[cfg(test)]
 mod test;
 
 // Payment streaming module (Issue #127)
@@ -13575,10 +14236,12 @@ mod subscription_test;
 #[cfg(test)] mod escalate_disputes_test;
 #[cfg(test)] mod feature_tests;
 #[cfg(test)] mod fx_oracle_test;
+#[cfg(test)] mod htlc_test;
 #[cfg(test)] mod integration_test;
 #[cfg(test)] mod memo_test;
 #[cfg(test)] mod merchant_ranking_test;
 #[cfg(test)] mod merchant_registry_test;
+#[cfg(test)] mod merchant_reserve_test;
 #[cfg(test)] mod mock_dex_router;
 #[cfg(test)] mod muxed_payer_test;
 #[cfg(test)] mod oracle_sanitization_test;
@@ -13594,3 +14257,5 @@ mod subscription_test;
 #[cfg(test)] mod merchant_auth_test;
 #[cfg(test)] mod account_abstraction_test;
 #[cfg(test)] mod meta_transaction_test;
+#[cfg(test)] mod merkle_distributor_test;
+#[cfg(test)] mod treasury_single_admin_threshold_test;

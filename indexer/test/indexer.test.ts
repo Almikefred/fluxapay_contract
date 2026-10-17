@@ -18,6 +18,7 @@ import {
 } from "../src/index";
 import { createServer } from "../src/server";
 import { Database } from "../src/database";
+import { sseManager } from "../src/sse";
 import {
   clearRegisteredApiKeys,
   extractApiKey,
@@ -87,6 +88,12 @@ function createMockDatabase() {
 
     async getPaymentById(paymentId: string) {
       return state.payments.get(paymentId) || null;
+    },
+
+    // Issue #1039: used by the live SSE dispatcher to resolve a dispute
+    // event's merchant when only `dispute_id` is present on the event.
+    async getDisputeById(disputeId: string) {
+      return state.disputes.get(disputeId) || null;
     },
 
     async recordPaymentLinkView(linkId: string) {
@@ -322,13 +329,18 @@ function createMockDatabase() {
           }
         } else {
           const status = subtype === "CREATED" ? "Open" : subtype;
+          // Mirrors the real `database.ts`'s `onConflictDoUpdate({ set: { status } })`:
+          // an existing dispute only has its status touched here, so events
+          // like REVIEWED/VOTE_CAST/AUTO_RESOLVED (issue #1039) that don't
+          // carry payment_id/amount never blank out what CREATED recorded.
+          const existing = state.disputes.get(val.dispute_id);
           state.disputes.set(val.dispute_id, {
             dispute_id: val.dispute_id,
-            payment_id: val.payment_id,
-            amount: val.amount,
+            payment_id: existing ? existing.payment_id : val.payment_id,
+            amount: existing ? existing.amount : val.amount,
             status,
-            escalated: false,
-            created_at: new Date(event.timestamp * 1000),
+            escalated: existing ? existing.escalated : false,
+            created_at: existing ? existing.created_at : new Date(event.timestamp * 1000),
           });
         }
       }
@@ -1770,5 +1782,147 @@ describe("ISSUE #1081 — Reconciliation report export", () => {
       payment_id: "pay_1",
       amount: "15000000",
     });
+  });
+});
+
+describe("ISSUE #1039 — SSE broadcast for dispute status changes", () => {
+  const config = {
+    rpcUrl: "http://localhost:8000",
+    contractIds: ["C_DISPUTE"],
+    dbConnectionString: "postgres://localhost/test",
+    pollInterval: 1000,
+    startLedger: 1,
+    dlqRetryIntervalMs: 1000,
+    dlqMinAgeSeconds: 10,
+    apiPort: 3001,
+  };
+
+  // Spies on the shared sseManager singleton for the duration of one test,
+  // restoring the real `broadcast` afterward so other suites are unaffected.
+  function spyOnBroadcast() {
+    const calls: Array<{ merchantId: string; eventType: string; data: any }> = [];
+    const original = sseManager.broadcast.bind(sseManager);
+    sseManager.broadcast = (merchantId: string, eventType: string, data: any) => {
+      calls.push({ merchantId, eventType, data });
+    };
+    return { calls, restore: () => { sseManager.broadcast = original; } };
+  }
+
+  it("broadcasts all 6 dispute lifecycle events, resolving merchant via payment_id", async () => {
+    const mockDb = createMockDatabase();
+    mockDb.state.payments.set("pay_1", {
+      payment_id: "pay_1",
+      merchant_id: "merch_1",
+      amount: 5000,
+      status: "Confirmed",
+    });
+    mockDb.state.disputes.set("disp_1", {
+      dispute_id: "disp_1",
+      payment_id: "pay_1",
+      status: "Open",
+    });
+
+    const subscriber = new EventSubscriber(config, mockDb as any);
+    const spy = spyOnBroadcast();
+
+    try {
+      await subscriber.processBatch([
+        {
+          id: "evt_1",
+          ledger: 10,
+          txHash: "tx1",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "CREATED"],
+          value: { dispute_id: "disp_1", payment_id: "pay_1", amount: 5000 },
+        },
+        {
+          id: "evt_2",
+          ledger: 11,
+          txHash: "tx2",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "REVIEWED"],
+          value: { dispute_id: "disp_1", payment_id: "pay_1" },
+        },
+        {
+          id: "evt_3",
+          ledger: 12,
+          txHash: "tx3",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "ESCALATED"],
+          value: { payment_id: "pay_1", dispute_id: "disp_1", amount: 5000 },
+        },
+        {
+          id: "evt_4",
+          ledger: 13,
+          txHash: "tx4",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "VOTE_CAST"],
+          // No payment_id on this event — merchant must resolve via dispute_id.
+          value: { dispute_id: "disp_1", arbitrator: "G_ARB", stake: 1000 },
+        },
+        {
+          id: "evt_5",
+          ledger: 14,
+          txHash: "tx5",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "RESOLVED"],
+          value: { dispute_id: "disp_1", payment_id: "pay_1" },
+        },
+        {
+          id: "evt_6",
+          ledger: 15,
+          txHash: "tx6",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "AUTO_RESOLVED"],
+          // No payment_id on this event either.
+          value: { dispute_id: "disp_1", approved: true },
+        },
+      ] as any);
+
+      assert.strictEqual(spy.calls.length, 6, "expected a broadcast for each of the 6 dispute events");
+      assert.deepStrictEqual(
+        spy.calls.map((c) => c.eventType),
+        [
+          "dispute.opened",
+          "dispute.responded",
+          "dispute.escalated",
+          "dispute.vote_cast",
+          "dispute.resolved",
+          "dispute.auto_resolved",
+        ],
+      );
+      // Every event resolves to the same merchant — including VOTE_CAST and
+      // AUTO_RESOLVED, which carry only `dispute_id` and must be resolved via
+      // the `disputes` -> `payments` lookup chain.
+      for (const call of spy.calls) {
+        assert.strictEqual(call.merchantId, "merch_1");
+      }
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it("does not broadcast when the owning merchant cannot be resolved", async () => {
+    const mockDb = createMockDatabase();
+    const subscriber = new EventSubscriber(config, mockDb as any);
+    const spy = spyOnBroadcast();
+
+    try {
+      await subscriber.processBatch([
+        {
+          id: "evt_orphan",
+          ledger: 10,
+          txHash: "tx1",
+          contractId: "C_DISPUTE",
+          topic: ["DISPUTE", "CREATED"],
+          // dispute_id/payment_id with no matching payment indexed anywhere.
+          value: { dispute_id: "disp_unknown", payment_id: "pay_unknown", amount: 100 },
+        },
+      ] as any);
+
+      assert.strictEqual(spy.calls.length, 0);
+    } finally {
+      spy.restore();
+    }
   });
 });

@@ -7,6 +7,7 @@
  */
 
 import { Pool } from "pg";
+import { SettlementRecord, SettlementStatus, SettlementStore } from "./settlement";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import {
   and,
@@ -88,7 +89,7 @@ export interface SubscriptionMetrics {
   dunning_recovery_rate: number | null;
 }
 
-export class Database {
+export class Database implements SettlementStore {
   private pool: Pool;
   private db: NodePgDatabase<typeof schema>;
   private initialized = false;
@@ -169,6 +170,14 @@ export class Database {
 
     switch (table) {
       case "payments":
+        // Issue #1037: PAYMENT/RETRY_CREATED is emitted by the contract and
+        // carries (new_payment_id, original_payment_id), but the Drizzle
+        // `payments` schema has no `retryOfPaymentId` column yet to persist
+        // it into — the on-chain link (PaymentCharge.retry_of_payment_id,
+        // queryable via get_payment) is this issue's actual requirement and
+        // is unaffected; indexer-side reconciliation would need its own
+        // follow-up migration + schema column, left as a known gap rather
+        // than rushed in here.
         await tx
           .insert(payments)
           .values({
@@ -186,6 +195,9 @@ export class Database {
             tags: value.tags != null ? String(value.tags) : null,
             settledAt:
               event.topic[1] === "SETTLED" ? ts : null,
+            // Issue #1035: sub-account ID from an M-address payer.
+            payerMuxedId:
+              value.payer_muxed_id != null ? BigInt(String(value.payer_muxed_id)) : null,
           })
           .onConflictDoUpdate({
             target: payments.paymentId,
@@ -198,6 +210,10 @@ export class Database {
               updatedAt: new Date(),
               settledAt:
                 event.topic[1] === "SETTLED" ? ts : undefined,
+              payerMuxedId:
+                value.payer_muxed_id != null
+                  ? BigInt(String(value.payer_muxed_id))
+                  : undefined,
             },
           });
         break;
@@ -694,6 +710,70 @@ export class Database {
   }
 
   /**
+   * Fetch the current settlement record for a payment, if the SEP-6/SEP-24
+   * offramp has been attempted for it. Used by `SettlementService` to make
+   * `settle()` idempotent against re-delivered `PAYMENT/ANCHOR_WITHDRAW`
+   * events.
+   */
+  async getSettlement(paymentId: string): Promise<SettlementRecord | null> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT payment_id, merchant_id, anchor_domain, anchor_txn_id, amount, currency, status
+         FROM settlements WHERE payment_id = $1`,
+        [paymentId]
+      );
+      if (result.rows.length === 0) return null;
+      const row = result.rows[0];
+      return {
+        paymentId: row.payment_id,
+        merchantId: row.merchant_id,
+        anchorDomain: row.anchor_domain,
+        anchorTxnId: row.anchor_txn_id,
+        amount: Number(row.amount),
+        currency: row.currency,
+        status: row.status as SettlementStatus,
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Insert or update the settlement row for a payment, keyed by
+   * `payment_id`. Called at each step of the SEP-6 withdrawal flow
+   * (initiated -> pending -> fiat_sent/failed).
+   */
+  async upsertSettlement(record: SettlementRecord): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        `INSERT INTO settlements
+           (payment_id, merchant_id, anchor_domain, anchor_txn_id, amount, currency, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+         ON CONFLICT (payment_id) DO UPDATE SET
+           anchor_domain = $3,
+           anchor_txn_id = COALESCE($4, settlements.anchor_txn_id),
+           amount = $5,
+           currency = $6,
+           status = $7,
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          record.paymentId,
+          record.merchantId,
+          record.anchorDomain,
+          record.anchorTxnId,
+          record.amount,
+          record.currency,
+          record.status,
+        ]
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * Issue #839: Mirror oracle rate events into the in-memory convert cache.
    * Accepts both `FX_ORACLE` and `ORACLE` topic prefixes and pair formats
    * like `USDC/NGN` or `USDC_NGN`.
@@ -720,9 +800,28 @@ export class Database {
         status: payments.status,
         created_at: payments.createdAt,
         updated_at: payments.updatedAt,
+        // Issue #1035: sub-account ID from an M-address payer, for reconciliation.
+        payer_muxed_id: payments.payerMuxedId,
       })
       .from(payments)
       .where(eq(payments.paymentId, paymentId))
+      .limit(1);
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  // Issue #1039: resolve a dispute's payment/merchant so live dispute events
+  // that only carry `dispute_id` (e.g. `DISPUTE/VOTE_CAST`,
+  // `DISPUTE/AUTO_RESOLVED`) can still be routed to the right merchant's SSE
+  // stream and webhook endpoints.
+  async getDisputeById(disputeId: string): Promise<unknown | null> {
+    const rows = await this.db
+      .select({
+        dispute_id: disputes.disputeId,
+        payment_id: disputes.paymentId,
+        status: disputes.status,
+      })
+      .from(disputes)
+      .where(eq(disputes.disputeId, disputeId))
       .limit(1);
     return rows.length > 0 ? rows[0] : null;
   }
@@ -1007,6 +1106,8 @@ export class Database {
     to?: string;
     limit: number;
     cursor?: { createdAt: string; id: string };
+    // Issue #1035: filter to payments routed from a specific muxed sub-account.
+    payerMuxedId?: bigint;
   }): Promise<{ payments: Array<Record<string, unknown>>; total: number }> {
     const conditions = [eq(payments.merchantId, opts.merchantId)];
     if (opts.statuses && opts.statuses.length > 0) {
@@ -1017,6 +1118,9 @@ export class Database {
     }
     if (opts.to) {
       conditions.push(lte(payments.createdAt, new Date(opts.to)));
+    }
+    if (opts.payerMuxedId !== undefined) {
+      conditions.push(eq(payments.payerMuxedId, opts.payerMuxedId));
     }
     if (opts.cursor) {
       const cursorDate = new Date(opts.cursor.createdAt);
@@ -1046,6 +1150,7 @@ export class Database {
         status: payments.status,
         created_at: payments.createdAt,
         updated_at: payments.updatedAt,
+        payer_muxed_id: payments.payerMuxedId,
       })
       .from(payments)
       .where(and(...conditions))
