@@ -117,6 +117,51 @@ fn setup_subscription_env(
     (admin, client, merchant, usdc_token, payer, operator)
 }
 
+/// Shared helper for the payment-state-machine property tests (#1034).
+/// Spins up a fresh `PaymentProcessor`, grants merchant/oracle roles, and
+/// creates a single `Pending` payment for `amount` with `allow_partial` set
+/// as requested. No merchant registry is wired up, matching
+/// `setup_payment_processor` above, so partial-payment policy always
+/// resolves to "not allowed" when `allow_partial` is `false`.
+fn setup_pending_payment(
+    env: &Env,
+    amount: i128,
+    allow_partial: bool,
+) -> (Address, PaymentProcessorClient<'_>, String) {
+    let (admin, client) = setup_payment_processor(env);
+    let merchant = Address::generate(env);
+    let oracle = Address::generate(env);
+    client.grant_role(&admin, &role_merchant(env), &merchant);
+    client.grant_role(&admin, &role_oracle(env), &oracle);
+
+    let payment_id = format_id(env, "sm_prop_", 0u64);
+    let args = crate::CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(env, "USDC"),
+        deposit_address: Address::generate(env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        idempotency_key: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+        retry_of_payment_id: None,
+        payer_muxed_id: None,
+        allow_partial: Some(allow_partial),
+        tip_enabled: false,
+    };
+    client.create_payment(&args);
+
+    (oracle, client, payment_id)
+}
+
 proptest! {
     #[test]
     fn test_format_id_starts_with_prefix(n in 0u64..u64::MAX) {
@@ -957,6 +1002,182 @@ proptest! {
 
         let expected_total = (total_active_elapsed as i128).saturating_mul(rate);
         prop_assert_eq!(baseline_accrued, expected_total);
+    }
+
+    // ---- Issue #1034: payment state machine transition properties ----
+    //
+    // `payment_state_machine.rs` is the single source of truth for which
+    // `PaymentStatus` transitions are legal. These properties fuzz both the
+    // pure transition table directly and `verify_payment`'s use of it, so a
+    // change that silently allows (or forbids) a transition is caught here
+    // even if no discrete unit test happens to cover that exact pair.
+
+    /// Property: no invalid transitions. For every pair of `PaymentStatus`
+    /// variants, `validate_transition` must agree with the transition table
+    /// documented at the top of `payment_state_machine.rs` - it can never
+    /// accept an edge that isn't listed there, and never reject one that is.
+    #[test]
+    fn proptest_state_machine_matches_documented_transition_table(
+        from_idx in 0usize..8,
+        to_idx in 0usize..8,
+    ) {
+        use crate::PaymentStatus::*;
+
+        let statuses = [
+            Pending, Confirmed, Settled, Expired, Failed, PartiallyPaid, Overpaid, Disputed,
+        ];
+        let from = statuses[from_idx].clone();
+        let to = statuses[to_idx].clone();
+
+        // Mirrors the `| (From, To)` arms in `payment_state_machine::is_valid_transition`.
+        let documented_valid = matches!(
+            (&from, &to),
+            (Pending, Confirmed)
+                | (Pending, Expired)
+                | (Pending, Failed)
+                | (Pending, PartiallyPaid)
+                | (Pending, Overpaid)
+                | (PartiallyPaid, PartiallyPaid)
+                | (PartiallyPaid, Confirmed)
+                | (PartiallyPaid, Overpaid)
+                | (PartiallyPaid, Expired)
+                | (PartiallyPaid, Failed)
+                | (Confirmed, Settled)
+                | (Confirmed, Disputed)
+                | (Disputed, Settled)
+        );
+
+        let result = crate::payment_state_machine::validate_transition(from, to);
+        prop_assert_eq!(result.is_ok(), documented_valid);
+    }
+
+    /// Property: idempotency. Calling `verify_payment` a second time against
+    /// an already-`Confirmed` payment must return the same status and must
+    /// not re-accumulate `amount_received` or move `confirmed_at`, no matter
+    /// what amount, tx hash, or payer is passed the second time (Issue #75).
+    #[test]
+    fn proptest_verify_payment_confirmed_is_idempotent(
+        amount in 10i128..1_000_000i128,
+        second_amount in 0i128..1_000_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (oracle, client, payment_id) = setup_pending_payment(&env, amount, false);
+
+        let first_status = client.verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &amount,
+            &None,
+        );
+        prop_assert_eq!(first_status, PaymentStatus::Confirmed);
+
+        let after_first = client.get_payment(&payment_id);
+        prop_assert_eq!(after_first.status.clone(), PaymentStatus::Confirmed);
+        prop_assert_eq!(after_first.amount_received, Some(amount));
+
+        let second_status = client.verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &second_amount,
+            &None,
+        );
+        prop_assert_eq!(second_status, PaymentStatus::Confirmed);
+
+        let after_second = client.get_payment(&payment_id);
+        prop_assert_eq!(after_second.status, PaymentStatus::Confirmed);
+        prop_assert_eq!(after_second.amount_received, Some(amount));
+        prop_assert_eq!(after_second.confirmed_at, after_first.confirmed_at);
+    }
+
+    /// Property: monotonicity. A payment's `confirmed_at` (once set) is
+    /// always >= its `created_at`, and `created_at` never changes once the
+    /// payment exists, regardless of how far the ledger clock advances
+    /// before confirmation.
+    #[test]
+    fn proptest_payment_timestamps_non_decreasing(
+        amount in 10i128..1_000_000i128,
+        ledger_advance in 0u64..3000u64,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (oracle, client, payment_id) = setup_pending_payment(&env, amount, false);
+
+        let before = client.get_payment(&payment_id);
+        prop_assert!(before.confirmed_at.is_none());
+
+        let advanced_timestamp = env.ledger().timestamp() + ledger_advance;
+        env.ledger().set_timestamp(advanced_timestamp);
+
+        let status = client.verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &amount,
+            &None,
+        );
+        prop_assert_eq!(status, PaymentStatus::Confirmed);
+
+        let after = client.get_payment(&payment_id);
+        prop_assert_eq!(after.created_at, before.created_at);
+        let confirmed_at = after.confirmed_at.expect("Confirmed payment must set confirmed_at");
+        prop_assert!(confirmed_at >= after.created_at);
+    }
+
+    /// Property: conservation. In non-partial-payment mode `amount_received`
+    /// is never silently accumulated across calls the way it is when
+    /// `allow_partial = true` (Issue #767) - it always reflects exactly the
+    /// most recent `verify_payment` call, and once an under-payment settles
+    /// the payment into a terminal `Failed` state (no partial policy
+    /// configured), a later call is rejected rather than adding on top of
+    /// the first amount.
+    #[test]
+    fn proptest_non_partial_amount_received_is_not_accumulated(
+        amount in 1_000i128..1_000_000i128,
+        first_amount in 1i128..500i128,
+        second_amount in 1i128..500_000i128,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (oracle, client, payment_id) = setup_pending_payment(&env, amount, false);
+
+        // first_amount is well below `amount - PAYMENT_TOLERANCE`, so this
+        // call under-pays and (with no partial-payment policy configured)
+        // resolves to the terminal `Failed` status rather than `Confirmed`.
+        prop_assume!(first_amount < amount - PAYMENT_TOLERANCE);
+
+        let first_status = client.verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &first_amount,
+            &None,
+        );
+        prop_assert_eq!(first_status, PaymentStatus::Failed);
+
+        let after_first = client.get_payment(&payment_id);
+        prop_assert_eq!(after_first.amount_received, Some(first_amount));
+
+        // The payment is now terminal; a second attempt must be rejected
+        // and must not touch the stored amount_received.
+        let second_result = client.try_verify_payment(
+            &oracle,
+            &payment_id,
+            &BytesN::<32>::random(&env),
+            &Address::generate(&env),
+            &second_amount,
+            &None,
+        );
+        prop_assert!(second_result.is_err());
+
+        let after_second = client.get_payment(&payment_id);
+        prop_assert_eq!(after_second.amount_received, Some(first_amount));
     }
 }
 

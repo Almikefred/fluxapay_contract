@@ -181,24 +181,40 @@ Do not silently raise the baseline in an unrelated feature commit.
 
 ## 4a. Pre-commit Hooks
 
-We use [lefthook](https://github.com/evilmartians/lefthook) to run `cargo fmt`, `cargo clippy`, and TypeScript type checks before each commit.
+We use [lefthook](https://github.com/evilmartians/lefthook) to run `cargo fmt`, `cargo clippy`, TypeScript type checks, `eslint`, and secret scanning before each commit.
 
 ### Installation
 
 ```bash
-# Install lefthook (macOS / Linux)
+# Install lefthook (macOS / Linux) via Homebrew
 brew install lefthook
-# or via Go:
+
+# ...or via npm
+npm install -g lefthook
+
+# ...or via Go
 go install github.com/evilmartians/lefthook@latest
 
 # Install hooks for this repo
 lefthook install
 ```
 
+Secret scanning requires [`gitleaks`](https://github.com/gitleaks/gitleaks) on your `PATH`:
+
+```bash
+brew install gitleaks
+# or
+go install github.com/gitleaks/gitleaks/v8@latest
+```
+
+If `gitleaks` isn't installed, the hook prints a warning and skips the scan rather than blocking the commit -- CI still runs the full scan.
+
 ### What the hooks do
 
-- **pre-commit** (Rust files): runs `cargo fmt --check` and `cargo clippy --all-targets - -D warnings` on staged `.rs` files
-- *pre-commit** (TypeScript files): runs `npx tsc --noEmit` in `sdk/` on staged `.ts` files
+- **pre-commit** (Rust files): runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` on staged `.rs` files
+- **pre-commit** (TypeScript files): runs `npx tsc --noEmit` in `sdk/` on staged `.ts` files
+- **pre-commit** (TypeScript/TSX files in `sdk/`, `indexer/`, `backend/`, `dashboard/`): runs `npx eslint` on only the staged files
+- **pre-commit** (all staged files): runs `gitleaks protect --staged` to block commits that introduce secrets (API keys, private keys, tokens)
 
 ### Skipping hooks
 
@@ -265,6 +281,7 @@ Before marking a PR ready for review:
 - [ ] New features and bug fixes include tests
 - [ ] PR title follows Conventional Commits format
 - [ ] PR description explains *what* changed, *why*, and how it was tested
+- [ ] If your change affects the compiled contract (new dependency, new public function, large refactor), run `./scripts/update-wasm-baseline.sh` and commit the updated `.wasm-size-baseline` so the CI size gate compares against the right number
 
 ### Changelog Format
 

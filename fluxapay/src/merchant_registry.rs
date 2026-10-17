@@ -341,6 +341,10 @@ pub enum MerchantError {
     InvalidVersion = 14,
     /// Issue #1017: `reserve_bps` outside `0..=10_000`.
     InvalidReservePolicy = 15,
+    /// Issue #1014: Payment amount exceeds the merchant's KYC tier single-payment limit.
+    TierSingleLimitExceeded = 15,
+    /// Issue #1014: Payment would exceed the merchant's KYC tier monthly volume limit.
+    TierMonthlyLimitExceeded = 16,
 }
 
 #[cfg_attr(
@@ -1085,14 +1089,10 @@ impl MerchantRegistry {
             .persistent()
             .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "MERCHANT"),
-                Symbol::new(&env, "KYC_UPGRADED"),
-            ),
-            merchant_id.clone(),
-        );
-
+        // `emit_kyc_tier_upgraded` below already publishes MERCHANT/KYC_TIER_UPGRADED
+        // with (merchant_id, old_tier, new_tier) — issue #1015's requirement — so no
+        // separate inline publish is needed here (both prior attempts at one were
+        // redundant with it).
         crate::events::emit_kyc_tier_upgraded(&env, &merchant_id, &old_tier, &new_tier);
 
         Ok(())
@@ -2496,7 +2496,7 @@ impl MerchantRegistry {
         };
 
         if amount > max_single {
-            return Err(MerchantError::KycLimitExceeded);
+            return Err(MerchantError::TierSingleLimitExceeded);
         }
 
         if max_monthly != i128::MAX {
@@ -2506,11 +2506,55 @@ impl MerchantRegistry {
             let current_vol: i128 = env.storage().persistent().get(&key).unwrap_or(0);
             let new_vol = current_vol.saturating_add(amount);
             if new_vol > max_monthly {
-                return Err(MerchantError::KycLimitExceeded);
+                return Err(MerchantError::TierMonthlyLimitExceeded);
             }
             env.storage().persistent().set(&key, &new_vol);
             Self::bump_persistent_ttl(&env, &key, LONG_LIVE_TTL);
         }
+
+        Ok(())
+    }
+
+    /// Issue #1014: Cross-contract function for `verify_payment` to re-check the
+    /// KYC tier monthly volume cap against an *additional* amount (e.g. the
+    /// overpaid portion received on top of the originally invoiced amount,
+    /// which `create_payment`'s call to `check_kyc_limit` never accounted
+    /// for). On success, records `extra_amount` against the merchant's
+    /// current calendar month volume.
+    ///
+    /// Unlike `check_kyc_limit`, this does not re-check the per-payment
+    /// single-transaction limit — that was already enforced on the original
+    /// invoiced amount at `create_payment` time.
+    pub fn check_monthly_limit_only(
+        env: Env,
+        merchant_id: Address,
+        extra_amount: i128,
+    ) -> Result<(), MerchantError> {
+        if extra_amount <= 0 {
+            return Ok(());
+        }
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+
+        let max_monthly = match merchant.kyc_tier {
+            KycTier::Unverified => crate::TIER_0_MAX_MONTHLY,
+            KycTier::Basic => crate::TIER_1_MAX_MONTHLY,
+            KycTier::Full | KycTier::Business => crate::TIER_2_MAX_MONTHLY,
+        };
+
+        if max_monthly == i128::MAX {
+            return Ok(());
+        }
+
+        let (year, month) = Self::get_year_month(env.ledger().timestamp());
+        let month_code = year * 100 + month;
+        let key = MerchantDataKey::MerchantMonthlyVolume(merchant_id, month_code);
+        let current_vol: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_vol = current_vol.saturating_add(extra_amount);
+        if new_vol > max_monthly {
+            return Err(MerchantError::TierMonthlyLimitExceeded);
+        }
+        env.storage().persistent().set(&key, &new_vol);
+        Self::bump_persistent_ttl(&env, &key, LONG_LIVE_TTL);
 
         Ok(())
     }

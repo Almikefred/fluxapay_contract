@@ -1870,6 +1870,166 @@ fn test_process_refund_sends_fee_to_admin() {
     assert_eq!(token_client.balance(&admin), fee);
 }
 
+// ── Issue #1016: Tiered refund fee enforcement based on merchant KYC tier ────
+
+/// Sets up a RefundManager wired to a MerchantRegistry, with a merchant
+/// already registered and placed at the given KYC tier.
+fn setup_refund_manager_with_tier<'a>(
+    env: &'a Env,
+    tier: &crate::merchant_registry::KycTier,
+) -> (
+    Address,
+    RefundManagerClient<'a>,
+    Address,
+    Address,
+) {
+    let (admin, client, usdc_token) = setup_refund_manager_with_token(env);
+
+    let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+    let registry_client =
+        crate::merchant_registry::MerchantRegistryClient::new(env, &registry_contract);
+    registry_client.initialize(&admin);
+
+    client.set_merchant_registry_address(&admin, &registry_contract);
+
+    let merchant = Address::generate(env);
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(env, "Tiered Fee Test Merchant"),
+        &String::from_str(env, "USDC"),
+        &None::<Address>,
+        &None::<String>,
+        &None,
+    );
+    registry_client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant,
+        tier,
+        &Some(String::from_str(env, "sig")),
+    );
+
+    (admin, client, usdc_token, merchant)
+}
+
+/// Extracts the `fee_bps` field (4th element) from the most recently emitted
+/// `REFUND/COMPLETED` event's data payload.
+fn last_refund_completed_fee_bps(env: &Env) -> i128 {
+    let events = env.events().all();
+    let completed = events
+        .iter()
+        .rev()
+        .find(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+            if topics.len() < 2 {
+                return false;
+            }
+            let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(env);
+            let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(env);
+            matches!(
+                (t0, t1),
+                (Ok(a), Ok(b))
+                    if a == Symbol::new(env, "REFUND") && b == Symbol::new(env, "COMPLETED")
+            )
+        })
+        .expect("expected a REFUND/COMPLETED event");
+
+    let data: (String, String, i128, i128) = completed.2.clone().try_into_val(env).unwrap();
+    data.3
+}
+
+#[test]
+fn test_process_refund_applies_basic_tier_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token, merchant) =
+        setup_refund_manager_with_tier(&env, &crate::merchant_registry::KycTier::Basic);
+
+    let payment_id = String::from_str(&env, "payment_tier_basic");
+    let refund_amount = 10_000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(&payment_id, &merchant, &refund_amount, &Symbol::new(&env, "USDC"));
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "basic tier fee test"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    let token_client = token::TokenClient::new(&env, &usdc_token);
+    let fee = refund_amount * REFUND_FEE_BPS_BASIC / 10_000; // 1.0%
+    assert_eq!(fee, 100i128);
+    assert_eq!(token_client.balance(&requester), refund_amount - fee);
+    assert_eq!(client.get_treasury_balance(), fee);
+    assert_eq!(last_refund_completed_fee_bps(&env), REFUND_FEE_BPS_BASIC);
+}
+
+#[test]
+fn test_process_refund_applies_full_tier_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token, merchant) =
+        setup_refund_manager_with_tier(&env, &crate::merchant_registry::KycTier::Full);
+
+    let payment_id = String::from_str(&env, "payment_tier_full");
+    let refund_amount = 10_000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(&payment_id, &merchant, &refund_amount, &Symbol::new(&env, "USDC"));
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "full tier fee test"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    let token_client = token::TokenClient::new(&env, &usdc_token);
+    let fee = refund_amount * REFUND_FEE_BPS_FULL / 10_000; // 0.8%
+    assert_eq!(fee, 80i128);
+    assert_eq!(token_client.balance(&requester), refund_amount - fee);
+    assert_eq!(client.get_treasury_balance(), fee);
+    assert_eq!(last_refund_completed_fee_bps(&env), REFUND_FEE_BPS_FULL);
+}
+
+#[test]
+fn test_process_refund_applies_business_tier_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token, merchant) =
+        setup_refund_manager_with_tier(&env, &crate::merchant_registry::KycTier::Business);
+
+    let payment_id = String::from_str(&env, "payment_tier_business");
+    let refund_amount = 10_000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(&payment_id, &merchant, &refund_amount, &Symbol::new(&env, "USDC"));
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "business tier fee test"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    let token_client = token::TokenClient::new(&env, &usdc_token);
+    let fee = refund_amount * REFUND_FEE_BPS_BUSINESS / 10_000; // 0.5%
+    assert_eq!(fee, 50i128);
+    assert_eq!(token_client.balance(&requester), refund_amount - fee);
+    assert_eq!(client.get_treasury_balance(), fee);
+    assert_eq!(last_refund_completed_fee_bps(&env), REFUND_FEE_BPS_BUSINESS);
+}
+
 #[test]
 fn test_cancel_refund_by_requester() {
     let env = Env::default();

@@ -23,6 +23,20 @@ export interface PaymentEvent extends ContractEvent {
   };
 }
 
+/**
+ * Issue #1037: Emitted by both `create_payment` (when called with
+ * `retry_of_payment_id`) and `retry_payment` when a new payment is linked to
+ * an expired/failed original. Payload is a positional 2-tuple, not the usual
+ * named-field map, matching the on-chain `env.events().publish(topic, (a, b))` call.
+ */
+export interface PaymentRetryCreatedEvent extends ContractEvent {
+  topic: ["PAYMENT", "RETRY_CREATED"];
+  value: {
+    original_payment_id: string;
+    new_payment_id: string;
+  };
+}
+
 export interface PaymentFeeEvent extends ContractEvent {
   topic: ["PAYMENT", "FEE_TOTAL"];
   value: {
@@ -122,6 +136,29 @@ export interface InvoiceEvent extends ContractEvent {
   };
 }
 
+/**
+ * Emitted by `PaymentProcessor::settle_payment` when the settled merchant
+ * has an `AnchorConfig` on file (see `merchant_registry.rs`). Consumed by
+ * `SettlementService` (`settlement.ts`) to drive the SEP-6/SEP-24
+ * USDC-to-fiat offramp. Topics carry `merchant_id` and `anchor_domain` in
+ * addition to the type/action pair, so this event is decoded separately
+ * from the generic `scValToObject` path — see `tryParseAnchorWithdraw` in
+ * `index.ts`.
+ */
+export interface SettlementAnchorWithdrawEvent extends ContractEvent {
+  topic: ["PAYMENT", "ANCHOR_WITHDRAW"];
+  value: {
+    payment_id: string;
+    amount: number;
+    currency: string;
+    payout_address: string;
+    sep6_endpoint: string;
+    sep24_endpoint: string;
+    supported_currencies: string[];
+    ledger_timestamp: number;
+  };
+}
+
 export interface FXOracleEvent extends ContractEvent {
   topic: ["FX_ORACLE" | "ORACLE" | "FX_RATE", "UPDATED" | "SET" | "REMOVED"];
   value: {
@@ -178,9 +215,9 @@ export type PaymentLinkEvent =
   | LinkDeactivatedEvent
   | LinkExpiredEvent
   | LinkViewedEvent;
-
 export type AnyEvent =
   | PaymentEvent
+  | PaymentRetryCreatedEvent
   | PaymentFeeEvent
   | RefundEvent
   | DisputeEvent
@@ -189,5 +226,6 @@ export type AnyEvent =
   | StreamEvent
   | SubscriptionEvent
   | InvoiceEvent
+  | SettlementAnchorWithdrawEvent;
   | FXOracleEvent
   | PaymentLinkEvent;

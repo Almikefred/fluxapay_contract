@@ -1111,6 +1111,117 @@ impl RefundManager {
         page
     }
 
+    /// Issue #1013: amount (in the token's smallest unit) below which
+    /// `withdraw_treasury` may still be executed by a single admin without
+    /// multisig approval, when no explicit threshold has been configured via
+    /// `set_treasury_single_admin_threshold`. Assumes a 7-decimal USDC-style
+    /// token: 1000 * 10^7.
+    pub const DEFAULT_TREASURY_SINGLE_ADMIN_THRESHOLD: i128 = 10_000_000_000;
+
+    /// Admin-only: configure the amount below which `withdraw_treasury` may
+    /// bypass multisig governance. Withdrawals above this amount must go
+    /// through `propose_treasury_withdrawal` / `approve_treasury_withdrawal`
+    /// / `execute_treasury_withdrawal` instead.
+    pub fn set_treasury_single_admin_threshold(
+        env: Env,
+        admin: Address,
+        threshold: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if threshold < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::TreasurySingleAdminThreshold, &threshold);
+        Ok(())
+    }
+
+    /// The current single-admin withdrawal threshold, falling back to
+    /// `DEFAULT_TREASURY_SINGLE_ADMIN_THRESHOLD` when unset.
+    pub fn get_treasury_single_admin_threshold(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TreasurySingleAdminThreshold)
+            .unwrap_or(Self::DEFAULT_TREASURY_SINGLE_ADMIN_THRESHOLD)
+    }
+
+    /// Admin-only: add a new authorized treasury multisig signer.
+    pub fn add_treasury_signer(env: Env, admin: Address, signer: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        let mut config: TreasuryMultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryMultisigConfig)
+            .ok_or(Error::TreasuryMultisigNotConfigured)?;
+
+        if config.admin_signers.iter().any(|s| s == signer) {
+            return Ok(()); // Already a signer; idempotent no-op.
+        }
+        if config.admin_signers.len() >= MAX_TREASURY_SIGNERS {
+            return Err(Error::InvalidTreasuryThreshold);
+        }
+        config.admin_signers.push_back(signer.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::TreasuryMultisigConfig, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "TREASURY"), Symbol::new(&env, "SIGNER_ADDED")),
+            signer,
+        );
+        Ok(())
+    }
+
+    /// Admin-only: remove an authorized treasury multisig signer. Rejected if
+    /// removing the signer would drop the signer count below
+    /// `required_approvals`, which would make the quorum unreachable.
+    pub fn remove_treasury_signer(env: Env, admin: Address, signer: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        let mut config: TreasuryMultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryMultisigConfig)
+            .ok_or(Error::TreasuryMultisigNotConfigured)?;
+
+        if !config.admin_signers.iter().any(|s| s == signer) {
+            return Err(Error::NotAuthorizedTreasurySigner);
+        }
+        if config.admin_signers.len().saturating_sub(1) < config.required_approvals {
+            return Err(Error::InvalidTreasuryThreshold);
+        }
+
+        let mut remaining: Vec<Address> = vec![&env];
+        for s in config.admin_signers.iter() {
+            if s != signer {
+                remaining.push_back(s);
+            }
+        }
+        config.admin_signers = remaining;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TreasuryMultisigConfig, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "TREASURY"), Symbol::new(&env, "SIGNER_REMOVED")),
+            signer,
+        );
+        Ok(())
+    }
+
+    /// Admin withdrawal of accumulated treasury fees, bypassing multisig
+    /// governance. Issue #1013: only amounts at or below the configured
+    /// single-admin threshold may use this path — larger withdrawals must go
+    /// through `propose_treasury_withdrawal` and collect M-of-N approvals.
     pub fn withdraw_treasury(
         env: Env,
         admin: Address,
@@ -1124,6 +1235,9 @@ impl RefundManager {
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+        if amount > Self::get_treasury_single_admin_threshold(env.clone()) {
+            return Err(Error::TreasuryExceedsSingleAdminThreshold);
         }
 
         let usdc_token_address: Address = env
