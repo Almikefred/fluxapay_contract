@@ -122,6 +122,29 @@ export interface InvoiceEvent extends ContractEvent {
   };
 }
 
+/**
+ * Emitted by `PaymentProcessor::settle_payment` when the settled merchant
+ * has an `AnchorConfig` on file (see `merchant_registry.rs`). Consumed by
+ * `SettlementService` (`settlement.ts`) to drive the SEP-6/SEP-24
+ * USDC-to-fiat offramp. Topics carry `merchant_id` and `anchor_domain` in
+ * addition to the type/action pair, so this event is decoded separately
+ * from the generic `scValToObject` path — see `tryParseAnchorWithdraw` in
+ * `index.ts`.
+ */
+export interface SettlementAnchorWithdrawEvent extends ContractEvent {
+  topic: ["PAYMENT", "ANCHOR_WITHDRAW"];
+  value: {
+    payment_id: string;
+    amount: number;
+    currency: string;
+    payout_address: string;
+    sep6_endpoint: string;
+    sep24_endpoint: string;
+    supported_currencies: string[];
+    ledger_timestamp: number;
+  };
+}
+
 export interface FXOracleEvent extends ContractEvent {
   topic: ["FX_ORACLE" | "ORACLE" | "FX_RATE", "UPDATED" | "SET" | "REMOVED"];
   value: {
@@ -178,7 +201,6 @@ export type PaymentLinkEvent =
   | LinkDeactivatedEvent
   | LinkExpiredEvent
   | LinkViewedEvent;
-
 export type AnyEvent =
   | PaymentEvent
   | PaymentFeeEvent
@@ -189,5 +211,6 @@ export type AnyEvent =
   | StreamEvent
   | SubscriptionEvent
   | InvoiceEvent
+  | SettlementAnchorWithdrawEvent;
   | FXOracleEvent
   | PaymentLinkEvent;
