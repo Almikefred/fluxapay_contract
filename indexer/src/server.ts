@@ -143,6 +143,8 @@ const paymentsQuerySchema = z.object({
   to: isoDateString.optional(),
   limit: z.coerce.number().int().min(1).max(100).optional().default(50),
   cursor: z.string().max(512).optional(),
+  // Issue #1035: filter to payments routed from a specific muxed sub-account.
+  payer_muxed_id: z.coerce.bigint().optional(),
 });
 
 const subscriptionMetricsQuerySchema = z.object({
@@ -462,29 +464,6 @@ export function createServer(
       return;
     }
 
-        const data = await database.getReconciliationData(
-          merchantId,
-          range.start,
-          range.endExclusive
-        );
-        const report = buildReconciliationReport(
-          data,
-          req.query.from as string,
-          req.query.to as string
-        );
-
-        if (req.headers.accept?.includes("text/csv")) {
-          res.status(200).type("text/csv").send(buildReconciliationCsv(report as Record<string, any>));
-          return;
-        }
-
-        res.status(200).json(report);
-      } catch (error) {
-        next(error);
-      }
-    }
-  );
-
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -497,8 +476,15 @@ export function createServer(
         ? req.query.event_types.split(",").map((s) => s.trim())
         : undefined;
 
+    // Issue #1039: optional narrowing to one payment's or dispute's events,
+    // e.g. `?dispute_id=disp_1` from a dispute detail page.
+    const paymentId =
+      typeof req.query.payment_id === "string" ? req.query.payment_id : undefined;
+    const disputeId =
+      typeof req.query.dispute_id === "string" ? req.query.dispute_id : undefined;
+
     const clientId = `${merchantId}-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    sseManager.registerClient(clientId, merchantId, res, eventTypes);
+    sseManager.registerClient(clientId, merchantId, res, eventTypes, { paymentId, disputeId });
 
     req.on("close", () => {
       sseManager.removeClient(clientId);
@@ -674,7 +660,7 @@ export function createServer(
         return;
       }
 
-      const { merchant_id, status, from, to, limit, cursor } = parsed.data;
+      const { merchant_id, status, from, to, limit, cursor, payer_muxed_id } = parsed.data;
 
       const subject = req.auth?.sub;
       if (!subject) {
@@ -702,6 +688,7 @@ export function createServer(
         to,
         limit,
         cursor: decodedCursor ?? undefined,
+        payerMuxedId: payer_muxed_id,
       });
 
       const nextCursor =

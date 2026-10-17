@@ -11,6 +11,17 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+/// Issue #1024: Shared refund-fee helper for `process_refund` /
+/// `process_refund_direct`. Previously each call site computed
+/// `refund_amount * fee_bps / 10_000` inline with the plain (non-saturating)
+/// `*` operator. `fee_bps` is always admin-bounded to 0..=1000 via
+/// `set_refund_fee_bps`, but `refund_amount` is an unconstrained `i128` read
+/// back from storage, so an implausibly large stored amount could overflow
+/// the multiplication and panic. This saturates instead.
+pub fn compute_refund_fee(refund_amount: i128, fee_bps: i128) -> i128 {
+    refund_amount.saturating_mul(fee_bps) / BPS_DENOMINATOR
+}
+
 #[contract]
 pub struct RefundManager;
 
@@ -97,6 +108,18 @@ impl RefundManager {
             .persistent()
             .get(&DataKey::DisputeBondAmount)
             .unwrap_or(DISPUTE_BOND_AMOUNT)
+    }
+
+    /// Issue #1024 / #820: Proportional minimum dispute bond for a disputed
+    /// payment of `disputed_amount` — `max(ABSOLUTE_MIN_BOND, disputed_amount
+    /// * MIN_BOND_BPS / BPS_DENOMINATOR)`. These constants (issue #820) were
+    /// previously declared but never read anywhere; this is the first
+    /// consumer. Saturates and clamps rather than panicking for extreme or
+    /// negative `disputed_amount` values — a non-positive amount simply
+    /// yields the absolute floor.
+    pub fn min_bond_for(_env: Env, disputed_amount: i128) -> i128 {
+        let proportional = disputed_amount.max(0).saturating_mul(MIN_BOND_BPS) / BPS_DENOMINATOR;
+        proportional.max(ABSOLUTE_MIN_BOND)
     }
 
     /// Admin-only: set an arbitrary on-chain metadata entry (issue #667), e.g. a
@@ -1818,7 +1841,7 @@ impl RefundManager {
             default_fee_bps
         };
 
-        let fee = refund.amount * fee_bps / 10_000;
+        let fee = compute_refund_fee(refund.amount, fee_bps);
         let net_amount = refund.amount - fee;
 
         // Issue #173: Multi-token swap refund router
@@ -2188,7 +2211,7 @@ impl RefundManager {
         let token_client = token::TokenClient::new(&env, &usdc_token_address);
 
         let default_fee_bps = Self::get_refund_fee_bps_internal(&env);
-        let fee = refund_amount * default_fee_bps / 10_000;
+        let fee = compute_refund_fee(refund_amount, default_fee_bps);
         let net_amount = refund_amount - fee;
 
         let mut refund = Self::get_refund_internal(&env, &refund_id)?;

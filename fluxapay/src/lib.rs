@@ -9627,6 +9627,9 @@ impl PaymentProcessor {
         };
 
         // Issue #166: Optimize event topics for efficient indexing
+        // Issue #1035: include payer_muxed_id (None for non-muxed payers) so
+        // downstream consumers (indexer, webhooks) can route confirmation to
+        // the correct sub-account without a separate lookup.
         // Issue #1025: Payload now also carries `tip_amount` (None if tipping wasn't
         // enabled or the payer chose not to tip) so downstream consumers (indexer,
         // reconciliation) can break the tip out from the base amount.
@@ -9635,6 +9638,12 @@ impl PaymentProcessor {
                 Symbol::new(&env, "PAYMENT"),
                 event_name,
                 payment.merchant_id.clone(),
+            ),
+            (
+                payment_id.clone(),
+                payment.amount,
+                amount_received,
+                payment.payer_muxed_id,
             ),
             (payment_id.clone(), payment.amount, amount_received, payment.tip_amount),
         );
