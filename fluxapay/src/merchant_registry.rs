@@ -222,6 +222,11 @@ pub struct Merchant {
     /// Global payment tolerance in basis points for this merchant.
     pub resolved_against_count: u32,
     pub payment_tolerance: Option<i128>,
+    /// Issue #1017: Rolling reserve policy. When set, `settle_payment`
+    /// withholds `reserve_bps` of each settlement for `holding_period_secs`
+    /// before it is available to sweep via `trigger_settlement`. `None`
+    /// means no reserve is withheld (the default).
+    pub reserve_policy: Option<RollingReservePolicy>,
 }
 
 #[contracttype]
@@ -267,6 +272,12 @@ pub enum MerchantDataKey {
     MerchantMonthlyVolume(Address, u32),
     /// Stored semantic contract version. Appended to preserve existing key discriminants.
     ContractVersion,
+    /// Issue #1017: FIFO queue of rolling-reserve buckets currently held for a merchant.
+    MerchantReserveBuckets(Address),
+    /// Issue #1017: Running total of reserve currently locked (unreleased) for a merchant.
+    MerchantReserveLocked(Address),
+    /// Issue #1017: Monotonic reserve bucket id counter, unique per merchant.
+    MerchantReserveBucketCounter(Address),
 }
 
 /// ~3 years at 5s/ledger — mirrors `LONG_LIVE_TTL` in lib.rs (issue #667).
@@ -328,6 +339,8 @@ pub enum MerchantError {
     KycLimitExceeded = 12,
     PageSizeTooLarge = 13,
     InvalidVersion = 14,
+    /// Issue #1017: `reserve_bps` outside `0..=10_000`.
+    InvalidReservePolicy = 15,
 }
 
 #[cfg_attr(
@@ -586,6 +599,7 @@ impl MerchantRegistry {
             lost_disputes_count: 0,
             resolved_against_count: 0,
             payment_tolerance: None,
+            reserve_policy: None,
         };
 
         env.storage()
@@ -2538,5 +2552,192 @@ impl MerchantRegistry {
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         let y = if m <= 2 { y + 1 } else { y };
         (y as u32, m)
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Issue #1017: Merchant rolling reserve                              */
+    /* ------------------------------------------------------------------ */
+
+    /// Admin-only: set, update, or clear (pass `None`) a merchant's rolling
+    /// reserve policy. When set, `PaymentProcessor::settle_payment` withholds
+    /// `policy.reserve_bps` of each settlement for `policy.holding_period_secs`
+    /// before it becomes available to sweep.
+    #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
+    pub fn set_reserve_policy(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+        policy: Option<RollingReservePolicy>,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        if let Some(ref p) = policy {
+            if p.reserve_bps > 10_000 {
+                return Err(MerchantError::InvalidReservePolicy);
+            }
+        }
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.reserve_policy = policy.clone();
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "RESERVE_POLICY_UPDATED"),
+            ),
+            (merchant_id, policy),
+        );
+
+        Ok(())
+    }
+
+    /// Read a merchant's configured rolling reserve policy, if any.
+    pub fn get_reserve_policy(
+        env: Env,
+        merchant_id: Address,
+    ) -> Option<RollingReservePolicy> {
+        Self::get_merchant_internal(&env, &merchant_id)
+            .ok()
+            .and_then(|m| m.reserve_policy)
+    }
+
+    /// Called by `PaymentProcessor::settle_payment` to lock `amount` of a
+    /// merchant's settlement proceeds in a new reserve bucket maturing at
+    /// `unlock_at`. Only the registered PaymentProcessor contract may call this.
+    pub fn lock_reserve(
+        env: Env,
+        caller: Address,
+        merchant_id: Address,
+        amount: i128,
+        unlock_at: u64,
+    ) -> Result<u64, MerchantError> {
+        caller.require_auth();
+        let payment_processor: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::PaymentProcessorAddress)
+            .ok_or(MerchantError::Unauthorized)?;
+        if caller != payment_processor {
+            return Err(MerchantError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        let counter_key = MerchantDataKey::MerchantReserveBucketCounter(merchant_id.clone());
+        let bucket_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0u64)
+            .saturating_add(1);
+        env.storage().persistent().set(&counter_key, &bucket_id);
+
+        let bucket = RollingReserveBucket {
+            bucket_id,
+            amount,
+            unlock_at,
+            created_at: env.ledger().timestamp(),
+        };
+
+        let buckets_key = MerchantDataKey::MerchantReserveBuckets(merchant_id.clone());
+        let mut buckets: Vec<RollingReserveBucket> = env
+            .storage()
+            .persistent()
+            .get(&buckets_key)
+            .unwrap_or_else(|| vec![&env]);
+        buckets.push_back(bucket);
+        env.storage().persistent().set(&buckets_key, &buckets);
+
+        let locked_key = MerchantDataKey::MerchantReserveLocked(merchant_id);
+        let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&locked_key, &locked.saturating_add(amount));
+
+        Ok(bucket_id)
+    }
+
+    /// Release every matured (`unlock_at <= now`) reserve bucket for a
+    /// merchant, moving their total into the merchant's pending settlement
+    /// balance so the next `trigger_settlement` sweep pays it out. Intended
+    /// to be invoked (directly or via `PaymentProcessor::release_merchant_reserve`)
+    /// on a schedule by an off-chain release daemon. Only the registered
+    /// PaymentProcessor contract may call this, matching `lock_reserve`.
+    #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
+    pub fn release_reserve(
+        env: Env,
+        caller: Address,
+        merchant_id: Address,
+    ) -> Result<i128, MerchantError> {
+        caller.require_auth();
+        let payment_processor: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::PaymentProcessorAddress)
+            .ok_or(MerchantError::Unauthorized)?;
+        if caller != payment_processor {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        let buckets_key = MerchantDataKey::MerchantReserveBuckets(merchant_id.clone());
+        let buckets: Vec<RollingReserveBucket> = env
+            .storage()
+            .persistent()
+            .get(&buckets_key)
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut remaining: Vec<RollingReserveBucket> = vec![&env];
+        let mut released: i128 = 0;
+        for bucket in buckets.iter() {
+            if bucket.unlock_at <= now {
+                released = released.saturating_add(bucket.amount);
+            } else {
+                remaining.push_back(bucket.clone());
+            }
+        }
+
+        if released > 0 {
+            env.storage().persistent().set(&buckets_key, &remaining);
+
+            let locked_key = MerchantDataKey::MerchantReserveLocked(merchant_id.clone());
+            let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&locked_key, &locked.saturating_sub(released));
+
+            Self::add_pending_settlement(&env, &merchant_id, released);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "MERCHANT"),
+                    Symbol::new(&env, "RESERVE_RELEASED"),
+                ),
+                (merchant_id, released),
+            );
+        }
+
+        Ok(released)
+    }
+
+    /// Total reserve currently locked (unreleased) for a merchant.
+    pub fn get_locked_reserve(env: Env, merchant_id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&MerchantDataKey::MerchantReserveLocked(merchant_id))
+            .unwrap_or(0)
     }
 }
