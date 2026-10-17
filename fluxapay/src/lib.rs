@@ -84,6 +84,8 @@ pub(crate) const ZERO_CONTRACT_STRKEY: &str =
 pub mod constants;
 pub mod data_keys;
 pub mod gas_estimator;
+/// Issues #1026/#1027: on-chain Merkle batch payment proof verifier.
+pub mod merkle_distributor;
 pub mod merchant_registry;
 pub mod payment_processor;
 pub mod refund_manager;
@@ -8276,6 +8278,14 @@ impl PaymentProcessor {
                 crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
             match registry_client.try_check_kyc_limit(&args.merchant_id, &args.amount) {
                 Ok(Ok(())) => {}
+                // Issue #1014: surface which specific tier limit tripped
+                // instead of a single generic error.
+                Err(Ok(crate::merchant_registry::MerchantError::TierSingleLimitExceeded)) => {
+                    return Err(Error::ExceedsTierSingleLimit);
+                }
+                Err(Ok(crate::merchant_registry::MerchantError::TierMonthlyLimitExceeded)) => {
+                    return Err(Error::ExceedsTierMonthlyLimit);
+                }
                 Err(Ok(crate::merchant_registry::MerchantError::KycLimitExceeded)) => {
                     return Err(Error::KycLimitExceeded);
                 }
@@ -9247,6 +9257,37 @@ impl PaymentProcessor {
             // Meaningfully less than expected → PartiallyPaid
             PaymentStatus::PartiallyPaid
         };
+
+        // Issue #1014: `create_payment` already enforced the KYC tier monthly
+        // volume cap against the originally invoiced `payment.amount`. An
+        // Overpaid confirmation receives *more* than that, so re-check (and
+        // record) only the extra portion here against the merchant's
+        // monthly cap — avoids double-counting the invoiced amount while
+        // still closing the gap where an overpayment could push a merchant
+        // over their tier's monthly limit unnoticed.
+        if new_status == PaymentStatus::Overpaid {
+            let extra = total_received.saturating_sub(payment.amount);
+            if extra > 0 {
+                if let Some(registry_address) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+                {
+                    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(
+                        &env,
+                        &registry_address,
+                    );
+                    match registry_client
+                        .try_check_monthly_limit_only(&payment.merchant_id, &extra)
+                    {
+                        Err(Ok(crate::merchant_registry::MerchantError::TierMonthlyLimitExceeded)) => {
+                            return Err(Error::ExceedsTierMonthlyLimit);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         payment.status = new_status.clone();
 
@@ -13492,6 +13533,198 @@ impl PaymentProcessor {
     ) -> Option<meta_transaction::RefundAuthorization> {
         meta_transaction::get_refund_authorization(&env, &merchant, &payment_id)
     }
+
+    // ========================================================================
+    // Issues #1026 / #1027: Merkle batch payment proof verifier.
+    // See `merkle_distributor` for the hashing scheme and rationale. These
+    // methods live in this impl block (rather than a separate `impl
+    // PaymentProcessor` block in that module) so they become part of the
+    // single generated `PaymentProcessorClient`.
+    // ========================================================================
+
+    /// Create a new Merkle-root batch distribution. Pulls `total_amount` of
+    /// `token` from `creator` into contract custody. Emits
+    /// `MERKLE/DISTRIBUTION_CREATED` and returns the new `distribution_id`.
+    pub fn create_batch(
+        env: Env,
+        creator: Address,
+        token: Address,
+        merkle_root: BytesN<32>,
+        total_amount: i128,
+        leaf_count: u32,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        creator.require_auth();
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if leaf_count == 0 || leaf_count > merkle_distributor::MAX_MERKLE_BATCH_LEAVES {
+            return Err(Error::InvalidMerkleLeafCount);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidExpiry);
+        }
+
+        let counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleDistributionCounter)
+            .unwrap_or(0);
+        let distribution_id = counter + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistributionCounter, &distribution_id);
+
+        // Pull funds into escrow before recording the distribution so a
+        // failed transfer never leaves a funded-looking record behind.
+        let token_client = token::TokenClient::new(&env, &token);
+        token_client.transfer(&creator, &env.current_contract_address(), &total_amount);
+
+        let distribution = MerkleDistribution {
+            distribution_id,
+            creator: creator.clone(),
+            token: token.clone(),
+            merkle_root: merkle_root.clone(),
+            total_amount,
+            claimed_amount: 0,
+            leaf_count,
+            expires_at,
+            defunded: false,
+            claimed_bitmap: merkle_distributor::new_claim_bitmap(&env, leaf_count),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistribution(distribution_id), &distribution);
+
+        events::emit_merkle_distribution_created(
+            &env,
+            distribution_id,
+            &creator,
+            &token,
+            &merkle_root,
+            total_amount,
+            leaf_count,
+            expires_at,
+        );
+
+        Ok(distribution_id)
+    }
+
+    /// Claim a recipient's allocation from a batch distribution.
+    ///
+    /// Verifies that `(index, recipient, amount)` is included under the
+    /// distribution's stored Merkle root via `proof`, enforces one claim per
+    /// `(distribution_id, index)`, and transfers `amount` to `recipient` on
+    /// success. Emits `MERKLE/CLAIMED`.
+    pub fn claim_batch_payment(
+        env: Env,
+        distribution_id: u64,
+        index: u32,
+        recipient: Address,
+        amount: i128,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let mut distribution = Self::get_batch(env.clone(), distribution_id)?;
+
+        if distribution.defunded {
+            return Err(Error::MerkleDistributionAlreadyDefunded);
+        }
+        if env.ledger().timestamp() > distribution.expires_at {
+            return Err(Error::MerkleDistributionExpired);
+        }
+        if index >= distribution.leaf_count {
+            return Err(Error::InvalidMerkleProof);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if proof.len() > merkle_distributor::MAX_PROOF_LEN {
+            return Err(Error::InvalidMerkleProof);
+        }
+        if merkle_distributor::is_claimed_bit(&distribution.claimed_bitmap, index) {
+            return Err(Error::MerkleAlreadyClaimed);
+        }
+
+        let computed_root = merkle_distributor::compute_merkle_root(
+            &env,
+            index,
+            &recipient,
+            amount,
+            &distribution.token,
+            &proof,
+        );
+        if computed_root != distribution.merkle_root {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        let new_claimed = distribution.claimed_amount.saturating_add(amount);
+        if new_claimed > distribution.total_amount {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        distribution.claimed_amount = new_claimed;
+        merkle_distributor::set_claimed_bit(&mut distribution.claimed_bitmap, index);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistribution(distribution_id), &distribution);
+
+        let token_client = token::TokenClient::new(&env, &distribution.token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        events::emit_merkle_claimed(&env, distribution_id, index, &recipient, amount);
+
+        Ok(())
+    }
+
+    /// After `expires_at`, the distribution's creator reclaims any unclaimed
+    /// balance. Emits `MERKLE/DEFUNDED` and returns the refunded amount.
+    pub fn defund_batch(env: Env, creator: Address, distribution_id: u64) -> Result<i128, Error> {
+        creator.require_auth();
+
+        let mut distribution = Self::get_batch(env.clone(), distribution_id)?;
+
+        if distribution.creator != creator {
+            return Err(Error::Unauthorized);
+        }
+        if distribution.defunded {
+            return Err(Error::MerkleDistributionAlreadyDefunded);
+        }
+        if env.ledger().timestamp() <= distribution.expires_at {
+            return Err(Error::MerkleDistributionNotExpired);
+        }
+
+        let refund = distribution
+            .total_amount
+            .saturating_sub(distribution.claimed_amount);
+        distribution.defunded = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleDistribution(distribution_id), &distribution);
+
+        if refund > 0 {
+            let token_client = token::TokenClient::new(&env, &distribution.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &refund);
+        }
+
+        events::emit_merkle_defunded(&env, distribution_id, &creator, refund);
+
+        Ok(refund)
+    }
+
+    /// View: fetch a batch distribution's metadata.
+    pub fn get_batch(env: Env, distribution_id: u64) -> Result<MerkleDistribution, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerkleDistribution(distribution_id))
+            .ok_or(Error::MerkleDistributionNotFound)
+    }
+
+    /// View: has the allocation at `index` in `distribution_id` been claimed?
+    pub fn is_batch_claimed(env: Env, distribution_id: u64, index: u32) -> Result<bool, Error> {
+        let distribution = Self::get_batch(env, distribution_id)?;
+        Ok(merkle_distributor::is_claimed_bit(&distribution.claimed_bitmap, index))
+    }
 }
 
 /// Bumps the version string by incrementing the number after the last '.'.
@@ -13648,3 +13881,5 @@ mod subscription_test;
 #[cfg(test)] mod merchant_auth_test;
 #[cfg(test)] mod account_abstraction_test;
 #[cfg(test)] mod meta_transaction_test;
+#[cfg(test)] mod merkle_distributor_test;
+#[cfg(test)] mod treasury_single_admin_threshold_test;
