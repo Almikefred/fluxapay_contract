@@ -128,3 +128,27 @@ const signature = signMetaTransaction(payload, merchant);
 
 The relayer then calls `execute_meta_transaction` with `payload` and the
 64-byte `signature`.
+
+## Issue #1020: replay-hardening audit
+
+This section documents an audit of the replay-protection properties
+requested in Issue #1020, against the implementation in
+`fluxapay/src/meta_transaction.rs`.
+
+| Requested hardening | Status | Where |
+| --- | --- | --- |
+| Signed message binds the contract address | **Already enforced** | `domain_separator` hashes `contract_id_hash` (derived from `env.current_contract_address()`) into the separator, which is itself part of the signed preimage (`signing_preimage`). A signature produced against one contract's separator fails `payload.domain_separator != expected_domain` (`InvalidDomain`) on any other contract. |
+| Signed message binds the network | **Already enforced** | `domain_separator` also hashes `env.ledger().network_id()` (SHA-256 of the network passphrase) into the separator, so a signature cannot be replayed across networks (e.g. testnet → mainnet) either. |
+| `expires_at` / deadline enforcement | **Already enforced** | `execute` rejects with `MetaTxError::Expired` when `env.ledger().timestamp() > payload.deadline`, checked before signature verification. |
+| Nonce replay protection | **Already enforced** | Nonces are strictly sequential per merchant (`expected_nonce`), rejected with `MetaTxError::InvalidNonce` on mismatch, and consumed (advanced) even when the inner action fails, so a used envelope can never be replayed. |
+| Nonce scoped "per (user, contract_address)" | **Structurally already true, now also explicit** | Each Soroban contract instance has its own isolated persistent storage, so a `Nonce(merchant)` entry in one deployed contract can never collide with the same merchant's nonce in a different deployed contract — there is no shared storage to collide in. Combined with the domain-separator check above (belt-and-braces), cross-contract nonce reuse was already structurally impossible, not merely nonce-scheme-dependent. |
+
+**Conclusion:** the specific vulnerability described in Issue #1020 ("a signed
+meta-tx for contract A could be replayed on contract B") does not reproduce
+against the current implementation — `domain_separator_for` already binds
+both the contract address and the network, and `test_wrong_domain_separator_is_rejected`
+(`fluxapay/src/meta_transaction_test.rs`, `fluxapay/tests/meta_transaction.rs`)
+already covers it, alongside `test_expired_deadline_is_rejected` and
+`test_replayed_nonce_is_rejected`. No functional change was required here;
+this section exists so the hardening is documented explicitly rather than
+only implied by the code.

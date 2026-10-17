@@ -394,6 +394,14 @@ pub enum Error {
     KycLimitExceeded = 85,
     /// Issue #1061: A single-use payment link has already been redeemed and cannot be used again.
     LinkAlreadyUsed = 86,
+    /// Issue #1033: FX rate used by `confirm_payment` is older than the
+    /// PaymentProcessor's own configured staleness threshold
+    /// (`MAX_ORACLE_STALENESS_SECS` / `set_oracle_staleness_threshold`),
+    /// independent of the oracle's own internal cap (`StaleOracleRate`).
+    OracleStale = 87,
+    /// Issue #1032: The requested `deposit_address` is already assigned to
+    /// another open (`Pending`, unexpired) payment.
+    DepositAddressInUse = 88,
 }
 
 /// Issue #841: Muxed account (M-address) wrapping a G-address and 64-bit sub-account ID.

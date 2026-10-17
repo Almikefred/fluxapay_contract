@@ -750,6 +750,7 @@ impl PaymentStreaming {
             now,
             old_rate,
             stream.remaining_deposit,
+            stream.cliff_at,
         );
         stream.last_checkpoint_at = now;
 
@@ -1199,6 +1200,7 @@ impl PaymentStreaming {
             now,
             stream.rate_per_second,
             stream.remaining_deposit,
+            stream.cliff_at,
         );
         stream.last_checkpoint_at = now;
 
@@ -1280,6 +1282,7 @@ impl PaymentStreaming {
             now,
             stream.rate_per_second,
             stream.remaining_deposit,
+            stream.cliff_at,
         );
         stream.accrued_at_pause = stream.accrued_at_checkpoint;
         stream.last_checkpoint_at = now;
@@ -1375,6 +1378,7 @@ impl PaymentStreaming {
                 now,
                 stream.rate_per_second,
                 stream.remaining_deposit,
+                stream.cliff_at,
             );
             stream.last_checkpoint_at = now;
 
@@ -1477,6 +1481,7 @@ impl PaymentStreaming {
             now,
             old_rate,
             stream.remaining_deposit,
+            stream.cliff_at,
         );
         stream.last_checkpoint_at = now;
 
@@ -1605,6 +1610,7 @@ impl PaymentStreaming {
                 now,
                 stream.rate_per_second,
                 stream.remaining_deposit,
+                stream.cliff_at,
             );
             stream.last_checkpoint_at = now;
 
@@ -1927,6 +1933,7 @@ impl PaymentStreaming {
             now,
             stream.rate_per_second,
             stream.remaining_deposit,
+            stream.cliff_at,
         );
         stream.last_checkpoint_at = now;
 

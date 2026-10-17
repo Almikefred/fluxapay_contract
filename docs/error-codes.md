@@ -85,6 +85,8 @@ document on every CI run to catch drift between them.
 | 404 | `PaymentNotFound` | No payment exists with the given `payment_id`. | Typo'd ID, or payment was never created. | Verify the ID via `get_payment` / listing endpoints. |
 | 405 | `RefundNotFound` | No refund exists with the given `refund_id`. | Typo'd ID, or refund was never created. | Verify the ID via `get_refund` / `get_payment_refunds`. |
 | 406 | `InvalidAmount` | Amount is zero, negative, or otherwise invalid. | Passing a non-positive amount to a payment/refund call. | Pass a strictly positive `i128` amount. |
+| 88 | `OracleStale` | FX rate used by `confirm_payment`/`verify_payment` is older than the PaymentProcessor's own configured staleness threshold. | `MAX_ORACLE_STALENESS_SECS` (default 5 minutes) or the admin-configured override via `set_oracle_staleness_threshold` has elapsed since the rate was last updated, or the FX oracle itself reports the rate as stale. | Trigger (or wait for) an oracle rate update, or raise the threshold via `set_oracle_staleness_threshold` if 5 minutes is too strict for your deployment. |
+| 89 | `DepositAddressInUse` | The requested `deposit_address` is already assigned to another open (`Pending`, unexpired) payment. | Reusing a deposit address across two concurrently-open payments (Issue #1032 spam mitigation). | Use a fresh deposit address, or wait for the existing payment on that address to resolve or expire. |
 
 > **Note:** Every `Error` variant has a unique discriminant — there are no code collisions in the current Rust source.
 

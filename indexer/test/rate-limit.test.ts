@@ -158,4 +158,84 @@ describe("indexer rate limiting (Issue #817)", () => {
     assert.equal(next2, false);
     assert.equal(second.getStatus(), 429);
   });
+
+  test("Issue #1032: loadRateLimitConfig reads payment-create overrides and defaults to 30/60s", () => {
+    const cfg = loadRateLimitConfig({} as NodeJS.ProcessEnv);
+    assert.equal(cfg.paymentCreateLimit, 30);
+    assert.equal(cfg.paymentCreateWindowMs, 60_000);
+
+    const overridden = loadRateLimitConfig({
+      RATE_LIMIT_PAYMENT_CREATE_RPW: "5",
+      RATE_LIMIT_PAYMENT_CREATE_WINDOW_SECS: "30",
+    } as NodeJS.ProcessEnv);
+    assert.equal(overridden.paymentCreateLimit, 5);
+    assert.equal(overridden.paymentCreateWindowMs, 30_000);
+  });
+
+  test("Issue #1032: POST /v1/payment-links/:id/view is rate-limited per IP, matching the contract's 30/60s budget", () => {
+    const store = new MemorySlidingWindowStore();
+    const { middleware } = createTestRateLimiter({
+      authRpm: 10,
+      apiRpm: 200,
+      paymentCreateLimit: 3,
+      paymentCreateWindowMs: 60_000,
+      store,
+    });
+
+    const req = () =>
+      mockReq({ path: "/v1/payment-links/link_123/view", method: "POST" });
+
+    for (let i = 0; i < 3; i++) {
+      const res = mockRes();
+      let nextCalled = false;
+      middleware(req(), res as unknown as Response, (() => {
+        nextCalled = true;
+      }) as NextFunction);
+      assert.equal(nextCalled, true, `request ${i + 1} should pass`);
+    }
+
+    const blocked = mockRes();
+    let nextCalled = false;
+    middleware(req(), blocked as unknown as Response, (() => {
+      nextCalled = true;
+    }) as NextFunction);
+    assert.equal(nextCalled, false);
+    assert.equal(blocked.getStatus(), 429);
+    assert.ok(blocked.getHeaders()["retry-after"]);
+  });
+
+  test("Issue #1032: payment-create limit is per IP even with different API keys", () => {
+    const store = new MemorySlidingWindowStore();
+    const { middleware } = createTestRateLimiter({
+      authRpm: 10,
+      apiRpm: 200,
+      paymentCreateLimit: 1,
+      paymentCreateWindowMs: 60_000,
+      store,
+    });
+
+    const reqWithKey = (apiKey: string) =>
+      mockReq({
+        path: "/v1/payment-links/link_abc/view",
+        method: "POST",
+        headers: { "x-api-key": apiKey },
+      });
+
+    const first = mockRes();
+    let next1 = false;
+    middleware(reqWithKey("key-a"), first as unknown as Response, (() => {
+      next1 = true;
+    }) as NextFunction);
+    assert.equal(next1, true);
+
+    // Same IP, different API key — still blocked, because the budget is
+    // keyed on IP, not on account, for this route.
+    const second = mockRes();
+    let next2 = false;
+    middleware(reqWithKey("key-b"), second as unknown as Response, (() => {
+      next2 = true;
+    }) as NextFunction);
+    assert.equal(next2, false);
+    assert.equal(second.getStatus(), 429);
+  });
 });

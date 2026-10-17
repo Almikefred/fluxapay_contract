@@ -754,6 +754,8 @@ export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   83: "TrialTooLong",
   84: "InvalidPaymentLink",
   85: "KycLimitExceeded",
+  88: "OracleStale",
+  89: "DepositAddressInUse",
   404: "PaymentNotFound",
   405: "RefundNotFound",
   406: "InvalidAmount",

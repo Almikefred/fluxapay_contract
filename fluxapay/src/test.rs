@@ -3846,7 +3846,10 @@ fn test_verify_payment_rejects_stale_fx_rate() {
         &1000i128,
         &None::<u64>,
     );
-    assert_eq!(result, Err(Ok(Error::StaleOracleRate)));
+    // Issue #1033: the PaymentProcessor's own staleness guard now reports
+    // `OracleStale` (previously `StaleOracleRate`), and no longer requires a
+    // merchant registry to be configured for the check to run.
+    assert_eq!(result, Err(Ok(Error::OracleStale)));
 }
 
 #[test]
@@ -3950,6 +3953,166 @@ fn test_verify_payment_no_fx_oracle_config_skips_check() {
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.fx_rate, None);
     assert_eq!(payment.fx_rate_at, None);
+}
+
+// -----------------------------------------------------------------------------
+// Issue #1033: oracle staleness is enforced even without a merchant registry,
+// and the admin-configurable threshold is independent of the oracle's own cap.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_verify_payment_rejects_stale_fx_rate_without_registry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, client) = setup_payment_processor(&env);
+    let oracle_contract = env.register(crate::FXOracle, ());
+    let oracle_client = crate::FXOracleClient::new(&env, &oracle_contract);
+    oracle_client.oracle_initialize(&admin, &86400);
+
+    // Note: no merchant registry is configured here at all. Prior to Issue
+    // #1033 this meant the staleness check was skipped entirely for both
+    // `set_fx_oracle` and `set_fx_oracle_address` setups that enforced via
+    // the registry-gated block; the per-contract guard now runs regardless.
+    client.set_fx_oracle_address(&admin, &oracle_contract);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let oracle_role = Symbol::new(&env, "ORACLE");
+    let oracle = Address::generate(&env);
+    oracle_client.oracle_grant_role(&admin, &oracle_role, &oracle);
+    let pair = Symbol::new(&env, "USDC");
+    oracle_client.set_rate(&oracle, &pair, &1500_0000000i128, &7);
+
+    // Advance past the oracle's own 24h cap so `try_get_rate` itself reports
+    // `RateStale` — the fix maps that straight to `Error::OracleStale`.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 25 * 3600);
+
+    let payment_id = String::from_str(&env, "fx_stale_no_registry");
+    let args = create_payment_args(&env, &payment_id, &merchant, 1000i128);
+    client.create_payment(&args);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let tx_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let payer = Address::generate(&env);
+    let result = client.try_verify_payment(
+        &operator,
+        &payment_id,
+        &tx_hash,
+        &payer,
+        &1000i128,
+        &None::<u64>,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleStale)));
+}
+
+#[test]
+fn test_verify_payment_rejects_rate_older_than_configured_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, client) = setup_payment_processor(&env);
+    let oracle_contract = env.register(crate::FXOracle, ());
+    let oracle_client = crate::FXOracleClient::new(&env, &oracle_contract);
+    // Oracle's own cap is the generous 24h default.
+    oracle_client.oracle_initialize(&admin, &86400);
+    client.set_fx_oracle_address(&admin, &oracle_contract);
+
+    // PaymentProcessor tightens its own guard to 60 seconds, well inside the
+    // oracle's own 24h cap.
+    client.set_oracle_staleness_threshold(&admin, &60u64);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let oracle_role = Symbol::new(&env, "ORACLE");
+    let oracle = Address::generate(&env);
+    oracle_client.oracle_grant_role(&admin, &oracle_role, &oracle);
+    let pair = Symbol::new(&env, "USDC");
+    oracle_client.set_rate(&oracle, &pair, &1500_0000000i128, &7);
+
+    // 61 seconds old: still fresh by the oracle's own 24h cap, but stale by
+    // the PaymentProcessor's own configured 60s threshold.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 61);
+
+    let payment_id = String::from_str(&env, "fx_stale_own_threshold");
+    let args = create_payment_args(&env, &payment_id, &merchant, 1000i128);
+    client.create_payment(&args);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let tx_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let payer = Address::generate(&env);
+    let result = client.try_verify_payment(
+        &operator,
+        &payment_id,
+        &tx_hash,
+        &payer,
+        &1000i128,
+        &None::<u64>,
+    );
+    assert_eq!(result, Err(Ok(Error::OracleStale)));
+}
+
+// -----------------------------------------------------------------------------
+// Issue #1032: deposit_address reuse prevention.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_create_payment_rejects_deposit_address_reuse_while_pending() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let shared_deposit_address = Address::generate(&env);
+
+    let payment_id_1 = String::from_str(&env, "dep_addr_first");
+    let mut args1 = create_payment_args(&env, &payment_id_1, &merchant, 1000i128);
+    args1.deposit_address = shared_deposit_address.clone();
+    client.create_payment(&args1);
+
+    // Second payment with the same deposit_address, while the first is still
+    // Pending, must be rejected.
+    let payment_id_2 = String::from_str(&env, "dep_addr_second");
+    let mut args2 = create_payment_args(&env, &payment_id_2, &merchant, 500i128);
+    args2.deposit_address = shared_deposit_address.clone();
+    let result = client.try_create_payment(&args2);
+    assert_eq!(result, Err(Ok(Error::DepositAddressInUse)));
+}
+
+#[test]
+fn test_create_payment_allows_deposit_address_reuse_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let shared_deposit_address = Address::generate(&env);
+
+    let payment_id_1 = String::from_str(&env, "dep_addr_expired");
+    let mut args1 = create_payment_args(&env, &payment_id_1, &merchant, 1000i128);
+    args1.deposit_address = shared_deposit_address.clone();
+    client.create_payment(&args1);
+
+    // Let the first payment's expiry pass.
+    env.ledger().with_mut(|ledger| ledger.timestamp += 3_601);
+
+    // A new payment reusing the same deposit_address is now accepted, since
+    // the first payment is no longer an active Pending payment.
+    let payment_id_2 = String::from_str(&env, "dep_addr_reused");
+    let mut args2 = create_payment_args(&env, &payment_id_2, &merchant, 500i128);
+    args2.deposit_address = shared_deposit_address.clone();
+    client.create_payment(&args2);
+
+    assert_eq!(client.get_payment(&payment_id_2).deposit_address, shared_deposit_address);
 }
 
 #[test]
