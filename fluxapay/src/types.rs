@@ -396,6 +396,14 @@ pub enum Error {
     KycLimitExceeded = 85,
     /// Issue #1061: A single-use payment link has already been redeemed and cannot be used again.
     LinkAlreadyUsed = 86,
+    /// Issue #1033: FX rate used by `confirm_payment` is older than the
+    /// PaymentProcessor's own configured staleness threshold
+    /// (`MAX_ORACLE_STALENESS_SECS` / `set_oracle_staleness_threshold`),
+    /// independent of the oracle's own internal cap (`StaleOracleRate`).
+    OracleStale = 87,
+    /// Issue #1032: The requested `deposit_address` is already assigned to
+    /// another open (`Pending`, unexpired) payment.
+    DepositAddressInUse = 88,
     /// Issues #1026/#1027: `leaf_count` is zero or exceeds `MAX_MERKLE_BATCH_LEAVES`.
     InvalidMerkleLeafCount = 87,
     /// Issues #1026/#1027: No Merkle batch distribution exists with the given ID.

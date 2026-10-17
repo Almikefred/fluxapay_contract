@@ -215,6 +215,14 @@ pub enum DataKey {
     RefundIndex,
     /// Pause state keyed by operation scope. Appended to preserve existing storage keys.
     PauseScope(PauseScope),
+    /// Issue #1033: Admin-configurable override (in seconds) for
+    /// `MAX_ORACLE_STALENESS_SECS`, enforced in `confirm_payment` independently
+    /// of the FX oracle's own internal staleness threshold.
+    OracleStalenessThreshold,
+    /// Issue #1032: Maps a `deposit_address` to the `payment_id` currently
+    /// holding it while that payment is `Pending`, so a new `create_payment`
+    /// can detect and reject concurrent reuse of the same address.
+    DepositAddressPending(Address),
     /// Issues #1026 / #1027: Counter for Merkle batch distribution IDs.
     MerkleDistributionCounter,
     /// Issues #1026 / #1027: Merkle batch distribution record keyed by distribution_id.
