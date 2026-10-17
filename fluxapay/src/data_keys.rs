@@ -17,7 +17,7 @@ pub fn payment_id_str_to_key(env: &Env, payment_id: &str) -> BytesN<32> {
         .to_bytes()
 }
 
-#[contracttpe]
+#[contracttype]
 pub enum DataKey {
     Payment(BytesN<32>),
     PaymentStatusHistory(String),
@@ -215,4 +215,11 @@ pub enum DataKey {
     RefundIndex,
     /// Pause state keyed by operation scope. Appended to preserve existing storage keys.
     PauseScope(PauseScope),
+    /// Issues #1026 / #1027: Counter for Merkle batch distribution IDs.
+    MerkleDistributionCounter,
+    /// Issues #1026 / #1027: Merkle batch distribution record keyed by distribution_id.
+    MerkleDistribution(u64),
+    /// Issue #1013: Configurable amount below which `withdraw_treasury` may be
+    /// executed by a single admin without going through multisig governance.
+    TreasurySingleAdminThreshold,
 }
