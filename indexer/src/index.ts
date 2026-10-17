@@ -7,6 +7,7 @@
 import { SorobanRpc as rpc, scValToNative } from "stellar-sdk";
 import { Database } from "./database";
 import { ContractEvent, AnyEvent, StreamEvent } from "./types";
+import { AnchorWithdrawPayload, SettlementService } from "./settlement";
 import { startServer } from "./server";
 import {
   buildEnvelope,
@@ -156,6 +157,7 @@ export class EventSubscriber {
   private database: Database;
   private config: EventSubscriptionConfig;
   private currentLedger: number;
+  private settlementService: SettlementService;
   private pollTimer: NodeJS.Timeout | null = null;
   private dlqRetryTimer: NodeJS.Timeout | null = null;
   private replayWebhookDispatcher?: ReplayWebhookDispatcher;
@@ -170,6 +172,14 @@ export class EventSubscriber {
     this.server = dependencies.eventSource ?? new rpc.Server(config.rpcUrl, { allowHttp });
     this.database = database || new Database(config.dbConnectionString);
     this.currentLedger = config.startLedger;
+    this.settlementService = new SettlementService(this.database);
+    this.settlementService.onSettlementEvent((event) => {
+      console.log(
+        `${event.type} payment=${event.paymentId} anchorTxn=${event.anchorTxnId ?? "n/a"}${
+          event.reason ? ` reason=${event.reason}` : ""
+        }`
+      );
+    });
     if (dependencies.replayWebhookDispatcher) {
       this.replayWebhookDispatcher = dependencies.replayWebhookDispatcher;
     } else if (typeof this.database.getPool === "function") {
@@ -267,6 +277,16 @@ export class EventSubscriber {
             stored++;
             console.log(`✓ Stored event ${parsedEvent.id} from contract ${parsedEvent.contractId}`);
           }
+        }
+
+        // Settlement offramp: PaymentProcessor::settle_payment emits
+        // (PAYMENT, ANCHOR_WITHDRAW, merchant_id, anchor_domain) whenever
+        // the settled merchant has an AnchorConfig on file. Trigger the
+        // SEP-6 withdrawal flow for it, independent of whether the raw
+        // event was also persisted to contract_events above.
+        const anchorWithdraw = this.tryParseAnchorWithdraw(event);
+        if (anchorWithdraw) {
+          await this.settlementService.settle(anchorWithdraw);
         }
       } catch (error: any) {
         errors++;
@@ -413,6 +433,65 @@ export class EventSubscriber {
 
     console.warn("Could not parse PAYMENT/RETRY_CREATED value as a 2-tuple:", raw);
     return {};
+   * Decode a raw RPC event into an `AnchorWithdrawPayload` if (and only if)
+   * its topics match `(PAYMENT, ANCHOR_WITHDRAW, merchant_id, anchor_domain)`.
+   * Returns `null` for every other event type.
+   *
+   * Unlike `scValToObject` (a best-effort placeholder used for the generic
+   * dedup path), this uses `stellar-sdk`'s `scValToNative` to fully decode
+   * the topic and value ScVals, since the settlement flow depends on exact
+   * field values (amount, endpoints, payout address) rather than a loose
+   * approximation.
+   */
+  private tryParseAnchorWithdraw(event: any): AnchorWithdrawPayload | null {
+    try {
+      const rawTopics = Array.isArray(event.topic) ? event.topic : [];
+      if (rawTopics.length < 4) return null;
+
+      const topic0 = scValToNative(rawTopics[0]);
+      const topic1 = scValToNative(rawTopics[1]);
+      if (topic0 !== "PAYMENT" || topic1 !== "ANCHOR_WITHDRAW") return null;
+
+      const merchantId = String(scValToNative(rawTopics[2]));
+      const anchorDomain = String(scValToNative(rawTopics[3]));
+
+      // Payload tuple order per fluxapay/src/lib.rs settle_payment:
+      // (payment_id, amount, currency, payout_addr, sep6_endpoint,
+      //  sep24_endpoint, supported_currencies, ledger_timestamp)
+      const decodedValue = scValToNative(event.value) as unknown[];
+      if (!Array.isArray(decodedValue) || decodedValue.length < 8) return null;
+
+      const [
+        paymentId,
+        amount,
+        currency,
+        payoutAddress,
+        sep6Endpoint,
+        sep24Endpoint,
+        supportedCurrencies,
+        ledgerTimestamp,
+      ] = decodedValue;
+
+      return {
+        paymentId: String(paymentId),
+        merchantId,
+        amount: Number(amount),
+        currency: String(currency),
+        payoutAddress: String(payoutAddress),
+        anchorDomain,
+        sep6Endpoint: String(sep6Endpoint ?? ""),
+        sep24Endpoint: String(sep24Endpoint ?? ""),
+        supportedCurrencies: Array.isArray(supportedCurrencies)
+          ? supportedCurrencies.map(String)
+          : [],
+        ledgerTimestamp: Number(ledgerTimestamp),
+      };
+    } catch (error) {
+      // Not every event matches the anchor-withdraw shape; failing to
+      // decode is expected for the vast majority of events and is not an
+      // error on its own.
+      return null;
+    }
   }
 
   scValToObject(
